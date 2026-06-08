@@ -35,7 +35,13 @@ const db = new SqliteDatabase(DB_PATH)
 db.pragma('journal_mode = WAL')
 db.pragma('foreign_keys = ON')
 
+function tableExists(name) {
+  const row = db.prepare("select name from sqlite_master where type='table' and name=?").get(name)
+  return !!row
+}
+
 function migrateDb() {
+  if (!tableExists('borrowers')) return
   const borrowerCols = db.prepare('pragma table_info(borrowers)').all().map((c) => c.name)
   if (!borrowerCols.includes('loandisk_id')) {
     db.exec('alter table borrowers add column loandisk_id text')
@@ -57,7 +63,6 @@ export function resetAppData() {
 }
 
 export function initDb() {
-  migrateDb()
   db.exec(`
     create table if not exists users (
       id text primary key,
@@ -132,6 +137,8 @@ export function initDb() {
     create index if not exists idx_transactions_date on transactions(date);
     create index if not exists idx_exceptions_status on exceptions(status);
   `)
+
+  migrateDb()
 
   const userCount = db.prepare('select count(*) as c from users').get().c
   if (userCount === 0) {
