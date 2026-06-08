@@ -705,12 +705,20 @@ app.post('/api/demo/seed', authMiddleware, (req, res) => {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const distPath = path.resolve(__dirname, '..', 'dist')
+const indexHtml = path.join(distPath, 'index.html')
+
 if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath))
-  app.get('*', (req, res, next) => {
+  app.use(express.static(distPath, { index: false, fallthrough: true }))
+
+  // SPA fallback — refresh on /match, /settings/sla, etc. must return index.html
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next()
     if (req.path.startsWith('/api')) return next()
-    res.sendFile(path.join(distPath, 'index.html'))
+    const lastSegment = req.path.split('/').pop() || ''
+    if (lastSegment.includes('.')) return next()
+    res.sendFile(indexHtml, (err) => (err ? next(err) : undefined))
   })
+
   console.log(`Serving frontend from ${distPath}`)
 }
 
