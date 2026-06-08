@@ -714,8 +714,8 @@ if (fs.existsSync(distPath)) {
   console.log(`Serving frontend from ${distPath}`)
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`SmartRepay running at http://localhost:${PORT}`)
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`SmartRepay running on 0.0.0.0:${PORT}`)
   console.log(`Ingest: POST /api/ingest/parse · AI: ${process.env.OPENROUTER_API_KEY ? 'enabled' : 'disabled'}`)
   console.log(`Demo login: demo@smartrepay.local / demo1234`)
 })
