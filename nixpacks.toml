@@ -1,0 +1,17 @@
+# Coolify / Nixpacks — installs devDependencies so Vite is available for build
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+dependsOn = ["setup"]
+cmds = [
+  "NPM_CONFIG_PRODUCTION=false npm ci",
+  "npm ci --prefix server"
+]
+
+[phases.build]
+dependsOn = ["install"]
+cmds = ["npm run build"]
+
+[start]
+cmd = "node server/index.js"

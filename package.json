@@ -7,8 +7,9 @@
     "dev": "concurrently -n api,web -c blue,green \"npm run dev:server\" \"npm run dev:client\"",
     "dev:client": "vite",
     "dev:server": "npm run dev --prefix server",
-    "build": "vite build",
+    "build": "npx vite build",
     "preview": "vite preview",
+    "start": "node server/index.js",
     "start:server": "npm start --prefix server"
   },
   "dependencies": {

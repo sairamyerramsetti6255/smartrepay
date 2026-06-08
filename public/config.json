@@ -1,0 +1,7 @@
+{
+  "apiUrl": "/api",
+  "useApi": true,
+  "simplifiedApiUrl": "/simplified-api",
+  "appUrl": "",
+  "appName": "SmartRepay AI"
+}
