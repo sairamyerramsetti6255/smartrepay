@@ -1,0 +1,12 @@
+node_modules
+server/node_modules
+server/smartrepay.db*
+dist
+.env
+.env.local
+server/.env
+.DS_Store
+*.log
+server/cd
+server/node
+server/npm
