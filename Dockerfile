@@ -2,9 +2,12 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-# Install ALL deps (vite is devDependency) — do not set NODE_ENV=production here
-RUN NPM_CONFIG_PRODUCTION=false npm ci
+# Coolify injects NODE_ENV=production at build — override so Vite (devDependency) installs
+ENV NODE_ENV=development
+ENV NPM_CONFIG_PRODUCTION=false
+
+COPY package.json package-lock.json .npmrc ./
+RUN npm ci --include=dev
 
 COPY index.html vite.config.js ./
 COPY src ./src
