@@ -34,15 +34,17 @@ After deploy, edit **`/app/dist/config.json`** (mount as persistent file) or upd
 
 ```json
 {
-  "apiUrl": "/api",
+  "apiUrl": "https://sswg4o008gcgc40okk8skcw8.api.pbshope.in/api",
   "useApi": true,
-  "simplifiedApiUrl": "/simplified-api",
-  "appUrl": "",
+  "simplifiedApiUrl": "https://sswg4o008gcgc40okk8skcw8.api.pbshope.in/simplified-api",
+  "appUrl": "https://smartrepay.pbshope.in",
   "appName": "SmartRepay AI"
 }
 ```
 
-See `public/config.example.json` in the repo. The app fetches `/config.json` on load.
+**Custom domain (`smartrepay.pbshope.in`):** keep `apiUrl` on the **Coolify app URL** above — `/api` on the custom domain alone returns the SPA HTML, not JSON. `appUrl` is where users open the app.
+
+See `public/config.example.json`. The app fetches `/config.json` on load.
 
 ### Backend (runtime)
 
