@@ -9,14 +9,21 @@ import { fileURLToPath } from 'url'
 import { randomUUID, createHash } from 'crypto'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
-import { matchTransaction, detectExceptionType } from './matcher.js'
+import { bestMatchFromCandidates, matchTransaction, detectExceptionType } from './matcher.js'
 import { parseStatementBuffer } from './parseStatement.js'
 import {
   fetchAllBorrowers,
   getLoanDiskToken,
   normalizeLoanDiskBorrower,
   normalizeBorrowersFromPayload,
+  borrowerSearch,
+  parseBorrowerSearchResults,
+  fetchBorrowerById,
 } from './loandisk.js'
+
+const __serverDir = path.dirname(fileURLToPath(import.meta.url))
+const UPLOADS_DIR = path.join(__serverDir, 'uploads')
+fs.mkdirSync(UPLOADS_DIR, { recursive: true })
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
@@ -98,7 +105,7 @@ function getCachedParse(id) {
   return entry
 }
 
-function bulkInsertRows(rows, actor) {
+function bulkInsertRows(rows, actor, documentId = null) {
   const inserted = []
   for (const row of rows) {
     const hash = row.import_hash || importHash(row)
@@ -106,15 +113,29 @@ function bulkInsertRows(rows, actor) {
     if (exists) continue
     const id = randomUUID()
     db.prepare(
-      `insert into transactions (id, date, payer, description, amount, reference, status, import_hash)
-       values (?, ?, ?, ?, ?, ?, 'pending', ?)`
-    ).run(id, row.date, row.payer, row.description, row.amount, row.reference, hash)
+      `insert into transactions (id, date, payer, description, amount, reference, status, import_hash, source_document_id)
+       values (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+    ).run(id, row.date, row.payer, row.description, row.amount, row.reference, hash, documentId)
     inserted.push(id)
   }
   if (inserted.length && actor) {
-    audit('transactions', null, 'bulk_import', actor, null, { count: inserted.length })
+    audit('transactions', null, 'bulk_import', actor, null, { count: inserted.length, documentId })
   }
   return inserted
+}
+
+function saveUploadedDocument({ buffer, filename, mimeType, documentType, uploadedBy, rowCount }) {
+  const docId = randomUUID()
+  const safeName = path.basename(filename || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload'
+  const docDir = path.join(UPLOADS_DIR, docId)
+  fs.mkdirSync(docDir, { recursive: true })
+  const storagePath = path.join(docDir, safeName)
+  if (buffer?.length) fs.writeFileSync(storagePath, buffer)
+  db.prepare(
+    `insert into documents (id, filename, mime_type, size_bytes, storage_path, uploaded_by, document_type, row_count)
+     values (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(docId, filename, mimeType || null, buffer?.length || 0, storagePath, uploadedBy, documentType || null, rowCount || 0)
+  return docId
 }
 
 setInterval(() => {
@@ -157,6 +178,9 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
       rows,
       userId: req.user.sub,
       filename: req.file.originalname,
+      buffer: req.file.buffer,
+      mimeType: req.file.mimetype,
+      documentType: result.documentType || result.source || null,
     })
 
     res.json({
@@ -190,15 +214,25 @@ app.post('/api/ingest/import', authMiddleware, (req, res) => {
     const toInsert = cached.rows.filter((r) => !r._duplicate)
     if (!toInsert.length) return res.status(400).json({ error: 'No new rows to import' })
 
-    const inserted = bulkInsertRows(toInsert, req.user.email)
+    const documentId = saveUploadedDocument({
+      buffer: cached.buffer,
+      filename: cached.filename,
+      mimeType: cached.mimeType,
+      documentType: cached.documentType,
+      uploadedBy: req.user.email,
+      rowCount: toInsert.length,
+    })
+
+    const inserted = bulkInsertRows(toInsert, req.user.email, documentId)
     parseCache.delete(parseId)
 
     audit('ingest', null, 'import_statement', req.user.email, null, {
       file: cached.filename,
       count: inserted.length,
+      documentId,
     })
 
-    res.json({ inserted: inserted.length })
+    res.json({ inserted: inserted.length, documentId })
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -301,21 +335,29 @@ app.post('/api/loans', authMiddleware, (req, res) => {
 
 // --- Transactions ---
 app.get('/api/transactions', authMiddleware, (req, res) => {
-  let sql = 'select * from transactions'
+  let sql = `select t.*, d.filename as source_filename
+    from transactions t
+    left join documents d on d.id = t.source_document_id`
   const params = []
+  const where = []
   if (req.query.date) {
-    sql += ' where date = ?'
+    where.push('t.date = ?')
     params.push(req.query.date)
   }
   if (req.query.status) {
-    sql += params.length ? ' and status = ?' : ' where status = ?'
+    where.push('t.status = ?')
     params.push(req.query.status)
   }
   if (req.query.since) {
-    sql += params.length ? ' and date >= ?' : ' where date >= ?'
+    where.push('t.date >= ?')
     params.push(req.query.since)
   }
-  sql += ' order by created_at desc'
+  if (req.query.document_id) {
+    where.push('t.source_document_id = ?')
+    params.push(req.query.document_id)
+  }
+  if (where.length) sql += ` where ${where.join(' and ')}`
+  sql += ' order by t.created_at desc'
   res.json(db.prepare(sql).all(...params))
 })
 
@@ -425,31 +467,99 @@ async function syncLoanDiskToDb(actor) {
   return result
 }
 
-function runMatchingBatch(actor) {
+async function fetchSearchCandidatesForPayers(payerNames) {
+  const apiPool = []
+  const byPayer = new Map()
+  const seen = new Set()
+
+  for (let i = 0; i < payerNames.length; i += 20) {
+    const batch = payerNames.slice(i, i + 20)
+    const criteria = batch.map((name) => ({ name, loanAmount: '', emi: '', branchId: '' }))
+    const data = await borrowerSearch(criteria)
+    const { borrowers, bySearchName } = parseBorrowerSearchResults(data, batch)
+
+    for (const b of borrowers) {
+      if (!seen.has(b.loandisk_id)) {
+        seen.add(b.loandisk_id)
+        apiPool.push(b)
+      }
+    }
+
+    for (const [key, list] of bySearchName) {
+      if (!byPayer.has(key)) byPayer.set(key, [])
+      byPayer.get(key).push(...list)
+    }
+
+    if (!bySearchName.size) {
+      for (const name of batch) {
+        const key = name.toLowerCase().trim()
+        if (!byPayer.has(key)) byPayer.set(key, borrowers)
+      }
+    }
+  }
+
+  return { apiPool, byPayer }
+}
+
+async function runMatchingBatch(actor) {
   const settings = getSettings()
   const threshold = settings.autoApproveThreshold ?? 80
-  const borrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
-  const loans = db.prepare('select * from loans').all()
+  const localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
+  let loans = db.prepare('select * from loans').all()
   const pending = db.prepare("select * from transactions where status = 'pending'").all()
   const allTx = db.prepare('select * from transactions').all()
+
+  const uniquePayers = [...new Set(pending.map((t) => String(t.payer || '').trim()).filter(Boolean))]
+  let apiPool = []
+  let byPayer = new Map()
+  let searchSource = 'local'
+
+  if (uniquePayers.length && loanDiskConfigured()) {
+    try {
+      const searchResult = await fetchSearchCandidatesForPayers(uniquePayers)
+      apiPool = searchResult.apiPool
+      byPayer = searchResult.byPayer
+      searchSource = 'BorrowerSerch'
+    } catch (e) {
+      console.warn('BorrowerSerch failed, using local borrowers:', e.message)
+    }
+  }
 
   let matched = 0
   let excepted = 0
 
   for (const tx of pending) {
-    const { borrower, score } = matchTransaction(tx, borrowers)
-    const loan = borrower ? loans.find((l) => l.borrower_id === borrower.id) : null
+    const payerKey = String(tx.payer || '').trim().toLowerCase()
+    let candidates = byPayer.get(payerKey)?.length ? byPayer.get(payerKey) : apiPool.length ? apiPool : localBorrowers
 
-    if (score >= threshold && borrower) {
+    let { borrower, score } = bestMatchFromCandidates(tx, candidates)
+    if (score < threshold && localBorrowers.length) {
+      const localMatch = bestMatchFromCandidates(tx, localBorrowers)
+      if (localMatch.score > score) {
+        borrower = localMatch.borrower
+        score = localMatch.score
+      }
+    }
+
+    let resolvedBorrower = borrower
+    if (borrower?.loandisk_id) {
+      const { id } = upsertBorrowerRecord(borrower)
+      resolvedBorrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
+      loans = db.prepare('select * from loans').all()
+    }
+
+    const loan = resolvedBorrower ? loans.find((l) => l.borrower_id === resolvedBorrower.id) : null
+
+    if (score >= threshold && resolvedBorrower) {
       db.prepare(
         `update transactions set status = 'matched', confidence_score = ?, matched_borrower_id = ?, loan_id = ? where id = ?`
-      ).run(score, borrower.id, loan?.id || null, tx.id)
+      ).run(score, resolvedBorrower.id, loan?.id || null, tx.id)
       matched++
     } else {
       const exType = detectExceptionType(tx, allTx, score)
       db.prepare(
         `update transactions set status = 'exception', confidence_score = ?, matched_borrower_id = ? where id = ?`
-      ).run(score, borrower?.id || null, tx.id)
+      ).run(score, resolvedBorrower?.id || null, tx.id)
       const existing = db
         .prepare("select id from exceptions where transaction_id = ? and status = 'open'")
         .get(tx.id)
@@ -463,8 +573,14 @@ function runMatchingBatch(actor) {
     }
   }
 
-  audit('matching', null, 'run', actor, null, { matched, excepted })
-  return { matched, excepted, pending: pending.length, borrowers: borrowers.length }
+  audit('matching', null, 'run', actor, null, { matched, excepted, searchSource })
+  return {
+    matched,
+    excepted,
+    pending: pending.length,
+    borrowers: db.prepare('select count(*) as c from borrowers').get().c,
+    searchSource,
+  }
 }
 
 // --- LoanDisk ---
@@ -526,17 +642,83 @@ app.post('/api/loandisk/sync', authMiddleware, async (req, res) => {
   }
 })
 
+app.post('/api/loandisk/search', authMiddleware, async (req, res) => {
+  try {
+    const criteria = req.body.searchCriteria || req.body.names?.map((n) => ({ name: n })) || []
+    if (!criteria.length) return res.status(400).json({ error: 'searchCriteria required' })
+    const data = await borrowerSearch(criteria)
+    const names = criteria.map((c) => c.name || c)
+    const parsed = parseBorrowerSearchResults(data, names)
+    res.json(parsed)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/loandisk/borrower/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await fetchBorrowerById(req.params.id)
+    if (result.borrower) {
+      const { id } = upsertBorrowerRecord(result.borrower)
+      result.borrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
+    }
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+// --- Documents ---
+app.get('/api/documents', authMiddleware, (_req, res) => {
+  const docs = db
+    .prepare(
+      `select d.*,
+        (select count(*) from transactions t where t.source_document_id = d.id) as total_rows,
+        (select count(*) from transactions t where t.source_document_id = d.id and t.status = 'matched') as matched_count,
+        (select count(*) from transactions t where t.source_document_id = d.id and t.status in ('exception','pending')) as unmatched_count,
+        (select min(t.date) from transactions t where t.source_document_id = d.id) as date_from,
+        (select max(t.date) from transactions t where t.source_document_id = d.id) as date_to
+      from documents d
+      order by d.created_at desc`
+    )
+    .all()
+  res.json(docs)
+})
+
+app.get('/api/documents/:id/download', authMiddleware, (req, res) => {
+  const doc = db.prepare('select * from documents where id = ?').get(req.params.id)
+  if (!doc) return res.status(404).json({ error: 'Document not found' })
+  if (!fs.existsSync(doc.storage_path)) return res.status(404).json({ error: 'File missing on server' })
+  res.download(doc.storage_path, doc.filename)
+})
+
+app.get('/api/documents/:id/transactions', authMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `select t.*, b.full_name as matched_borrower_name
+       from transactions t
+       left join borrowers b on b.id = t.matched_borrower_id
+       where t.source_document_id = ?
+       order by t.date asc`
+    )
+    .all(req.params.id)
+  res.json(rows)
+})
+
 // --- Matching ---
 app.post('/api/matching/run', authMiddleware, async (req, res) => {
   try {
-    const borrowerCount = db.prepare('select count(*) as c from borrowers').get().c
-    if (!borrowerCount) {
-      return res.status(400).json({
-        error: 'No borrowers loaded yet — wait a moment for background sync or click Sync LoanDisk',
+    const pendingCount = db.prepare("select count(*) as c from transactions where status = 'pending'").get().c
+    if (!pendingCount) {
+      return res.json({
+        matched: 0,
+        excepted: 0,
+        pending: 0,
+        message: 'No pending transactions — import a statement first',
       })
     }
 
-    const result = runMatchingBatch(req.user.email)
+    const result = await runMatchingBatch(req.user.email)
     if (result.pending === 0) {
       return res.json({
         ...result,

@@ -40,6 +40,11 @@ function tableExists(name) {
   return !!row
 }
 
+function columnExists(table, col) {
+  if (!tableExists(table)) return false
+  return db.prepare(`pragma table_info(${table})`).all().some((c) => c.name === col)
+}
+
 function migrateDb() {
   if (!tableExists('borrowers')) return
   const borrowerCols = db.prepare('pragma table_info(borrowers)').all().map((c) => c.name)
@@ -50,12 +55,17 @@ function migrateDb() {
   for (const col of ['first_name', 'last_name', 'branch_id', 'branch_name']) {
     if (!borrowerCols.includes(col)) db.exec(`alter table borrowers add column ${col} text`)
   }
+  if (tableExists('transactions') && !columnExists('transactions', 'source_document_id')) {
+    db.exec('alter table transactions add column source_document_id text references documents(id)')
+    db.exec('create index if not exists idx_transactions_document on transactions(source_document_id)')
+  }
 }
 
 export function resetAppData() {
   db.exec(`
     delete from exceptions;
     delete from transactions;
+    delete from documents;
     delete from loans;
     delete from borrowers;
     delete from audit_log;
@@ -131,6 +141,18 @@ export function initDb() {
     create table if not exists app_settings (
       key text primary key,
       value text not null
+    );
+
+    create table if not exists documents (
+      id text primary key,
+      filename text not null,
+      mime_type text,
+      size_bytes integer,
+      storage_path text not null,
+      uploaded_by text,
+      document_type text,
+      row_count integer default 0,
+      created_at text default (datetime('now'))
     );
 
     create index if not exists idx_transactions_status on transactions(status);

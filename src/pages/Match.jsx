@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom'
 
 import toast from 'react-hot-toast'
 
-import { Loader2, RefreshCw, Upload, Users } from 'lucide-react'
+import { Download, FileText, Loader2, RefreshCw, Upload, Users } from 'lucide-react'
 
 import * as api from '@/lib/api'
 
@@ -65,6 +65,9 @@ export function Match() {
   const [syncing, setSyncing] = useState(false)
 
   const [ldStatus, setLdStatus] = useState(null)
+  const [documents, setDocuments] = useState([])
+  const [docsLoading, setDocsLoading] = useState(true)
+  const [documentFilter, setDocumentFilter] = useState(null)
 
 
 
@@ -77,10 +80,11 @@ export function Match() {
 
 
   const filtered = useMemo(() => {
-    const list = filter === 'all' ? transactions : transactions.filter((t) => t.status === filter)
+    let list = filter === 'all' ? transactions : transactions.filter((t) => t.status === filter)
+    if (documentFilter) list = list.filter((t) => t.source_document_id === documentFilter)
     const order = { pending: 0, matched: 1, exception: 2, posted: 3 }
     return [...list].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9))
-  }, [transactions, filter])
+  }, [transactions, filter, documentFilter])
 
   const visibleList = useMemo(() => filtered.slice(0, 150), [filtered])
 
@@ -142,6 +146,8 @@ export function Match() {
 
       refetchBorrowers()
 
+      loadDocuments()
+
     }
 
     window.addEventListener('smartrepay:demo-loaded', onLoaded)
@@ -160,6 +166,54 @@ export function Match() {
 
 
 
+  async function loadDocuments() {
+
+    setDocsLoading(true)
+
+    try {
+
+      const docs = await api.documents.list()
+
+      setDocuments(Array.isArray(docs) ? docs : [])
+
+    } catch {
+
+      setDocuments([])
+
+    } finally {
+
+      setDocsLoading(false)
+
+    }
+
+  }
+
+
+
+  useEffect(() => {
+
+    loadDocuments()
+
+  }, [])
+
+
+
+  async function downloadDoc(doc) {
+
+    try {
+
+      await api.documents.download(doc.id, doc.filename)
+
+    } catch (e) {
+
+      toast.error(e.message)
+
+    }
+
+  }
+
+
+
   async function resetData() {
     if (!window.confirm('Clear all transactions, borrowers, loans, and unmatched items?')) return
     try {
@@ -168,6 +222,7 @@ export function Match() {
       setSelectedId(null)
       refetch()
       refetchBorrowers()
+      loadDocuments()
     } catch (e) {
       toast.error(e.message)
     }
@@ -214,10 +269,12 @@ export function Match() {
       if (result.message && result.matched === 0 && result.excepted === 0) {
         toast.error(result.message)
       } else {
-        toast.success(`${result.matched} matched, ${result.excepted} unmatched (${result.pending} processed)`)
+        const via = result.searchSource === 'BorrowerSerch' ? ' via LoanDisk search' : ''
+        toast.success(`${result.matched} matched, ${result.excepted} unmatched (${result.pending} processed${via})`)
       }
       refetch()
       refetchBorrowers()
+      loadDocuments()
     } catch (e) {
       toast.error(e.message)
     } finally {
@@ -315,7 +372,7 @@ export function Match() {
 
         title="Match Transactions"
 
-        subtitle="Sync all borrowers from LoanDisk GetAllBorrowers, then fuzzy-match imported payments."
+        subtitle="Run matching uses LoanDisk BorrowerSerch API per payer name, then separates matched vs unmatched."
 
         actions={
 
@@ -360,6 +417,182 @@ export function Match() {
         </div>
 
       )}
+
+
+
+      <section className="card overflow-hidden">
+
+        <div className="px-5 py-4 border-b border-[var(--border-light)] flex items-center justify-between gap-3">
+
+          <div>
+
+            <h2 className="text-sm font-semibold text-[var(--text-primary)]">Uploaded Documents</h2>
+
+            <p className="text-[12px] text-[var(--text-tertiary)] mt-0.5">
+
+              Source files with matched / unmatched counts per import
+
+            </p>
+
+          </div>
+
+          {documentFilter && (
+
+            <Button variant="secondary" size="sm" onClick={() => setDocumentFilter(null)}>
+
+              Clear document filter
+
+            </Button>
+
+          )}
+
+        </div>
+
+        {docsLoading ? (
+
+          <div className="px-5 py-8 flex justify-center">
+
+            <Loader2 className="h-5 w-5 animate-spin text-[var(--text-tertiary)]" />
+
+          </div>
+
+        ) : documents.length === 0 ? (
+
+          <div className="px-5 py-8 text-center text-[13px] text-[var(--text-secondary)]">
+
+            No uploaded documents yet — import a statement from Ingest
+
+          </div>
+
+        ) : (
+
+          <div className="overflow-x-auto">
+
+            <table className="w-full text-[13px]">
+
+              <thead>
+
+                <tr className="border-b border-[var(--border-light)] text-left text-[11px] uppercase tracking-wider text-[var(--text-tertiary)]">
+
+                  <th className="px-5 py-3 font-semibold">Document</th>
+
+                  <th className="px-3 py-3 font-semibold">Transaction dates</th>
+
+                  <th className="px-3 py-3 font-semibold text-right">Matched</th>
+
+                  <th className="px-3 py-3 font-semibold text-right">Unmatched</th>
+
+                  <th className="px-3 py-3 font-semibold text-right">Total</th>
+
+                  <th className="px-5 py-3 font-semibold text-right">Download</th>
+
+                </tr>
+
+              </thead>
+
+              <tbody>
+
+                {documents.map((doc) => (
+
+                  <tr
+
+                    key={doc.id}
+
+                    className={cn(
+
+                      'border-b border-[var(--border-light)] last:border-0 cursor-pointer hover:bg-[var(--bg-subtle)]',
+
+                      documentFilter === doc.id && 'bg-[var(--accent-subtle)]'
+
+                    )}
+
+                    onClick={() => setDocumentFilter(doc.id === documentFilter ? null : doc.id)}
+
+                  >
+
+                    <td className="px-5 py-3">
+
+                      <div className="flex items-center gap-2">
+
+                        <FileText className="h-4 w-4 shrink-0 text-[var(--text-tertiary)]" />
+
+                        <span className="font-medium text-[var(--text-primary)] truncate max-w-[220px]">{doc.filename}</span>
+
+                      </div>
+
+                    </td>
+
+                    <td className="px-3 py-3 text-[var(--text-secondary)] whitespace-nowrap">
+
+                      {doc.date_from ? (
+
+                        <>
+
+                          {formatDate(doc.date_from)}
+
+                          {doc.date_to && doc.date_to !== doc.date_from ? ` – ${formatDate(doc.date_to)}` : ''}
+
+                        </>
+
+                      ) : (
+
+                        '—'
+
+                      )}
+
+                    </td>
+
+                    <td className="px-3 py-3 text-right">
+
+                      <span className="mono font-medium text-[var(--success)]">{doc.matched_count ?? 0}</span>
+
+                    </td>
+
+                    <td className="px-3 py-3 text-right">
+
+                      <span className="mono font-medium text-[var(--danger)]">{doc.unmatched_count ?? 0}</span>
+
+                    </td>
+
+                    <td className="px-3 py-3 text-right mono text-[var(--text-secondary)]">{doc.total_rows ?? 0}</td>
+
+                    <td className="px-5 py-3 text-right">
+
+                      <Button
+
+                        variant="secondary"
+
+                        size="sm"
+
+                        onClick={(e) => {
+
+                          e.stopPropagation()
+
+                          downloadDoc(doc)
+
+                        }}
+
+                      >
+
+                        <Download className="h-3.5 w-3.5" />
+
+                      </Button>
+
+                    </td>
+
+                  </tr>
+
+                ))}
+
+              </tbody>
+
+            </table>
+
+          </div>
+
+        )}
+
+      </section>
 
 
 
@@ -465,7 +698,13 @@ export function Match() {
 
                   <div className="flex justify-between gap-2 mt-1">
 
-                    <p className="text-xs text-[var(--text-tertiary)] truncate">{tx.description || formatDate(tx.date)}</p>
+                    <p className="text-xs text-[var(--text-tertiary)] truncate">
+
+                      {formatDate(tx.date)}
+
+                      {tx.source_filename ? ` · ${tx.source_filename}` : ''}
+
+                    </p>
 
                     {score != null ? (
 
@@ -512,6 +751,8 @@ export function Match() {
                 <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-[13px]">
 
                   <KV label="Date" value={formatDate(selected.date)} />
+
+                  <KV label="Document" value={selected.source_filename} />
 
                   <KV label="Payer" value={selected.payer} />
 
