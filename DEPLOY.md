@@ -59,14 +59,22 @@ See `public/config.example.json` in the repo. The app fetches `/config.json` on 
 | `OPENROUTER_API_KEY` | your key | Optional (PDF/AI ingest) |
 | `RESET_APP_DATA` | `false` | Yes |
 
-## 5. Persistent storage (SQLite)
+## 5. Persistent storage (SQLite + uploads)
 
-Mount a volume in Coolify:
+**Important:** mount **`/app/server/data` only** — not `/app/server`.
 
-- **Container path:** `/app/server`
-- **Purpose:** keep `smartrepay.db` across redeploys
+Mounting the whole `/app/server` folder **replaces** `index.js` from the Docker image with old files from the volume, so new API routes (e.g. `/api/documents`) return **404** after redeploy.
 
-Or mount only the DB file path if your Coolify version supports it.
+In Coolify → **Storages**:
+
+| Setting | Value |
+|---------|--------|
+| **Container path** | `/app/server/data` |
+| **Purpose** | `smartrepay.db` + uploaded statement files |
+
+Optional env override: `DATA_DIR=/app/server/data`
+
+On first boot after this change, the server copies an existing `smartrepay.db` from the legacy `/app/server/` path into `data/` if needed.
 
 ## 6. Domain & HTTPS
 
@@ -96,5 +104,7 @@ Leave `appUrl` empty in `config.json` — the app auto-detects `window.location.
 | Build fails | Ensure `package-lock.json` exists at root and in `server/` |
 | 502 / app not starting | Check logs; Node 22+ required |
 | LoanDisk sync timeout | Increase `LOANDISK_FETCH_TIMEOUT_MS` |
-| Data lost on redeploy | Add persistent volume for `/app/server` |
+| Data lost on redeploy | Add persistent volume for `/app/server/data` (not `/app/server`) |
+| `/api/documents` 404 | Volume mounted at `/app/server` shadows new code — change to `/app/server/data` and redeploy |
+| Verify new API after deploy | `GET /api/health` should include `"features":{"documents":true,...}` |
 

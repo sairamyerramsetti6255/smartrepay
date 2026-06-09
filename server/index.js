@@ -21,9 +21,9 @@ import {
   fetchBorrowerById,
 } from './loandisk.js'
 
-const __serverDir = path.dirname(fileURLToPath(import.meta.url))
-const UPLOADS_DIR = path.join(__serverDir, 'uploads')
-fs.mkdirSync(UPLOADS_DIR, { recursive: true })
+import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
+
+ensureDataDirs()
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
@@ -146,7 +146,18 @@ setInterval(() => {
 }, 5 * 60 * 1000)
 
 // --- Health ---
-app.get('/api/health', (_req, res) => res.json({ ok: true, backend: 'node-sqlite', ai: !!process.env.OPENROUTER_API_KEY }))
+app.get('/api/health', (_req, res) =>
+  res.json({
+    ok: true,
+    backend: 'node-sqlite',
+    ai: !!process.env.OPENROUTER_API_KEY,
+    build: '1.2.0',
+    features: {
+      documents: true,
+      loandiskBorrowerSearch: true,
+    },
+  })
+)
 
 // --- Ingest ---
 app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req, res) => {

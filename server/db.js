@@ -1,11 +1,9 @@
 import { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'crypto'
 import bcrypt from 'bcryptjs'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import { DB_PATH, ensureDataDirs } from './paths.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DB_PATH = path.join(__dirname, 'smartrepay.db')
+ensureDataDirs()
 
 /** Thin wrapper so existing better-sqlite3-style calls keep working. */
 class SqliteDatabase {

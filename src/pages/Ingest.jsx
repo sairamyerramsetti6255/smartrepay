@@ -466,72 +466,149 @@ export function Ingest() {
         </div>
       )}
 
-      {/* Uploaded documents */}
-      <section className="space-y-3">
+      {/* Uploaded documents grid */}
+      <section className="space-y-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Uploaded documents</h2>
-          <span className="text-[12px] text-[var(--text-tertiary)]">{documents.length} file{documents.length !== 1 ? 's' : ''}</span>
+          <div>
+            <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Uploaded documents</h2>
+            <p className="text-[12px] text-[var(--text-tertiary)] mt-0.5">All imported statement files</p>
+          </div>
+          <span className="text-[12px] font-medium text-[var(--text-secondary)] bg-[var(--bg-subtle)] px-3 py-1 rounded-full">
+            {documents.length} file{documents.length !== 1 ? 's' : ''}
+          </span>
         </div>
 
-        <div className="card overflow-hidden">
-          {docsLoading ? (
-            <div className="flex justify-center py-12">
-              <Loader2 className="h-6 w-6 animate-spin text-[var(--text-tertiary)]" />
-            </div>
-          ) : documents.length === 0 ? (
-            <p className="px-6 py-10 text-center text-[13px] text-[var(--text-secondary)]">
-              No documents uploaded yet. Upload a file above to get started.
-            </p>
-          ) : (
-            <table className="w-full text-[13px]">
-              <thead>
-                <tr className="border-b border-[var(--border-light)] bg-[var(--bg-subtle)] text-left text-[11px] uppercase tracking-wider text-[var(--text-tertiary)]">
-                  <th className="px-5 py-3 font-semibold">Document</th>
-                  <th className="px-3 py-3 font-semibold">Uploaded</th>
-                  <th className="px-3 py-3 font-semibold">Transaction dates</th>
-                  <th className="px-3 py-3 font-semibold text-right">Rows</th>
-                  <th className="px-3 py-3 font-semibold text-right">Matched</th>
-                  <th className="px-3 py-3 font-semibold text-right">Unmatched</th>
-                  <th className="px-5 py-3 font-semibold text-right">Download</th>
-                </tr>
-              </thead>
-              <tbody>
-                {documents.map((doc) => (
-                  <tr key={doc.id} className="border-b border-[var(--border-light)] last:border-0 hover:bg-[var(--bg-hover)]">
-                    <td className="px-5 py-3">
-                      <div className="flex items-center gap-2">
-                        <FileText className="h-4 w-4 text-[var(--accent)] shrink-0" />
-                        <span className="font-medium text-[var(--text-primary)] truncate max-w-[240px]">{doc.filename}</span>
-                      </div>
-                    </td>
-                    <td className="px-3 py-3 text-[var(--text-secondary)] whitespace-nowrap">
-                      {doc.created_at ? formatDate(doc.created_at.slice(0, 10)) : '—'}
-                    </td>
-                    <td className="px-3 py-3 text-[var(--text-secondary)] whitespace-nowrap">
-                      {doc.date_from ? (
-                        <>
-                          {formatDate(doc.date_from)}
-                          {doc.date_to && doc.date_to !== doc.date_from ? ` – ${formatDate(doc.date_to)}` : ''}
-                        </>
-                      ) : (
-                        '—'
-                      )}
-                    </td>
-                    <td className="px-3 py-3 text-right mono text-[var(--text-secondary)]">{doc.total_rows ?? 0}</td>
-                    <td className="px-3 py-3 text-right mono font-medium text-[var(--success)]">{doc.matched_count ?? 0}</td>
-                    <td className="px-3 py-3 text-right mono font-medium text-[var(--danger)]">{doc.unmatched_count ?? 0}</td>
-                    <td className="px-5 py-3 text-right">
-                      <Button variant="secondary" size="sm" onClick={() => downloadDoc(doc)}>
-                        <Download className="h-3.5 w-3.5" />
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+        {docsLoading ? (
+          <div className="flex justify-center py-16 card">
+            <Loader2 className="h-6 w-6 animate-spin text-[var(--text-tertiary)]" />
+          </div>
+        ) : documents.length === 0 ? (
+          <div className="card px-6 py-14 text-center">
+            <FileText className="h-10 w-10 mx-auto text-[var(--text-tertiary)] opacity-50 mb-3" />
+            <p className="text-[14px] font-medium text-[var(--text-primary)]">No documents yet</p>
+            <p className="text-[13px] text-[var(--text-secondary)] mt-1">Upload a file above to see it here</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+            {documents.map((doc) => (
+              <DocumentGridCard key={doc.id} doc={doc} onDownload={() => downloadDoc(doc)} />
+            ))}
+          </div>
+        )}
       </section>
     </div>
+  )
+}
+
+function formatFileSize(bytes) {
+  if (!bytes || bytes < 1) return null
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+const DOC_TYPE_LABELS = {
+  bank: 'Bank statement',
+  employer: 'Employer report',
+  spreadsheet: 'Spreadsheet',
+  pdf: 'PDF',
+}
+
+function DocumentGridCard({ doc, onDownload }) {
+  const ext = doc.filename?.split('.').pop()?.toLowerCase() || ''
+  const isPdf = ext === 'pdf'
+  const isSheet = ['csv', 'xlsx', 'xls', 'xlsm'].includes(ext)
+  const total = doc.total_rows ?? 0
+  const matched = doc.matched_count ?? 0
+  const unmatched = doc.unmatched_count ?? 0
+  const matchPct = total > 0 ? Math.round((matched / total) * 100) : 0
+  const dateRange = doc.date_from
+    ? `${formatDate(doc.date_from)}${doc.date_to && doc.date_to !== doc.date_from ? ` – ${formatDate(doc.date_to)}` : ''}`
+    : '—'
+  const typeLabel = DOC_TYPE_LABELS[doc.document_type] || (isPdf ? 'PDF' : isSheet ? 'Spreadsheet' : ext.toUpperCase())
+  const sizeLabel = formatFileSize(doc.size_bytes)
+
+  const Icon = isSheet ? FileSpreadsheet : FileText
+  const iconBg = isPdf ? 'bg-[var(--danger-bg)]' : isSheet ? 'bg-[var(--success-bg)]' : 'bg-[var(--accent-subtle)]'
+  const iconColor = isPdf ? 'text-[var(--danger)]' : isSheet ? 'text-[var(--success)]' : 'text-[var(--accent)]'
+
+  return (
+    <article className="card card-lift flex flex-col overflow-hidden">
+      <div className="px-4 pt-4 pb-3">
+        <div className="flex items-start gap-3">
+          <div className={cn('h-11 w-11 shrink-0 rounded-[var(--radius-md)] flex items-center justify-center', iconBg)}>
+            <Icon className={cn('h-5 w-5', iconColor)} strokeWidth={1.75} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-semibold text-[var(--text-primary)] leading-snug line-clamp-2" title={doc.filename}>
+              {doc.filename}
+            </p>
+            <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+              <Badge variant="posted" className="text-[10px] py-0 px-1.5">{typeLabel}</Badge>
+              {sizeLabel && (
+                <span className="text-[10px] text-[var(--text-tertiary)] mono">{sizeLabel}</span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 pb-3 space-y-2.5 flex-1 text-[12px] border-t border-[var(--border-light)] pt-3">
+        <div className="flex justify-between gap-2">
+          <span className="text-[var(--text-tertiary)]">Uploaded</span>
+          <span className="text-[var(--text-secondary)] font-medium">
+            {doc.created_at ? formatDate(doc.created_at.slice(0, 10)) : '—'}
+          </span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-[var(--text-tertiary)]">Txn dates</span>
+          <span className="text-[var(--text-secondary)] font-medium text-right truncate max-w-[58%]" title={dateRange}>
+            {dateRange}
+          </span>
+        </div>
+        {total > 0 && (
+          <div className="pt-1">
+            <div className="flex justify-between text-[11px] mb-1.5">
+              <span className="text-[var(--text-tertiary)]">Match rate</span>
+              <span className="mono font-semibold text-[var(--text-primary)]">{matchPct}%</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-[var(--bg-subtle)] overflow-hidden flex">
+              <div
+                className="h-full bg-[var(--success)] transition-all duration-300"
+                style={{ width: `${matchPct}%` }}
+              />
+              {unmatched > 0 && (
+                <div
+                  className="h-full bg-[var(--danger)]/70"
+                  style={{ width: `${100 - matchPct}%` }}
+                />
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-3 divide-x divide-[var(--border-light)] border-t border-[var(--border-light)] bg-[var(--bg-subtle)]/30">
+        <div className="px-3 py-3 text-center">
+          <p className="mono text-[17px] font-bold text-[var(--text-primary)] leading-none">{total}</p>
+          <p className="text-[10px] uppercase tracking-wider text-[var(--text-tertiary)] mt-1">Rows</p>
+        </div>
+        <div className="px-3 py-3 text-center">
+          <p className="mono text-[17px] font-bold text-[var(--success)] leading-none">{matched}</p>
+          <p className="text-[10px] uppercase tracking-wider text-[var(--text-tertiary)] mt-1">Matched</p>
+        </div>
+        <div className="px-3 py-3 text-center">
+          <p className="mono text-[17px] font-bold text-[var(--danger)] leading-none">{unmatched}</p>
+          <p className="text-[10px] uppercase tracking-wider text-[var(--text-tertiary)] mt-1">Unmatched</p>
+        </div>
+      </div>
+
+      <div className="px-4 py-3 border-t border-[var(--border-light)]">
+        <Button variant="secondary" size="sm" className="w-full" onClick={onDownload}>
+          <Download className="h-3.5 w-3.5" />
+          Download original
+        </Button>
+      </div>
+    </article>
   )
 }

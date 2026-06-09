@@ -2,3 +2,4 @@ node_modules/
 smartrepay.db
 smartrepay.db-wal
 smartrepay.db-shm
+data/
