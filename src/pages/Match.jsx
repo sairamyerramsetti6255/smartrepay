@@ -17,7 +17,7 @@ import { DataTable } from '@/components/DataTable'
 import { Drawer } from '@/components/Drawer'
 import { PageLoader } from '@/components/PageLoader'
 import { formatCurrency, formatDate, cn, toUuidOrNull } from '@/lib/utils'
-import { exportToExcel } from '@/lib/exportExcel'
+import { exportMatchedTransactions } from '@/lib/transactionExport'
 
 const FILTERS = [
   { value: 'all', label: 'All' },
@@ -311,29 +311,15 @@ export function Match() {
     loadDocuments()
   }
 
-  function exportTransactionsExcel() {
-    const label = filter === 'matched' ? 'matched' : filter
-    const ok = exportToExcel(
-      filtered,
-      [
-        { key: 'date', label: 'Date', value: (row) => formatDate(row.date) },
-        { key: 'source_filename', label: 'Document', value: (row) => row.source_filename || '' },
-        { key: 'payer', label: 'Payer', value: (row) => row.payer || '' },
-        { key: 'amount', label: 'Amount', value: (row) => row.amount ?? '' },
-        { key: 'status', label: 'Status', value: (row) => STATUS_META[row.status]?.label || row.status || '' },
-        { key: 'confidence_score', label: 'Score', value: (row) => (row.confidence_score != null ? Math.round(row.confidence_score) : '') },
-        {
-          key: 'matched_borrower',
-          label: 'Matched to',
-          value: (row) => (row.matched_borrower_id ? borrowerById[row.matched_borrower_id]?.full_name : '') || '',
-        },
-        { key: 'reference', label: 'Reference', value: (row) => row.reference || '' },
-        { key: 'description', label: 'Description', value: (row) => row.description || '' },
-      ],
-      `${label}-transactions-${new Date().toISOString().slice(0, 10)}.xlsx`
-    )
-    if (!ok) toast.error('No rows to export')
-    else toast.success(`Exported ${filtered.length} rows`)
+  const matchedRows = useMemo(
+    () => matchTransactions.filter((t) => t.status === 'matched' || t.status === 'posted'),
+    [matchTransactions]
+  )
+
+  function exportMatchedExcel() {
+    const ok = exportMatchedTransactions(matchedRows, borrowerById)
+    if (!ok) toast.error('No matched transactions to export')
+    else toast.success(`Exported ${matchedRows.length} matched rows`)
   }
 
   if (initialLoading) return <PageLoader label="Loading transactions and borrowers…" />
@@ -352,6 +338,10 @@ export function Match() {
             <Button variant="secondary" size="sm" onClick={syncLoanDisk} disabled={syncing || running}>
               {syncing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Sync
+            </Button>
+            <Button variant="secondary" size="sm" onClick={exportMatchedExcel} disabled={counts.matched === 0}>
+              <FileSpreadsheet className="h-4 w-4" />
+              Export Matched
             </Button>
             <Button size="sm" onClick={runMatching} disabled={running || syncing}>
               {running ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -451,32 +441,24 @@ export function Match() {
         </section>
       )}
 
-      {/* Filter pills + export */}
-      <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-2 flex-wrap">
-          {FILTERS.map((f) => (
-            <button
-              key={f.value}
-              type="button"
-              onClick={() => setFilter(f.value)}
-              className={cn(
-                'h-8 px-3 rounded-[var(--radius-full)] text-[12px] font-medium transition-colors',
-                filter === f.value
-                  ? 'bg-[var(--accent)] text-white'
-                  : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
-              )}
-            >
-              {f.label}
-              <span className="ml-1.5 opacity-70">{counts[f.value] ?? counts.all}</span>
-            </button>
-          ))}
-        </div>
-        {filter === 'matched' && (
-          <Button variant="secondary" size="sm" onClick={exportTransactionsExcel} disabled={!filtered.length}>
-            <FileSpreadsheet className="h-4 w-4" />
-            Export Excel
-          </Button>
-        )}
+      {/* Filter pills */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {FILTERS.map((f) => (
+          <button
+            key={f.value}
+            type="button"
+            onClick={() => setFilter(f.value)}
+            className={cn(
+              'h-8 px-3 rounded-[var(--radius-full)] text-[12px] font-medium transition-colors',
+              filter === f.value
+                ? 'bg-[var(--accent)] text-white'
+                : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+            )}
+          >
+            {f.label}
+            <span className="ml-1.5 opacity-70">{counts[f.value] ?? counts.all}</span>
+          </button>
+        ))}
       </div>
 
       {/* Transactions table */}

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useExceptions } from '@/hooks/useExceptions'
 import { useBorrowers } from '@/hooks/useBorrowers'
+import { useTransactions } from '@/hooks/useTransactions'
 import { ExceptionDrawer } from '@/components/ExceptionDrawer'
 import { PageHeader } from '@/components/PageHeader'
 import { DataTable } from '@/components/DataTable'
@@ -8,11 +9,11 @@ import { SegmentedControl } from '@/components/SegmentedControl'
 import { Badge } from '@/components/Badge'
 import { Input } from '@/components/ui/input'
 import toast from 'react-hot-toast'
-import { Download } from 'lucide-react'
+import { FileSpreadsheet } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { formatCurrency, formatDate } from '@/lib/utils'
+import { formatCurrency } from '@/lib/utils'
 import { getSlaBucket, aggregateSlaBuckets } from '@/lib/sla'
-import { exportToExcel } from '@/lib/exportExcel'
+import { exportUnmatchedTransactions } from '@/lib/transactionExport'
 import { Card } from '@/components/Card'
 import { PageLoader } from '@/components/PageLoader'
 
@@ -26,7 +27,13 @@ const TYPE_FILTERS = [
 
 export function Exceptions() {
   const { exceptions, loading, error, refetch } = useExceptions()
+  const { transactions } = useTransactions()
   const { borrowers, loans } = useBorrowers()
+  const borrowerById = useMemo(() => Object.fromEntries(borrowers.map((b) => [b.id, b])), [borrowers])
+  const exceptionByTxId = useMemo(
+    () => Object.fromEntries(exceptions.map((ex) => [ex.transaction_id, ex])),
+    [exceptions]
+  )
   const [selected, setSelected] = useState(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [typeFilter, setTypeFilter] = useState('')
@@ -89,19 +96,15 @@ export function Exceptions() {
     },
   ]
 
-  function exportExcel() {
-    const ok = exportToExcel(filtered, [
-      { key: 'payer', label: 'Payer', value: (ex) => ex.transactions?.payer || '' },
-      { key: 'amount', label: 'Amount', value: (ex) => ex.transactions?.amount ?? '' },
-      { key: 'date', label: 'Date', value: (ex) => formatDate(ex.transactions?.date) },
-      { key: 'type', label: 'Type', value: (ex) => ex.type || '' },
-      { key: 'status', label: 'Status', value: (ex) => ex.status || '' },
-      { key: 'assigned_to', label: 'Assigned', value: (ex) => ex.assigned_to || '' },
-      { key: 'sla', label: 'SLA Status', value: (ex) => getSlaBucket(ex.created_at, ex.sla_hours).label },
-      { key: 'reference', label: 'Reference', value: (ex) => ex.transactions?.reference || '' },
-    ], `unmatched-report-${new Date().toISOString().slice(0, 10)}.xlsx`)
-    if (!ok) toast.error('No rows to export')
-    else toast.success(`Exported ${filtered.length} rows`)
+  const unmatchedRows = useMemo(
+    () => transactions.filter((t) => t.status === 'exception'),
+    [transactions]
+  )
+
+  function exportUnmatchedExcel() {
+    const ok = exportUnmatchedTransactions(unmatchedRows, { exceptionByTxId, borrowerById })
+    if (!ok) toast.error('No unmatched transactions to export')
+    else toast.success(`Exported ${unmatchedRows.length} unmatched rows`)
   }
 
   return (
@@ -109,9 +112,9 @@ export function Exceptions() {
       <PageHeader
         title="Unmatched Queue"
         actions={
-          <Button variant="secondary" size="sm" onClick={exportExcel} disabled={!filtered.length}>
-            <Download className="h-4 w-4" />
-            Export Excel
+          <Button variant="secondary" size="sm" onClick={exportUnmatchedExcel} disabled={!unmatchedRows.length}>
+            <FileSpreadsheet className="h-4 w-4" />
+            Export Unmatched
           </Button>
         }
       />
