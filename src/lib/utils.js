@@ -10,9 +10,34 @@ export function formatCurrency(amount) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 }
 
+/** Parse API/SQLite date strings without producing Invalid Date. */
+export function parseDateInput(date) {
+  if (date == null || date === '') return null
+  if (date instanceof Date) return Number.isNaN(date.getTime()) ? null : date
+
+  const raw = String(date).trim()
+  if (!raw) return null
+
+  // SQLite datetime: "2024-06-09 13:11:33"
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(raw)) {
+    const d = new Date(raw.replace(' ', 'T'))
+    if (!Number.isNaN(d.getTime())) return d
+  }
+
+  // Date-only: "2024-06-09"
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const d = new Date(`${raw}T00:00:00`)
+    if (!Number.isNaN(d.getTime())) return d
+  }
+
+  const d = new Date(raw)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
 export function formatDate(date) {
-  if (!date) return '—'
-  return new Date(date + (String(date).includes('T') ? '' : 'T00:00:00')).toLocaleDateString('en-US', {
+  const d = parseDateInput(date)
+  if (!d) return '—'
+  return d.toLocaleDateString('en-US', {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -20,8 +45,9 @@ export function formatDate(date) {
 }
 
 export function formatDateTime(date) {
-  if (!date) return '—'
-  return new Date(date).toLocaleString('en-US', {
+  const d = parseDateInput(date)
+  if (!d) return '—'
+  return d.toLocaleString('en-US', {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',

@@ -7,8 +7,12 @@ import { DataTable } from '@/components/DataTable'
 import { SegmentedControl } from '@/components/SegmentedControl'
 import { Badge } from '@/components/Badge'
 import { Input } from '@/components/ui/input'
-import { formatCurrency } from '@/lib/utils'
-import { getSlaBucket, formatAge, aggregateSlaBuckets } from '@/lib/sla'
+import toast from 'react-hot-toast'
+import { Download } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { formatCurrency, formatDate } from '@/lib/utils'
+import { getSlaBucket, aggregateSlaBuckets } from '@/lib/sla'
+import { exportToExcel } from '@/lib/exportExcel'
 import { Card } from '@/components/Card'
 import { PageLoader } from '@/components/PageLoader'
 
@@ -57,7 +61,6 @@ export function Exceptions() {
     },
     { key: 'type', label: 'Type', render: (ex) => <Badge variant="exception">{ex.type}</Badge> },
     { key: 'assigned_to', label: 'Assigned', render: (ex) => ex.assigned_to || '—' },
-    { key: 'age', label: 'Age', render: (ex) => <span className="mono text-[13px]">{formatAge(ex.created_at)}</span> },
     {
       key: 'sla',
       label: 'SLA Status',
@@ -86,9 +89,32 @@ export function Exceptions() {
     },
   ]
 
+  function exportExcel() {
+    const ok = exportToExcel(filtered, [
+      { key: 'payer', label: 'Payer', value: (ex) => ex.transactions?.payer || '' },
+      { key: 'amount', label: 'Amount', value: (ex) => ex.transactions?.amount ?? '' },
+      { key: 'date', label: 'Date', value: (ex) => formatDate(ex.transactions?.date) },
+      { key: 'type', label: 'Type', value: (ex) => ex.type || '' },
+      { key: 'status', label: 'Status', value: (ex) => ex.status || '' },
+      { key: 'assigned_to', label: 'Assigned', value: (ex) => ex.assigned_to || '' },
+      { key: 'sla', label: 'SLA Status', value: (ex) => getSlaBucket(ex.created_at, ex.sla_hours).label },
+      { key: 'reference', label: 'Reference', value: (ex) => ex.transactions?.reference || '' },
+    ], `unmatched-report-${new Date().toISOString().slice(0, 10)}.xlsx`)
+    if (!ok) toast.error('No rows to export')
+    else toast.success(`Exported ${filtered.length} rows`)
+  }
+
   return (
     <div className="space-y-6">
-      <PageHeader title="Unmatched Queue" />
+      <PageHeader
+        title="Unmatched Queue"
+        actions={
+          <Button variant="secondary" size="sm" onClick={exportExcel} disabled={!filtered.length}>
+            <Download className="h-4 w-4" />
+            Export Excel
+          </Button>
+        }
+      />
 
       <Card className="flex h-[72px] items-stretch overflow-hidden">
         <SlaMetric label="On Track" value={heatmap.on_track} color="var(--success)" />

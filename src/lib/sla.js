@@ -1,5 +1,8 @@
+import { parseDateInput } from '@/lib/utils'
+
 export function getSlaBucket(createdAt, slaHours = 24) {
-  const created = new Date(createdAt)
+  const created = parseDateInput(createdAt)
+  if (!created) return { bucket: 'on_track', label: 'On Track', pct: 0, hoursElapsed: 0, className: 'badge-matched' }
   const hoursElapsed = (Date.now() - created.getTime()) / (1000 * 60 * 60)
   const pct = (hoursElapsed / slaHours) * 100
 
@@ -9,7 +12,9 @@ export function getSlaBucket(createdAt, slaHours = 24) {
 }
 
 export function formatAge(createdAt) {
-  const hours = (Date.now() - new Date(createdAt).getTime()) / (1000 * 60 * 60)
+  const created = parseDateInput(createdAt)
+  if (!created) return '—'
+  const hours = (Date.now() - created.getTime()) / (1000 * 60 * 60)
   if (hours < 1) return `${Math.floor(hours * 60)}m`
   const h = Math.floor(hours)
   const m = Math.floor((hours - h) * 60)

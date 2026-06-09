@@ -35,13 +35,7 @@ export function DemoDataBanner() {
     }
   }
 
-  if (!counts || counts.error) {
-    return (
-      <div className="mb-6 rounded-[var(--radius-md)] border border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-[13px] text-[var(--danger)]">
-        Database: {counts?.error || 'unreachable'} — run migration in Supabase SQL Editor.
-      </div>
-    )
-  }
+  if (!counts || counts.error) return null
 
   if (counts.borrowers > 0 && counts.transactions > 0) return null
 
