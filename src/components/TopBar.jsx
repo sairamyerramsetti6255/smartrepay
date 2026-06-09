@@ -6,7 +6,7 @@ import { useAuth } from '@/context/AuthContext'
 
 const routeLabels = {
   '/': 'Dashboard',
-  '/ingest': 'Ingest',
+  '/ingest': 'Upload Documents',
   '/match': 'Match',
   '/exceptions': 'Unmatched',
   '/reconcile': 'Reconcile',

@@ -1,6 +1,6 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
-import { Upload, Check, X, Loader2, Sparkles, FileSpreadsheet, FileText } from 'lucide-react'
+import { Upload, Check, X, Loader2, Sparkles, FileSpreadsheet, FileText, Download } from 'lucide-react'
 import * as api from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { PageHeader } from '@/components/PageHeader'
@@ -44,6 +44,8 @@ export function Ingest() {
   const [parsing, setParsing] = useState(false)
   const [parseReady, setParseReady] = useState(false)
   const [dragOver, setDragOver] = useState(false)
+  const [documents, setDocuments] = useState([])
+  const [docsLoading, setDocsLoading] = useState(true)
 
   const isBankPdf = source === 'bank' || source === 'pdf'
   const isEmployerPdf = source === 'employer'
@@ -126,8 +128,9 @@ export function Ingest() {
     setImporting(true)
     try {
       const { inserted } = await api.ingest.import(parseId)
-      toast.success(`Imported ${inserted} transactions — go to Match to sync LoanDisk & run matching`)
+      toast.success(`Imported ${inserted} transactions — go to Match to run matching`)
       reset()
+      await loadDocuments()
       window.dispatchEvent(new Event('smartrepay:demo-loaded'))
     } catch (e) {
       toast.error(e.message)
@@ -140,11 +143,35 @@ export function Ingest() {
   const displayCreditRows = creditRows.length ? creditRows : rawRows
   const showUpload = !parseReady && !preview.length
 
+  async function loadDocuments() {
+    setDocsLoading(true)
+    try {
+      const docs = await api.documents.list()
+      setDocuments(Array.isArray(docs) ? docs : [])
+    } catch {
+      setDocuments([])
+    } finally {
+      setDocsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadDocuments()
+  }, [])
+
+  async function downloadDoc(doc) {
+    try {
+      await api.documents.download(doc.id, doc.filename)
+    } catch (e) {
+      toast.error(e.message)
+    }
+  }
+
   return (
-    <div className={cn('space-y-8', isPdfDoc ? 'max-w-6xl' : 'max-w-4xl')}>
+    <div className={cn('space-y-8', isPdfDoc ? 'max-w-6xl' : 'max-w-5xl')}>
       <PageHeader
-        title="Ingest Statement"
-        subtitle="Upload bank statements (CSV, Excel, PDF) or employer salary deduction reports (PDF). Names, dates, amounts, and remarks are extracted automatically."
+        title="Upload Documents"
+        subtitle="Upload bank statements (CSV, Excel, PDF) or employer salary reports. Imported files are saved and listed below."
       />
 
       <div className="flex items-center gap-3 text-[13px]">
@@ -438,6 +465,73 @@ export function Ingest() {
           </div>
         </div>
       )}
+
+      {/* Uploaded documents */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Uploaded documents</h2>
+          <span className="text-[12px] text-[var(--text-tertiary)]">{documents.length} file{documents.length !== 1 ? 's' : ''}</span>
+        </div>
+
+        <div className="card overflow-hidden">
+          {docsLoading ? (
+            <div className="flex justify-center py-12">
+              <Loader2 className="h-6 w-6 animate-spin text-[var(--text-tertiary)]" />
+            </div>
+          ) : documents.length === 0 ? (
+            <p className="px-6 py-10 text-center text-[13px] text-[var(--text-secondary)]">
+              No documents uploaded yet. Upload a file above to get started.
+            </p>
+          ) : (
+            <table className="w-full text-[13px]">
+              <thead>
+                <tr className="border-b border-[var(--border-light)] bg-[var(--bg-subtle)] text-left text-[11px] uppercase tracking-wider text-[var(--text-tertiary)]">
+                  <th className="px-5 py-3 font-semibold">Document</th>
+                  <th className="px-3 py-3 font-semibold">Uploaded</th>
+                  <th className="px-3 py-3 font-semibold">Transaction dates</th>
+                  <th className="px-3 py-3 font-semibold text-right">Rows</th>
+                  <th className="px-3 py-3 font-semibold text-right">Matched</th>
+                  <th className="px-3 py-3 font-semibold text-right">Unmatched</th>
+                  <th className="px-5 py-3 font-semibold text-right">Download</th>
+                </tr>
+              </thead>
+              <tbody>
+                {documents.map((doc) => (
+                  <tr key={doc.id} className="border-b border-[var(--border-light)] last:border-0 hover:bg-[var(--bg-hover)]">
+                    <td className="px-5 py-3">
+                      <div className="flex items-center gap-2">
+                        <FileText className="h-4 w-4 text-[var(--accent)] shrink-0" />
+                        <span className="font-medium text-[var(--text-primary)] truncate max-w-[240px]">{doc.filename}</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-3 text-[var(--text-secondary)] whitespace-nowrap">
+                      {doc.created_at ? formatDate(doc.created_at.slice(0, 10)) : '—'}
+                    </td>
+                    <td className="px-3 py-3 text-[var(--text-secondary)] whitespace-nowrap">
+                      {doc.date_from ? (
+                        <>
+                          {formatDate(doc.date_from)}
+                          {doc.date_to && doc.date_to !== doc.date_from ? ` – ${formatDate(doc.date_to)}` : ''}
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td className="px-3 py-3 text-right mono text-[var(--text-secondary)]">{doc.total_rows ?? 0}</td>
+                    <td className="px-3 py-3 text-right mono font-medium text-[var(--success)]">{doc.matched_count ?? 0}</td>
+                    <td className="px-3 py-3 text-right mono font-medium text-[var(--danger)]">{doc.unmatched_count ?? 0}</td>
+                    <td className="px-5 py-3 text-right">
+                      <Button variant="secondary" size="sm" onClick={() => downloadDoc(doc)}>
+                        <Download className="h-3.5 w-3.5" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </section>
     </div>
   )
 }

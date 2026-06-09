@@ -18,7 +18,7 @@ const groups = [
     label: 'Main',
     items: [
       { to: '/', label: 'Dashboard', icon: LayoutDashboard },
-      { to: '/ingest', label: 'Ingest', icon: Upload },
+      { to: '/ingest', label: 'Upload Documents', icon: Upload },
       { to: '/match', label: 'Match', icon: GitCompare },
     ],
   },

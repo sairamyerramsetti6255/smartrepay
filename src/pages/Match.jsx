@@ -410,11 +410,11 @@ export function Match() {
         pageSize={25}
         onRowClick={(row) => setDetailTx(row)}
         emptyMessage={counts.all === 0 ? 'No transactions yet' : 'No transactions in this filter'}
-        emptyDescription={counts.all === 0 ? 'Import a statement from Ingest first' : 'Try another filter'}
+        emptyDescription={counts.all === 0 ? 'Upload a statement first' : 'Try another filter'}
         emptyAction={
           counts.all === 0 ? (
             <Link to="/ingest">
-              <Button variant="secondary" size="sm">Go to Ingest</Button>
+              <Button variant="secondary" size="sm">Upload Documents</Button>
             </Link>
           ) : null
         }
