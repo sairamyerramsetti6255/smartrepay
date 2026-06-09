@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import toast from 'react-hot-toast'
-import { ArrowRight, Download, FileSpreadsheet, FileText, Loader2, RefreshCw, Upload, User } from 'lucide-react'
+import { ArrowRight, Download, FileSpreadsheet, FileText, Loader2, RefreshCw, Search, Upload, User } from 'lucide-react'
 import * as api from '@/lib/api'
 import { explainMatch, confidenceVariant, confidenceLabel } from '@/lib/matcher'
 import { writeAuditLog } from '@/lib/audit'
@@ -9,6 +9,8 @@ import { useAuth } from '@/context/AuthContext'
 import { useTransactions } from '@/hooks/useTransactions'
 import { useBorrowers } from '@/hooks/useBorrowers'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { PageHeader } from '@/components/PageHeader'
 import { Badge } from '@/components/Badge'
 import { DataTable } from '@/components/DataTable'
@@ -21,15 +23,17 @@ const FILTERS = [
   { value: 'all', label: 'All' },
   { value: 'pending', label: 'Pending' },
   { value: 'matched', label: 'Matched' },
-  { value: 'exception', label: 'Unmatched' },
 ]
 
 function matchesStatusFilter(tx, filter) {
   if (filter === 'all') return true
   if (filter === 'pending') return tx.status === 'pending'
   if (filter === 'matched') return tx.status === 'matched' || tx.status === 'posted'
-  if (filter === 'exception') return tx.status === 'exception'
   return tx.status === filter
+}
+
+function isMatchScreenTx(tx) {
+  return tx.status !== 'exception'
 }
 
 const STATUS_META = {
@@ -47,10 +51,11 @@ export function Match() {
   const [filter, setFilter] = useState('all')
   const [running, setRunning] = useState(false)
   const [syncing, setSyncing] = useState(false)
-  const [ldStatus, setLdStatus] = useState(null)
   const [documents, setDocuments] = useState([])
   const [docsLoading, setDocsLoading] = useState(true)
   const [documentFilter, setDocumentFilter] = useState(null)
+  const [selectedBorrowerId, setSelectedBorrowerId] = useState('')
+  const [borrowerSearch, setBorrowerSearch] = useState('')
 
   const initialLoading = txLoading || brLoading
   const refreshing = txRefreshing || brRefreshing
@@ -58,22 +63,29 @@ export function Match() {
 
   const borrowerById = useMemo(() => Object.fromEntries(borrowers.map((b) => [b.id, b])), [borrowers])
 
+  const matchTransactions = useMemo(
+    () => transactions.filter(isMatchScreenTx),
+    [transactions]
+  )
+
   const filtered = useMemo(() => {
-    let list = transactions.filter((t) => matchesStatusFilter(t, filter))
+    let list = matchTransactions.filter((t) => matchesStatusFilter(t, filter))
     if (documentFilter) list = list.filter((t) => t.source_document_id === documentFilter)
-    const order = { pending: 0, matched: 1, posted: 2, exception: 3 }
+    const order = { pending: 0, matched: 1, posted: 2 }
     return [...list].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9))
-  }, [transactions, filter, documentFilter])
+  }, [matchTransactions, filter, documentFilter])
 
   const counts = useMemo(
     () => ({
-      all: transactions.length,
-      pending: transactions.filter((t) => t.status === 'pending').length,
-      matched: transactions.filter((t) => t.status === 'matched' || t.status === 'posted').length,
-      exception: transactions.filter((t) => t.status === 'exception').length,
+      all: matchTransactions.length,
+      pending: matchTransactions.filter((t) => t.status === 'pending').length,
+      matched: matchTransactions.filter((t) => t.status === 'matched' || t.status === 'posted').length,
     }),
-    [transactions]
+    [matchTransactions]
   )
+
+  const selectedBorrower = selectedBorrowerId ? borrowerById[selectedBorrowerId] : null
+  const selectedLoan = selectedBorrower ? loans.find((l) => l.borrower_id === selectedBorrower.id) : null
 
   const detailMatch = useMemo(() => {
     if (!detailTx || !borrowers.length) {
@@ -172,9 +184,19 @@ export function Match() {
   }, [refetch, refetchBorrowers])
 
   useEffect(() => {
-    api.loandisk.status().then(setLdStatus).catch(() => setLdStatus({ ok: false }))
     loadDocuments()
   }, [])
+
+  useEffect(() => {
+    if (!detailTx) {
+      setSelectedBorrowerId('')
+      setBorrowerSearch('')
+      return
+    }
+    const suggested = detailTx.matched_borrower_id || detailMatch.borrower?.id || ''
+    setSelectedBorrowerId(suggested)
+    setBorrowerSearch('')
+  }, [detailTx?.id, detailMatch.borrower?.id])
 
   async function loadDocuments() {
     setDocsLoading(true)
@@ -216,7 +238,6 @@ export function Match() {
       const result = await syncFromLoanDisk()
       toast.success(`Synced ${result.synced} borrowers`)
       refetchBorrowers()
-      setLdStatus(await api.loandisk.status())
     } catch (e) {
       toast.error(e.message)
     } finally {
@@ -255,12 +276,15 @@ export function Match() {
   }
 
   async function confirmOne() {
-    if (!detailMatch.borrower || !detailTx) return toast.error('No borrower match')
+    if (!detailTx) return
+    if (!selectedBorrower) return toast.error('Search and select a borrower')
+    const explained = explainMatch(detailTx, [selectedBorrower])
+    const score = Math.max(detailTx.confidence_score || 0, explained.score || 0, 100)
     await api.transactions.update(detailTx.id, {
       status: 'matched',
-      confidence_score: detailMatch.score,
-      matched_borrower_id: toUuidOrNull(detailMatch.borrower.id),
-      loan_id: toUuidOrNull(detailMatch.loan?.id),
+      confidence_score: score,
+      matched_borrower_id: toUuidOrNull(selectedBorrower.id),
+      loan_id: toUuidOrNull(selectedLoan?.id),
       action: 'confirm_match',
     })
     await writeAuditLog({
@@ -269,7 +293,7 @@ export function Match() {
       action: 'confirm_match',
       actor: user.email,
       priorValue: null,
-      newValue: { borrower: detailMatch.borrower.id },
+      newValue: { borrower: selectedBorrower.id },
     })
     toast.success('Match confirmed')
     setDetailTx(null)
@@ -277,8 +301,18 @@ export function Match() {
     loadDocuments()
   }
 
+  async function rejectOne() {
+    if (!detailTx) return
+    await api.transactions.update(detailTx.id, { status: 'exception', action: 'reject_match' })
+    await api.exceptions.create({ transaction_id: detailTx.id, type: 'unmatched', assigned_to: user.email })
+    toast.success('Rejected — moved to Unmatched queue')
+    setDetailTx(null)
+    refetch()
+    loadDocuments()
+  }
+
   function exportTransactionsExcel() {
-    const label = filter === 'matched' ? 'matched' : filter === 'exception' ? 'unmatched' : filter
+    const label = filter === 'matched' ? 'matched' : filter
     const ok = exportToExcel(
       filtered,
       [
@@ -300,16 +334,6 @@ export function Match() {
     )
     if (!ok) toast.error('No rows to export')
     else toast.success(`Exported ${filtered.length} rows`)
-  }
-
-  async function sendToExceptions() {
-    if (!detailTx) return
-    await api.transactions.update(detailTx.id, { status: 'exception', action: 'send_to_queue' })
-    await api.exceptions.create({ transaction_id: detailTx.id, type: 'unmatched', assigned_to: user.email })
-    toast.success('Sent to unmatched queue')
-    setDetailTx(null)
-    refetch()
-    loadDocuments()
   }
 
   if (initialLoading) return <PageLoader label="Loading transactions and borrowers…" />
@@ -343,11 +367,10 @@ export function Match() {
         </div>
       )}
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-3 gap-3">
         <StatCard label="Total" value={counts.all} />
         <StatCard label="Pending" value={counts.pending} accent />
         <StatCard label="Matched" value={counts.matched} success />
-        <StatCard label="Unmatched" value={counts.exception} warn sub={ldStatus?.ok ? 'LoanDisk connected' : 'Sync LoanDisk'} />
       </div>
 
       {/* Documents table */}
@@ -368,7 +391,6 @@ export function Match() {
                   <th className="px-5 py-3 font-semibold">Document</th>
                   <th className="px-3 py-3 font-semibold">Dates</th>
                   <th className="px-3 py-3 font-semibold text-right">Matched</th>
-                  <th className="px-3 py-3 font-semibold text-right">Unmatched</th>
                   <th className="px-3 py-3 font-semibold text-right">Total</th>
                   <th className="px-5 py-3 font-semibold text-right">Download</th>
                 </tr>
@@ -376,7 +398,7 @@ export function Match() {
               <tbody>
                 {docsLoading ? (
                   <tr>
-                    <td colSpan={6} className="px-5 py-8 text-center">
+                    <td colSpan={5} className="px-5 py-8 text-center">
                       <Loader2 className="h-5 w-5 animate-spin mx-auto text-[var(--text-tertiary)]" />
                     </td>
                   </tr>
@@ -407,7 +429,6 @@ export function Match() {
                         )}
                       </td>
                       <td className="px-3 py-3 text-right mono font-medium text-[var(--success)]">{doc.matched_count ?? 0}</td>
-                      <td className="px-3 py-3 text-right mono font-medium text-[var(--danger)]">{doc.unmatched_count ?? 0}</td>
                       <td className="px-3 py-3 text-right mono text-[var(--text-secondary)]">{doc.total_rows ?? 0}</td>
                       <td className="px-5 py-3 text-right">
                         <Button
@@ -450,7 +471,7 @@ export function Match() {
             </button>
           ))}
         </div>
-        {(filter === 'matched' || filter === 'exception') && (
+        {filter === 'matched' && (
           <Button variant="secondary" size="sm" onClick={exportTransactionsExcel} disabled={!filtered.length}>
             <FileSpreadsheet className="h-4 w-4" />
             Export Excel
@@ -485,26 +506,69 @@ export function Match() {
         footer={
           detailTx?.status === 'pending' ? (
             <div className="flex gap-2 w-full">
-              <Button className="flex-1" onClick={confirmOne} disabled={!detailMatch.borrower}>
+              <Button className="flex-1" onClick={confirmOne} disabled={!selectedBorrowerId}>
                 Confirm match
               </Button>
-              <Button className="flex-1" variant="secondary" onClick={sendToExceptions}>
-                Unmatched
+              <Button className="flex-1" variant="secondary" onClick={rejectOne}>
+                Reject
               </Button>
             </div>
           ) : null
         }
       >
         {detailTx && (
-          <MatchDetailContent tx={detailTx} match={detailMatch} />
+          <MatchDetailContent
+            tx={detailTx}
+            match={detailMatch}
+            borrowers={borrowers}
+            selectedBorrower={selectedBorrower}
+            selectedLoan={selectedLoan}
+            selectedBorrowerId={selectedBorrowerId}
+            onSelectBorrower={setSelectedBorrowerId}
+            borrowerSearch={borrowerSearch}
+            onBorrowerSearchChange={setBorrowerSearch}
+          />
         )}
       </Drawer>
     </div>
   )
 }
 
-function MatchDetailContent({ tx, match }) {
+function MatchDetailContent({
+  tx,
+  match,
+  borrowers,
+  selectedBorrower,
+  selectedLoan,
+  selectedBorrowerId,
+  onSelectBorrower,
+  borrowerSearch,
+  onBorrowerSearchChange,
+}) {
   const status = STATUS_META[tx.status] || STATUS_META.pending
+  const displayBorrower = selectedBorrower || match.borrower
+  const displayLoan = selectedLoan || match.loan
+
+  const filteredBorrowers = useMemo(() => {
+    const q = borrowerSearch.toLowerCase().trim()
+    const list = !q
+      ? borrowers
+      : borrowers.filter((b) => {
+          const hay = [
+            b.full_name,
+            b.first_name,
+            b.last_name,
+            b.employer,
+            b.loandisk_id,
+            ...(Array.isArray(b.aliases) ? b.aliases : []),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase()
+          return hay.includes(q)
+        })
+    return list.slice(0, 40)
+  }, [borrowers, borrowerSearch])
 
   return (
     <div className="space-y-5 p-6">
@@ -529,21 +593,63 @@ function MatchDetailContent({ tx, match }) {
         <CompareCard
           title="Borrower"
           icon={User}
-          empty={!match.borrower}
-          emptyText="No match"
+          empty={!displayBorrower}
+          emptyText="Select a borrower below"
           rows={
-            match.borrower
+            displayBorrower
               ? [
-                  { label: 'Name', value: match.borrower.full_name, highlight: true },
-                  { label: 'Employer', value: match.borrower.employer },
-                  { label: 'Branch', value: match.borrower.branch_name },
-                  { label: 'LoanDisk ID', value: match.borrower.loandisk_id, mono: true },
-                  { label: 'Loan #', value: match.loan?.loan_number, mono: true },
+                  { label: 'Name', value: displayBorrower.full_name, highlight: true },
+                  { label: 'Employer', value: displayBorrower.employer },
+                  { label: 'Branch', value: displayBorrower.branch_name },
+                  { label: 'LoanDisk ID', value: displayBorrower.loandisk_id, mono: true },
+                  { label: 'Loan #', value: displayLoan?.loan_number, mono: true },
                 ]
               : []
           }
         />
       </div>
+
+      {tx.status === 'pending' && (
+        <section className="rounded-[var(--radius-md)] border border-[var(--border-light)] bg-[var(--bg-card)] p-4 space-y-3">
+          <div>
+            <Label className="mb-1.5 block text-[12px]">Search borrower</Label>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--text-tertiary)]" />
+              <Input
+                className="pl-9"
+                placeholder="Type name, employer, or LoanDisk ID…"
+                value={borrowerSearch}
+                onChange={(e) => onBorrowerSearchChange(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="max-h-[200px] overflow-y-auto rounded-[var(--radius-md)] border border-[var(--border-light)] divide-y divide-[var(--border-light)]">
+            {filteredBorrowers.length === 0 ? (
+              <p className="px-3 py-6 text-center text-[12px] text-[var(--text-tertiary)]">No borrowers found</p>
+            ) : (
+              filteredBorrowers.map((b) => (
+                <button
+                  key={b.id}
+                  type="button"
+                  onClick={() => onSelectBorrower(b.id)}
+                  className={cn(
+                    'w-full text-left px-3 py-2.5 text-[12px] transition-colors hover:bg-[var(--bg-hover)]',
+                    selectedBorrowerId === b.id && 'bg-[var(--accent-subtle)]'
+                  )}
+                >
+                  <p className="font-semibold text-[var(--text-primary)]">{b.full_name}</p>
+                  <p className="text-[var(--text-tertiary)] mt-0.5 truncate">
+                    {[b.employer, b.branch_name, b.loandisk_id ? `ID ${b.loandisk_id}` : null].filter(Boolean).join(' · ') || '—'}
+                  </p>
+                </button>
+              ))
+            )}
+          </div>
+          {match.borrower && !selectedBorrowerId && (
+            <p className="text-[11px] text-[var(--text-tertiary)]">Suggested: {match.borrower.full_name}</p>
+          )}
+        </section>
+      )}
 
       <div className="flex items-center justify-center text-[var(--text-tertiary)]">
         <ArrowRight className="h-4 w-4" />
