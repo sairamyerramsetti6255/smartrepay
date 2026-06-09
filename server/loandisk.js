@@ -182,12 +182,16 @@ export async function fetchAllBorrowers() {
 /** POST /SP/BorrowerSerch — search by name(s) for matching. */
 export async function borrowerSearch(searchCriteria) {
   const token = await getLoanDiskToken()
-  const criteria = (Array.isArray(searchCriteria) ? searchCriteria : [searchCriteria]).map((c) => ({
-    name: String(c.name || c).trim(),
-    loanAmount: c.loanAmount ?? '',
-    emi: c.emi ?? '',
-    branchId: c.branchId ?? '',
-  }))
+  const criteria = (Array.isArray(searchCriteria) ? searchCriteria : [searchCriteria])
+    .map((c) => ({
+      name: String(c.name || c).trim(),
+      loanAmount: c.loanAmount ?? '',
+      emi: c.emi ?? '',
+      branchId: c.branchId ?? '',
+    }))
+    .filter((c) => c.name.length > 0)
+
+  if (!criteria.length) throw new Error('BorrowerSerch requires at least one name')
 
   const res = await fetch(`${API_BASE}/SP/BorrowerSerch`, {
     method: 'POST',
@@ -204,50 +208,169 @@ export async function borrowerSearch(searchCriteria) {
   return data
 }
 
+/** First token of payer name — API expects names like "Kevin", "Godfrey". */
+export function borrowerSearchTerm(payer) {
+  const parts = String(payer || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+  if (!parts.length) return ''
+  const first = parts[0]
+  if (first.length <= 2 && parts.length > 1) {
+    return parts.slice(0, 2).join(' ')
+  }
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase()
+}
+
+function registerSearchBorrower(normalized, searchName, ctx) {
+  if (!normalized) return
+  const { all, seen, bySearchName } = ctx
+  if (!seen.has(normalized.loandisk_id)) {
+    seen.add(normalized.loandisk_id)
+    all.push(normalized)
+  }
+  if (!searchName) return
+  const key = String(searchName).toLowerCase().trim()
+  if (!bySearchName.has(key)) bySearchName.set(key, [])
+  const list = bySearchName.get(key)
+  if (!list.some((b) => b.loandisk_id === normalized.loandisk_id)) {
+    list.push(normalized)
+  }
+}
+
+function ingestSearchRows(rows, searchName, ctx) {
+  if (rows == null) return
+  for (const row of flattenResults(rows)) {
+    registerSearchBorrower(normalizeLoanDiskBorrower(row), searchName, ctx)
+  }
+}
+
 /** Parse BorrowerSerch response into normalized borrower rows keyed by search name. */
 export function parseBorrowerSearchResults(data, searchNames = []) {
   if (data.code !== undefined && !isSuccessCode(data.code)) {
     throw new Error(data.message || data.title || 'BorrowerSerch failed')
   }
 
-  const bySearchName = new Map()
-  const all = []
-  const seen = new Set()
-
+  const ctx = { all: [], seen: new Set(), bySearchName: new Map() }
   const doc = data.document
-  const resultBlocks = Array.isArray(doc) ? doc : doc ? [doc] : []
 
-  for (let i = 0; i < resultBlocks.length; i++) {
-    const block = resultBlocks[i]
-    const searchName = searchNames[i] || block?.searchName || block?.name || null
-    const results = block?.data?.response?.Results ?? block?.response?.Results ?? block?.Results
-    const rows = flattenResults(results)
-
-    for (const row of rows) {
-      const normalized = normalizeLoanDiskBorrower(row)
-      if (!normalized || seen.has(normalized.loandisk_id)) continue
-      seen.add(normalized.loandisk_id)
-      all.push(normalized)
-      if (searchName) {
-        const key = String(searchName).toLowerCase().trim()
-        if (!bySearchName.has(key)) bySearchName.set(key, [])
-        bySearchName.get(key).push(normalized)
+  // Shape A: document.response.Results[i] — one result set per searchCriteria entry
+  const parallelResults = doc?.response?.Results ?? doc?.data?.response?.Results
+  if (Array.isArray(parallelResults) && parallelResults.length) {
+    for (let i = 0; i < parallelResults.length; i++) {
+      const searchName = searchNames[i] || null
+      const chunk = parallelResults[i]
+      if (Array.isArray(chunk)) {
+        ingestSearchRows(chunk, searchName, ctx)
+      } else if (chunk && typeof chunk === 'object') {
+        ingestSearchRows(chunk?.data?.response?.Results ?? chunk?.response?.Results ?? chunk?.Results ?? [chunk], searchName, ctx)
       }
     }
   }
 
-  // Flat fallback: single Results array on document
-  if (!all.length && doc?.response?.Results) {
-    for (const row of flattenResults(doc.response.Results)) {
-      const normalized = normalizeLoanDiskBorrower(row)
-      if (normalized && !seen.has(normalized.loandisk_id)) {
-        seen.add(normalized.loandisk_id)
-        all.push(normalized)
+  // Shape B: document[] — one block per criteria
+  if (Array.isArray(doc)) {
+    for (let i = 0; i < doc.length; i++) {
+      const block = doc[i]
+      const searchName =
+        searchNames[i] ||
+        block?.searchName ||
+        block?.name ||
+        block?.searchCriteria?.name ||
+        block?.criteria?.name ||
+        null
+      const results = block?.data?.response?.Results ?? block?.response?.Results ?? block?.Results
+      if (results) ingestSearchRows(results, searchName, ctx)
+      else if (getBorrowerRowId(block)) registerSearchBorrower(normalizeLoanDiskBorrower(block), searchName, ctx)
+    }
+  }
+
+  // Shape C: single object with nested Results
+  if (!ctx.all.length && doc && !Array.isArray(doc)) {
+    const results = doc?.data?.response?.Results ?? doc?.response?.Results ?? doc?.Results
+    if (results) ingestSearchRows(results, searchNames[0] || null, ctx)
+    else if (getBorrowerRowId(doc)) registerSearchBorrower(normalizeLoanDiskBorrower(doc), searchNames[0] || null, ctx)
+  }
+
+  // Shape D: top-level Results (some gateways)
+  if (!ctx.all.length && Array.isArray(data.Results)) {
+    ingestSearchRows(data.Results, searchNames[0] || null, ctx)
+  }
+
+  // If we got borrowers but no per-name map, attach pool to every search term
+  if (ctx.all.length && !ctx.bySearchName.size && searchNames.length) {
+    for (const name of searchNames) {
+      const key = String(name).toLowerCase().trim()
+      ctx.bySearchName.set(key, [...ctx.all])
+    }
+  }
+
+  return { borrowers: ctx.all, bySearchName: ctx.bySearchName, message: data.message || null }
+}
+
+/** Build deduped BorrowerSerch criteria + map search term → payer keys. */
+export function buildPayerSearchPlan(payerNames) {
+  const termToPayers = new Map()
+  const orderedTerms = []
+
+  for (const raw of payerNames) {
+    const payer = String(raw || '').trim()
+    if (!payer) continue
+    const payerKey = payer.toLowerCase()
+    const terms = new Set([payer, borrowerSearchTerm(payer)].filter(Boolean))
+
+    for (const term of terms) {
+      const termKey = term.toLowerCase().trim()
+      if (!termToPayers.has(termKey)) {
+        termToPayers.set(termKey, new Set())
+        orderedTerms.push(term)
+      }
+      termToPayers.get(termKey).add(payerKey)
+    }
+  }
+
+  return { orderedTerms, termToPayers }
+}
+
+const SEARCH_BATCH_SIZE = 25
+
+/** Bulk BorrowerSerch for many payers; returns candidate pool + per-payer lists. */
+export async function fetchBorrowersForPayers(payerNames) {
+  const { orderedTerms, termToPayers } = buildPayerSearchPlan(payerNames)
+  const apiPool = []
+  const byPayer = new Map()
+  const seen = new Set()
+  let batches = 0
+
+  for (let i = 0; i < orderedTerms.length; i += SEARCH_BATCH_SIZE) {
+    const batch = orderedTerms.slice(i, i + SEARCH_BATCH_SIZE)
+    const criteria = batch.map((name) => ({ name, loanAmount: '', emi: '', branchId: '' }))
+    const data = await borrowerSearch(criteria)
+    const { borrowers, bySearchName } = parseBorrowerSearchResults(data, batch)
+    batches++
+
+    for (const b of borrowers) {
+      if (!seen.has(b.loandisk_id)) {
+        seen.add(b.loandisk_id)
+        apiPool.push(b)
+      }
+    }
+
+    for (const term of batch) {
+      const termKey = term.toLowerCase().trim()
+      const candidates = bySearchName.get(termKey) || []
+      const payerKeys = termToPayers.get(termKey) || new Set()
+      for (const payerKey of payerKeys) {
+        if (!byPayer.has(payerKey)) byPayer.set(payerKey, [])
+        const list = byPayer.get(payerKey)
+        for (const b of candidates) {
+          if (!list.some((x) => x.loandisk_id === b.loandisk_id)) list.push(b)
+        }
       }
     }
   }
 
-  return { borrowers: all, bySearchName, message: data.message || null }
+  return { apiPool, byPayer, batches, termsSearched: orderedTerms.length }
 }
 
 /** GET /SP/Loandisk_OperationsNewForId?borrowerId= — single borrower detail. */

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import toast from 'react-hot-toast'
-import { ArrowRight, Download, FileText, Loader2, RefreshCw, Upload, User } from 'lucide-react'
+import { ArrowRight, Download, FileSpreadsheet, FileText, Loader2, RefreshCw, Upload, User } from 'lucide-react'
 import * as api from '@/lib/api'
 import { explainMatch, confidenceVariant, confidenceLabel } from '@/lib/matcher'
 import { writeAuditLog } from '@/lib/audit'
@@ -15,6 +15,7 @@ import { DataTable } from '@/components/DataTable'
 import { Drawer } from '@/components/Drawer'
 import { PageLoader } from '@/components/PageLoader'
 import { formatCurrency, formatDate, cn, toUuidOrNull } from '@/lib/utils'
+import { exportToExcel } from '@/lib/exportExcel'
 
 const FILTERS = [
   { value: 'all', label: 'All' },
@@ -22,6 +23,14 @@ const FILTERS = [
   { value: 'matched', label: 'Matched' },
   { value: 'exception', label: 'Unmatched' },
 ]
+
+function matchesStatusFilter(tx, filter) {
+  if (filter === 'all') return true
+  if (filter === 'pending') return tx.status === 'pending'
+  if (filter === 'matched') return tx.status === 'matched' || tx.status === 'posted'
+  if (filter === 'exception') return tx.status === 'exception'
+  return tx.status === filter
+}
 
 const STATUS_META = {
   pending: { label: 'Pending', variant: 'pending' },
@@ -50,9 +59,9 @@ export function Match() {
   const borrowerById = useMemo(() => Object.fromEntries(borrowers.map((b) => [b.id, b])), [borrowers])
 
   const filtered = useMemo(() => {
-    let list = filter === 'all' ? transactions : transactions.filter((t) => t.status === filter)
+    let list = transactions.filter((t) => matchesStatusFilter(t, filter))
     if (documentFilter) list = list.filter((t) => t.source_document_id === documentFilter)
-    const order = { pending: 0, matched: 1, exception: 2, posted: 3 }
+    const order = { pending: 0, matched: 1, posted: 2, exception: 3 }
     return [...list].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9))
   }, [transactions, filter, documentFilter])
 
@@ -60,7 +69,7 @@ export function Match() {
     () => ({
       all: transactions.length,
       pending: transactions.filter((t) => t.status === 'pending').length,
-      matched: transactions.filter((t) => t.status === 'matched').length,
+      matched: transactions.filter((t) => t.status === 'matched' || t.status === 'posted').length,
       exception: transactions.filter((t) => t.status === 'exception').length,
     }),
     [transactions]
@@ -141,6 +150,9 @@ export function Match() {
         key: 'matched_borrower',
         label: 'Matched to',
         render: (row) => {
+          if (row.status !== 'matched' && row.status !== 'posted') {
+            return <span className="text-[var(--text-tertiary)]">—</span>
+          }
           const name = row.matched_borrower_id ? borrowerById[row.matched_borrower_id]?.full_name : null
           return <span className="text-[var(--text-secondary)]">{name || '—'}</span>
         },
@@ -219,8 +231,18 @@ export function Match() {
       if (result.message && result.matched === 0 && result.excepted === 0) {
         toast.error(result.message)
       } else {
-        const via = result.searchSource === 'BorrowerSerch' ? ' via LoanDisk search' : ''
-        toast.success(`${result.matched} matched, ${result.excepted} unmatched${via}`)
+        const via =
+          result.searchSource?.includes('BorrowerSerch')
+            ? ' via LoanDisk BorrowerSerch'
+            : result.searchSource === 'GetAllBorrowers'
+              ? ' via GetAllBorrowers'
+              : ''
+        const extra =
+          result.candidatesFound != null
+            ? ` · ${result.candidatesFound} borrowers from ${result.termsSearched ?? '?'} searches`
+            : ''
+        toast.success(`${result.matched} matched, ${result.excepted} unmatched${via}${extra}`)
+        if (result.searchError) toast.error(`LoanDisk warning: ${result.searchError}`)
       }
       refetch()
       refetchBorrowers()
@@ -253,6 +275,31 @@ export function Match() {
     setDetailTx(null)
     refetch()
     loadDocuments()
+  }
+
+  function exportTransactionsExcel() {
+    const label = filter === 'matched' ? 'matched' : filter === 'exception' ? 'unmatched' : filter
+    const ok = exportToExcel(
+      filtered,
+      [
+        { key: 'date', label: 'Date', value: (row) => formatDate(row.date) },
+        { key: 'source_filename', label: 'Document', value: (row) => row.source_filename || '' },
+        { key: 'payer', label: 'Payer', value: (row) => row.payer || '' },
+        { key: 'amount', label: 'Amount', value: (row) => row.amount ?? '' },
+        { key: 'status', label: 'Status', value: (row) => STATUS_META[row.status]?.label || row.status || '' },
+        { key: 'confidence_score', label: 'Score', value: (row) => (row.confidence_score != null ? Math.round(row.confidence_score) : '') },
+        {
+          key: 'matched_borrower',
+          label: 'Matched to',
+          value: (row) => (row.matched_borrower_id ? borrowerById[row.matched_borrower_id]?.full_name : '') || '',
+        },
+        { key: 'reference', label: 'Reference', value: (row) => row.reference || '' },
+        { key: 'description', label: 'Description', value: (row) => row.description || '' },
+      ],
+      `${label}-transactions-${new Date().toISOString().slice(0, 10)}.xlsx`
+    )
+    if (!ok) toast.error('No rows to export')
+    else toast.success(`Exported ${filtered.length} rows`)
   }
 
   async function sendToExceptions() {
@@ -383,24 +430,32 @@ export function Match() {
         </section>
       )}
 
-      {/* Filter pills */}
-      <div className="flex items-center gap-2 flex-wrap">
-        {FILTERS.map((f) => (
-          <button
-            key={f.value}
-            type="button"
-            onClick={() => setFilter(f.value)}
-            className={cn(
-              'h-8 px-3 rounded-[var(--radius-full)] text-[12px] font-medium transition-colors',
-              filter === f.value
-                ? 'bg-[var(--accent)] text-white'
-                : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
-            )}
-          >
-            {f.label}
-            <span className="ml-1.5 opacity-70">{counts[f.value] ?? counts.all}</span>
-          </button>
-        ))}
+      {/* Filter pills + export */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          {FILTERS.map((f) => (
+            <button
+              key={f.value}
+              type="button"
+              onClick={() => setFilter(f.value)}
+              className={cn(
+                'h-8 px-3 rounded-[var(--radius-full)] text-[12px] font-medium transition-colors',
+                filter === f.value
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+              )}
+            >
+              {f.label}
+              <span className="ml-1.5 opacity-70">{counts[f.value] ?? counts.all}</span>
+            </button>
+          ))}
+        </div>
+        {(filter === 'matched' || filter === 'exception') && (
+          <Button variant="secondary" size="sm" onClick={exportTransactionsExcel} disabled={!filtered.length}>
+            <FileSpreadsheet className="h-4 w-4" />
+            Export Excel
+          </Button>
+        )}
       </div>
 
       {/* Transactions table */}

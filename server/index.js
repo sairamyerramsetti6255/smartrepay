@@ -12,13 +12,14 @@ import { authMiddleware, signToken } from './auth.js'
 import { bestMatchFromCandidates, matchTransaction, detectExceptionType } from './matcher.js'
 import { parseStatementBuffer } from './parseStatement.js'
 import {
-  fetchAllBorrowers,
   getLoanDiskToken,
   normalizeLoanDiskBorrower,
   normalizeBorrowersFromPayload,
   borrowerSearch,
   parseBorrowerSearchResults,
   fetchBorrowerById,
+  fetchBorrowersForPayers,
+  fetchAllBorrowers,
 } from './loandisk.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
@@ -478,38 +479,9 @@ async function syncLoanDiskToDb(actor) {
   return result
 }
 
-async function fetchSearchCandidatesForPayers(payerNames) {
-  const apiPool = []
-  const byPayer = new Map()
-  const seen = new Set()
-
-  for (let i = 0; i < payerNames.length; i += 20) {
-    const batch = payerNames.slice(i, i + 20)
-    const criteria = batch.map((name) => ({ name, loanAmount: '', emi: '', branchId: '' }))
-    const data = await borrowerSearch(criteria)
-    const { borrowers, bySearchName } = parseBorrowerSearchResults(data, batch)
-
-    for (const b of borrowers) {
-      if (!seen.has(b.loandisk_id)) {
-        seen.add(b.loandisk_id)
-        apiPool.push(b)
-      }
-    }
-
-    for (const [key, list] of bySearchName) {
-      if (!byPayer.has(key)) byPayer.set(key, [])
-      byPayer.get(key).push(...list)
-    }
-
-    if (!bySearchName.size) {
-      for (const name of batch) {
-        const key = name.toLowerCase().trim()
-        if (!byPayer.has(key)) byPayer.set(key, borrowers)
-      }
-    }
-  }
-
-  return { apiPool, byPayer }
+async function loadAllBorrowersFallback() {
+  const { borrowers } = await fetchAllBorrowers()
+  return borrowers
 }
 
 async function runMatchingBatch(actor) {
@@ -517,33 +489,67 @@ async function runMatchingBatch(actor) {
   const threshold = settings.autoApproveThreshold ?? 80
   const localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
   let loans = db.prepare('select * from loans').all()
-  const pending = db.prepare("select * from transactions where status = 'pending'").all()
+  const toMatch = db
+    .prepare("select * from transactions where status in ('pending', 'exception') order by date asc")
+    .all()
   const allTx = db.prepare('select * from transactions').all()
 
-  const uniquePayers = [...new Set(pending.map((t) => String(t.payer || '').trim()).filter(Boolean))]
+  const uniquePayers = [...new Set(toMatch.map((t) => String(t.payer || '').trim()).filter(Boolean))]
   let apiPool = []
   let byPayer = new Map()
   let searchSource = 'local'
+  let searchError = null
+  let termsSearched = 0
+  let searchBatches = 0
 
   if (uniquePayers.length && loanDiskConfigured()) {
     try {
-      const searchResult = await fetchSearchCandidatesForPayers(uniquePayers)
+      const searchResult = await fetchBorrowersForPayers(uniquePayers)
       apiPool = searchResult.apiPool
       byPayer = searchResult.byPayer
+      termsSearched = searchResult.termsSearched
+      searchBatches = searchResult.batches
       searchSource = 'BorrowerSerch'
     } catch (e) {
-      console.warn('BorrowerSerch failed, using local borrowers:', e.message)
+      searchError = e.message
+      console.warn('BorrowerSerch failed:', e.message)
+    }
+  }
+
+  if (!apiPool.length && loanDiskConfigured()) {
+    try {
+      const fallback = await loadAllBorrowersFallback()
+      if (fallback.length) {
+        apiPool = fallback
+        searchSource = searchError ? 'GetAllBorrowers' : searchSource === 'BorrowerSerch' ? 'BorrowerSerch+GetAllBorrowers' : 'GetAllBorrowers'
+        searchError = null
+        for (const payer of uniquePayers) {
+          const key = payer.toLowerCase()
+          if (!byPayer.has(key) || !byPayer.get(key).length) byPayer.set(key, fallback)
+        }
+      }
+    } catch (e) {
+      if (!searchError) searchError = e.message
+      console.warn('GetAllBorrowers fallback failed:', e.message)
     }
   }
 
   let matched = 0
   let excepted = 0
 
-  for (const tx of pending) {
+  for (const tx of toMatch) {
     const payerKey = String(tx.payer || '').trim().toLowerCase()
-    let candidates = byPayer.get(payerKey)?.length ? byPayer.get(payerKey) : apiPool.length ? apiPool : localBorrowers
+    const payerCandidates = byPayer.get(payerKey) || []
+    let candidates = payerCandidates.length ? payerCandidates : apiPool.length ? apiPool : localBorrowers
 
     let { borrower, score } = bestMatchFromCandidates(tx, candidates)
+    if (score < threshold && apiPool.length) {
+      const poolMatch = bestMatchFromCandidates(tx, apiPool)
+      if (poolMatch.score > score) {
+        borrower = poolMatch.borrower
+        score = poolMatch.score
+      }
+    }
     if (score < threshold && localBorrowers.length) {
       const localMatch = bestMatchFromCandidates(tx, localBorrowers)
       if (localMatch.score > score) {
@@ -565,6 +571,10 @@ async function runMatchingBatch(actor) {
       db.prepare(
         `update transactions set status = 'matched', confidence_score = ?, matched_borrower_id = ?, loan_id = ? where id = ?`
       ).run(score, resolvedBorrower.id, loan?.id || null, tx.id)
+      db.prepare(
+        `update exceptions set status = 'resolved', resolved_at = datetime('now')
+         where transaction_id = ? and status = 'open'`
+      ).run(tx.id)
       matched++
     } else {
       const exType = detectExceptionType(tx, allTx, score)
@@ -584,13 +594,23 @@ async function runMatchingBatch(actor) {
     }
   }
 
-  audit('matching', null, 'run', actor, null, { matched, excepted, searchSource })
+  audit('matching', null, 'run', actor, null, {
+    matched,
+    excepted,
+    searchSource,
+    termsSearched,
+    candidatesFound: apiPool.length,
+    searchError,
+  })
   return {
     matched,
     excepted,
-    pending: pending.length,
+    pending: toMatch.length,
     borrowers: db.prepare('select count(*) as c from borrowers').get().c,
     searchSource,
+    termsSearched,
+    candidatesFound: apiPool.length,
+    searchError,
   }
 }
 
@@ -719,21 +739,23 @@ app.get('/api/documents/:id/transactions', authMiddleware, (req, res) => {
 // --- Matching ---
 app.post('/api/matching/run', authMiddleware, async (req, res) => {
   try {
-    const pendingCount = db.prepare("select count(*) as c from transactions where status = 'pending'").get().c
-    if (!pendingCount) {
+    const queueCount = db
+      .prepare("select count(*) as c from transactions where status in ('pending', 'exception')")
+      .get().c
+    if (!queueCount) {
       return res.json({
         matched: 0,
         excepted: 0,
         pending: 0,
-        message: 'No pending transactions — import a statement first',
+        message: 'No transactions to match — import a statement first',
       })
     }
 
     const result = await runMatchingBatch(req.user.email)
-    if (result.pending === 0) {
+    if (result.searchError && result.matched === 0 && result.candidatesFound === 0) {
       return res.json({
         ...result,
-        message: 'No pending transactions — import a statement first',
+        message: `LoanDisk search failed: ${result.searchError}`,
       })
     }
     res.json(result)
