@@ -2,12 +2,7 @@ import { randomUUID } from 'crypto'
 import { rowBorrower } from './db.js'
 import { createCandidateMatcher, detectExceptionType } from './matcher.js'
 import { yieldEventLoop } from './asyncUtil.js'
-import {
-  groupBorrowersByBranch,
-  buildLoansByBorrowerId,
-  buildBranchSummaries,
-  enrichTxForMatching,
-} from './matchingBranches.js'
+import { buildLoansByBorrowerId, enrichTxForMatching } from './matchingBranches.js'
 
 const REPORT_EVERY = 25
 
@@ -68,15 +63,6 @@ function upsertBorrowerRecord(db, b) {
   return { id, created: false }
 }
 
-function branchKeyForBorrower(b) {
-  return String(b?.branch_id || b?.branch_name || 'unknown')
-}
-
-function findBranchStat(branchStats, borrower) {
-  const key = branchKeyForBorrower(borrower)
-  return branchStats.find((s) => String(s.branchKey) === key)
-}
-
 function liveRow(tx, borrower, status) {
   return {
     id: tx.id,
@@ -94,30 +80,16 @@ export function getMatchingPreview(db) {
   const pending = db
     .prepare("select * from transactions where status in ('pending', 'exception') order by date asc")
     .all()
-  const borrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
-  const loans = db.prepare('select * from loans').all()
-  const branchGroups = groupBorrowersByBranch(borrowers)
-  const branches = buildBranchSummaries(branchGroups, loans, pending)
+  const borrowerCount = db.prepare('select count(*) as c from borrowers').get().c
   const totalPendingEmi = pending.reduce((s, t) => s + (Number(t.amount) || 0), 0)
   return {
     pendingCount: pending.length,
     totalPendingEmi: Math.round(totalPendingEmi * 100) / 100,
-    borrowerCount: borrowers.length,
-    branchCount: branches.length,
-    branches,
+    borrowerCount,
   }
 }
 
-export function getBranchTransactions(db, branchKey, status = 'all') {
-  const borrowers = db
-    .prepare('select * from borrowers')
-    .all()
-    .map(rowBorrower)
-    .filter((b) => String(b.branch_id || b.branch_name || 'unknown') === String(branchKey))
-
-  const borrowerIds = new Set(borrowers.map((b) => b.id))
-  const borrowerById = Object.fromEntries(borrowers.map((b) => [b.id, b]))
-
+export function getMatchTransactions(db, status = 'all') {
   let rows = db
     .prepare(
       `select t.*, b.full_name as matched_borrower_name, b.loandisk_id as borrower_loandisk_id, b.branch_name
@@ -126,10 +98,13 @@ export function getBranchTransactions(db, branchKey, status = 'all') {
        order by t.date asc`
     )
     .all()
-    .filter((t) => t.matched_borrower_id && borrowerIds.has(t.matched_borrower_id))
 
   if (status === 'matched') rows = rows.filter((t) => t.status === 'matched' || t.status === 'posted')
   else if (status === 'unmatched') rows = rows.filter((t) => t.status === 'exception' || t.status === 'pending')
+
+  const borrowerById = Object.fromEntries(
+    db.prepare('select * from borrowers').all().map((b) => [b.id, rowBorrower(b)])
+  )
 
   return rows.map((t) => ({
     ...t,
@@ -137,7 +112,12 @@ export function getBranchTransactions(db, branchKey, status = 'all') {
   }))
 }
 
-/** Fast name-only matching with live matched/unmatched progress. */
+/** @deprecated use getMatchTransactions */
+export function getBranchTransactions(db, _branchKey, status = 'all') {
+  return getMatchTransactions(db, status)
+}
+
+/** Fast name-only matching against synced local borrowers. */
 export async function runMatchingBatch(db, actor, onProgress) {
   const report = (patch) => onProgress?.(patch)
 
@@ -153,14 +133,6 @@ export async function runMatchingBatch(db, actor, onProgress) {
   )
 
   const loans = db.prepare('select * from loans').all()
-  let branchGroups = groupBorrowersByBranch(localBorrowers)
-  let branchStats = buildBranchSummaries(branchGroups, loans, toMatch)
-
-  if (!branchGroups.length) {
-    branchGroups = [{ branchKey: 'unknown', branchId: null, branchName: 'All borrowers', borrowers: localBorrowers }]
-    branchStats = buildBranchSummaries(branchGroups, loans, toMatch)
-  }
-
   const recentMatched = []
   const recentUnmatched = []
   let matched = 0
@@ -173,13 +145,13 @@ export async function runMatchingBatch(db, actor, onProgress) {
     matched: 0,
     excepted: 0,
     percent: 0,
-    branches: branchStats,
+    borrowerCount: localBorrowers.length,
     recentMatched: [],
     recentUnmatched: [],
   })
 
   if (!localBorrowers.length) {
-    report({ phase: 'done', processed: 0, total: 0, matched: 0, excepted: 0, percent: 100, branches: branchStats })
+    report({ phase: 'done', processed: 0, total: 0, matched: 0, excepted: 0, percent: 100, borrowerCount: 0 })
     return {
       matched: 0,
       excepted: 0,
@@ -187,7 +159,8 @@ export async function runMatchingBatch(db, actor, onProgress) {
       borrowers: 0,
       searchSource: 'local',
       message: 'No borrowers — sync LoanDisk first',
-      branches: branchStats,
+      recentMatched,
+      recentUnmatched,
     }
   }
 
@@ -216,15 +189,6 @@ export async function runMatchingBatch(db, actor, onProgress) {
       ).run(tx.id)
 
       matched++
-      const stat = findBranchStat(branchStats, resolvedBorrower)
-      if (stat) {
-        stat.matched++
-        stat.totalEmiReceived = Math.round((stat.totalEmiReceived + Number(tx.amount || 0)) * 100) / 100
-        stat.processed++
-        stat.percent = stat.processed > 0 ? Math.min(100, Math.round((stat.matched / stat.processed) * 100)) : 0
-        stat.status = 'running'
-      }
-
       recentMatched.unshift(liveRow(tx, resolvedBorrower, 'matched'))
       if (recentMatched.length > 30) recentMatched.pop()
     } else {
@@ -247,14 +211,6 @@ export async function runMatchingBatch(db, actor, onProgress) {
     const processed = i + 1
     if (processed % REPORT_EVERY === 0 || processed === toMatch.length) {
       const percent = Math.round((processed / Math.max(1, toMatch.length)) * 100)
-      for (const stat of branchStats) {
-        if (stat.status === 'running') stat.percent = percent
-        if (processed === toMatch.length) {
-          stat.status = 'done'
-          stat.percent = 100
-          stat.unmatched = Math.max(0, (stat.processed || 0) - (stat.matched || 0))
-        }
-      }
       report({
         phase: processed === toMatch.length ? 'done' : 'matching',
         processed,
@@ -262,7 +218,7 @@ export async function runMatchingBatch(db, actor, onProgress) {
         matched,
         excepted,
         percent,
-        branches: branchStats,
+        borrowerCount: localBorrowers.length,
         recentMatched: [...recentMatched],
         recentUnmatched: [...recentUnmatched],
       })
@@ -278,9 +234,6 @@ export async function runMatchingBatch(db, actor, onProgress) {
     pending: toMatch.length,
     borrowers: localBorrowers.length,
     searchSource: 'local-name',
-    termsSearched: 0,
-    candidatesFound: localBorrowers.length,
-    branches: branchStats,
     recentMatched,
     recentUnmatched,
   }
