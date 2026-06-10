@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import * as api from '@/lib/api'
-import { resetBorrowerSyncSession, startBorrowerBackgroundSync } from '@/lib/borrowerBackgroundSync'
+import { resetBorrowerSyncSession } from '@/lib/borrowerBackgroundSync'
 import { loadSettingsFromApi } from '@/lib/settings'
 
 const AuthContext = createContext(null)
@@ -21,7 +21,6 @@ export function AuthProvider({ children }) {
         setUser({ id: u.id, email: u.email })
         setProfile({ full_name: u.full_name, role: u.role })
         loadSettingsFromApi()
-        startBorrowerBackgroundSync()
       })
       .catch(() => api.setToken(null))
       .finally(() => setLoading(false))
@@ -35,7 +34,6 @@ export function AuthProvider({ children }) {
     setUser({ id: u.id, email: u.email })
     setProfile({ full_name: u.full_name, role: u.role })
     loadSettingsFromApi()
-    startBorrowerBackgroundSync()
   }
 
   const signUp = async (email, password, role = 'collections') => {
@@ -44,7 +42,6 @@ export function AuthProvider({ children }) {
     setUser({ id: u.id, email: u.email })
     setProfile({ full_name: u.full_name, role: u.role })
     loadSettingsFromApi()
-    startBorrowerBackgroundSync()
   }
 
   const signOut = async () => {

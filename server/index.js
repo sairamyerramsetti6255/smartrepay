@@ -9,8 +9,8 @@ import { fileURLToPath } from 'url'
 import { randomUUID, createHash } from 'crypto'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
-import { bestMatchFromCandidates, createCandidateMatcher, matchTransaction, detectExceptionType } from './matcher.js'
-import { yieldEventLoop } from './asyncUtil.js'
+import { matchTransaction, detectExceptionType } from './matcher.js'
+import { runHeavyJob, isHeavyJobRunning, getActiveJobName } from './jobRunner.js'
 import { parseStatementBuffer } from './parseStatement.js'
 import {
   getLoanDiskToken,
@@ -19,8 +19,6 @@ import {
   borrowerSearch,
   parseBorrowerSearchResults,
   fetchBorrowerById,
-  fetchBorrowersForPayers,
-  fetchAllBorrowers,
 } from './loandisk.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
@@ -153,7 +151,8 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.3.0',
+    build: '1.4.0',
+    heavyJob: getActiveJobName(),
     features: {
       documents: true,
       loandiskBorrowerSearch: true,
@@ -458,32 +457,20 @@ function upsertBorrowerRecord(b) {
   return { id, created: true }
 }
 
-async function importBorrowerBatch(borrowers, actor, meta = {}, onProgress) {
+function importBorrowerBatch(borrowers, actor, meta = {}) {
   let created = 0
   let updated = 0
 
-  for (let i = 0; i < borrowers.length; i++) {
-    const raw = borrowers[i]
+  for (const raw of borrowers) {
     const b = raw.loandisk_id && raw.full_name ? raw : normalizeLoanDiskBorrower(raw.raw || raw)
-    if (b?.loandisk_id) {
-      const result = upsertBorrowerRecord(b)
-      if (result.created) created++
-      else updated++
-    }
-    if (i % 50 === 0) {
-      onProgress?.({ processed: i, total: borrowers.length, created, updated })
-      await yieldEventLoop()
-    }
+    if (!b?.loandisk_id) continue
+    const result = upsertBorrowerRecord(b)
+    if (result.created) created++
+    else updated++
   }
 
   audit('loandisk', null, 'import_borrowers', actor, null, { created, updated, ...meta })
   return { created, updated, synced: created + updated, total: borrowers.length, source: 'GetAllBorrowers', ...meta }
-}
-
-async function syncLoanDiskToDb(actor, onProgress) {
-  const { borrowers, total, orgId, source, branches, totalReported, message } = await fetchAllBorrowers()
-  const result = await importBorrowerBatch(borrowers, actor, { total, orgId, source, branches, totalReported, message }, onProgress)
-  return result
 }
 
 const syncJob = {
@@ -492,11 +479,7 @@ const syncJob = {
   finishedAt: null,
   result: null,
   error: null,
-}
-
-async function loadAllBorrowersFallback() {
-  const { borrowers } = await fetchAllBorrowers()
-  return borrowers
+  progress: null,
 }
 
 const matchingJob = {
@@ -506,162 +489,6 @@ const matchingJob = {
   progress: null,
   result: null,
   error: null,
-}
-
-function updateMatchingProgress(patch) {
-  matchingJob.progress = { ...matchingJob.progress, ...patch }
-}
-
-async function runMatchingBatch(actor, onProgress) {
-  const report = (patch) => {
-    updateMatchingProgress(patch)
-    onProgress?.(matchingJob.progress)
-  }
-
-  const settings = getSettings()
-  const threshold = settings.autoApproveThreshold ?? 80
-  const localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
-  const toMatch = db
-    .prepare("select * from transactions where status in ('pending', 'exception') order by date asc")
-    .all()
-  const allTx = db.prepare('select * from transactions').all()
-
-  report({ phase: 'preparing', processed: 0, total: toMatch.length, matched: 0, excepted: 0 })
-
-  const uniquePayers = [...new Set(toMatch.map((t) => String(t.payer || '').trim()).filter(Boolean))]
-  let apiPool = []
-  let byPayer = new Map()
-  let searchSource = 'local'
-  let searchError = null
-  let termsSearched = 0
-  let searchBatches = 0
-
-  if (uniquePayers.length && loanDiskConfigured()) {
-    try {
-      const searchResult = await fetchBorrowersForPayers(uniquePayers, report)
-      apiPool = searchResult.apiPool
-      byPayer = searchResult.byPayer
-      termsSearched = searchResult.termsSearched
-      searchBatches = searchResult.batches
-      searchSource = 'BorrowerSerch'
-    } catch (e) {
-      searchError = e.message
-      console.warn('BorrowerSerch failed:', e.message)
-    }
-  }
-
-  if (!apiPool.length && loanDiskConfigured()) {
-    try {
-      const fallback = await loadAllBorrowersFallback()
-      if (fallback.length) {
-        apiPool = fallback
-        searchSource = searchError ? 'GetAllBorrowers' : searchSource === 'BorrowerSerch' ? 'BorrowerSerch+GetAllBorrowers' : 'GetAllBorrowers'
-        searchError = null
-        for (const payer of uniquePayers) {
-          const key = payer.toLowerCase()
-          if (!byPayer.has(key) || !byPayer.get(key).length) byPayer.set(key, fallback)
-        }
-      }
-    } catch (e) {
-      if (!searchError) searchError = e.message
-      console.warn('GetAllBorrowers fallback failed:', e.message)
-    }
-  }
-
-  let matched = 0
-  let excepted = 0
-  const loans = db.prepare('select * from loans').all()
-  const loanByBorrower = new Map(loans.map((l) => [l.borrower_id, l]))
-  const matchFromPool = apiPool.length ? createCandidateMatcher(apiPool) : null
-  const matchFromLocal = localBorrowers.length ? createCandidateMatcher(localBorrowers) : null
-
-  report({ phase: 'matching', processed: 0, total: toMatch.length, matched: 0, excepted: 0 })
-
-  for (let i = 0; i < toMatch.length; i++) {
-    const tx = toMatch[i]
-    const payerKey = String(tx.payer || '').trim().toLowerCase()
-    const payerCandidates = byPayer.get(payerKey) || []
-
-    let { borrower, score } = payerCandidates.length
-      ? bestMatchFromCandidates(tx, payerCandidates)
-      : { borrower: null, score: 0 }
-    if (score < threshold && matchFromPool) {
-      const poolMatch = matchFromPool(tx)
-      if (poolMatch.score > score) {
-        borrower = poolMatch.borrower
-        score = poolMatch.score
-      }
-    }
-    if (score < threshold && matchFromLocal) {
-      const localMatch = matchFromLocal(tx)
-      if (localMatch.score > score) {
-        borrower = localMatch.borrower
-        score = localMatch.score
-      }
-    }
-
-    let resolvedBorrower = borrower
-    if (borrower?.loandisk_id) {
-      const { id } = upsertBorrowerRecord(borrower)
-      resolvedBorrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
-      const loanRow = db.prepare('select * from loans where borrower_id = ?').get(id)
-      if (loanRow) loanByBorrower.set(id, loanRow)
-    }
-
-    const loan = resolvedBorrower ? loanByBorrower.get(resolvedBorrower.id) : null
-
-    if (score >= threshold && resolvedBorrower) {
-      db.prepare(
-        `update transactions set status = 'matched', confidence_score = ?, matched_borrower_id = ?, loan_id = ? where id = ?`
-      ).run(score, resolvedBorrower.id, loan?.id || null, tx.id)
-      db.prepare(
-        `update exceptions set status = 'resolved', resolved_at = datetime('now')
-         where transaction_id = ? and status = 'open'`
-      ).run(tx.id)
-      matched++
-    } else {
-      const exType = detectExceptionType(tx, allTx, score)
-      db.prepare(
-        `update transactions set status = 'exception', confidence_score = ?, matched_borrower_id = ? where id = ?`
-      ).run(score, resolvedBorrower?.id || null, tx.id)
-      const existing = db
-        .prepare("select id from exceptions where transaction_id = ? and status = 'open'")
-        .get(tx.id)
-      if (!existing) {
-        const sla = settings.slaHours?.[exType] ?? 24
-        db.prepare(
-          `insert into exceptions (id, transaction_id, type, status, assigned_to, sla_hours) values (?, ?, ?, 'open', ?, ?)`
-        ).run(randomUUID(), tx.id, exType, actor, sla)
-      }
-      excepted++
-    }
-
-    if (i % 10 === 0 || i === toMatch.length - 1) {
-      report({ phase: 'matching', processed: i + 1, total: toMatch.length, matched, excepted })
-      await yieldEventLoop()
-    }
-  }
-
-  report({ phase: 'done', processed: toMatch.length, total: toMatch.length, matched, excepted })
-
-  audit('matching', null, 'run', actor, null, {
-    matched,
-    excepted,
-    searchSource,
-    termsSearched,
-    candidatesFound: apiPool.length,
-    searchError,
-  })
-  return {
-    matched,
-    excepted,
-    pending: toMatch.length,
-    borrowers: db.prepare('select count(*) as c from borrowers').get().c,
-    searchSource,
-    termsSearched,
-    candidatesFound: apiPool.length,
-    searchError,
-  }
 }
 
 // --- LoanDisk ---
@@ -674,10 +501,10 @@ app.get('/api/loandisk/token', authMiddleware, async (_req, res) => {
   }
 })
 
-app.post('/api/loandisk/import-raw', authMiddleware, async (req, res) => {
+app.post('/api/loandisk/import-raw', authMiddleware, (req, res) => {
   try {
     const parsed = normalizeBorrowersFromPayload(req.body)
-    const result = await importBorrowerBatch(parsed.borrowers, req.user.email, {
+    const result = importBorrowerBatch(parsed.borrowers, req.user.email, {
       branches: parsed.branches,
       totalReported: parsed.totalReported,
       message: parsed.message,
@@ -688,11 +515,11 @@ app.post('/api/loandisk/import-raw', authMiddleware, async (req, res) => {
   }
 })
 
-app.post('/api/loandisk/import-borrowers', authMiddleware, async (req, res) => {
+app.post('/api/loandisk/import-borrowers', authMiddleware, (req, res) => {
   try {
     const incoming = req.body.borrowers || req.body.rows || []
     if (!incoming.length) return res.status(400).json({ error: 'No borrowers to import' })
-    res.json(await importBorrowerBatch(incoming, req.user.email))
+    res.json(importBorrowerBatch(incoming, req.user.email))
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -726,32 +553,33 @@ app.get('/api/loandisk/sync/status', authMiddleware, (_req, res) => {
 
 app.post('/api/loandisk/sync', authMiddleware, (req, res) => {
   try {
-    if (syncJob.status === 'running') {
-      return res.json({ status: 'running', message: 'Borrower sync already in progress' })
+    if (syncJob.status === 'running' || isHeavyJobRunning()) {
+      return res.json({
+        status: 'running',
+        message: 'Borrower sync already in progress',
+        activeJob: getActiveJobName(),
+      })
     }
     syncJob.status = 'running'
     syncJob.startedAt = new Date().toISOString()
     syncJob.finishedAt = null
     syncJob.result = null
     syncJob.error = null
+    syncJob.progress = { phase: 'starting' }
 
-    res.json({ status: 'started', message: 'Borrower sync started in background' })
-
-    const actor = req.user.email
-    setImmediate(() => {
-      syncLoanDiskToDb(actor)
-        .then((result) => {
-          syncJob.status = 'completed'
-          syncJob.finishedAt = new Date().toISOString()
-          syncJob.result = result
-        })
-        .catch((e) => {
-          syncJob.status = 'failed'
-          syncJob.finishedAt = new Date().toISOString()
-          syncJob.error = e.message
-          console.error('Borrower sync failed:', e)
-        })
+    const { started, activeJob } = runHeavyJob('sync', req.user.email, syncJob, {
+      onProgress: (p) => {
+        syncJob.progress = p
+      },
+      onError: (err) => console.error('Borrower sync failed:', err),
     })
+
+    if (!started) {
+      syncJob.status = 'idle'
+      return res.json({ status: 'busy', message: `Server busy with ${activeJob}` })
+    }
+
+    res.json({ status: 'started', message: 'Borrower sync started in background worker' })
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -834,11 +662,12 @@ app.get('/api/matching/status', authMiddleware, (_req, res) => {
 
 app.post('/api/matching/run', authMiddleware, (req, res) => {
   try {
-    if (matchingJob.status === 'running') {
+    if (matchingJob.status === 'running' || isHeavyJobRunning()) {
       return res.json({
         status: 'running',
         message: 'Matching already in progress',
         progress: matchingJob.progress,
+        activeJob: getActiveJobName(),
       })
     }
 
@@ -862,32 +691,22 @@ app.post('/api/matching/run', authMiddleware, (req, res) => {
     matchingJob.error = null
     matchingJob.progress = { phase: 'starting', processed: 0, total: queueCount, matched: 0, excepted: 0 }
 
-    res.json({
-      status: 'started',
-      message: 'Matching started in background',
-      progress: matchingJob.progress,
+    const { started, activeJob } = runHeavyJob('matching', req.user.email, matchingJob, {
+      onProgress: (p) => {
+        matchingJob.progress = p
+      },
+      onError: (err) => console.error('Matching job failed:', err),
     })
 
-    const actor = req.user.email
-    setImmediate(() => {
-      runMatchingBatch(actor)
-        .then((result) => {
-          matchingJob.status = 'completed'
-          matchingJob.finishedAt = new Date().toISOString()
-          matchingJob.result = result
-          if (result.searchError && result.matched === 0 && result.candidatesFound === 0) {
-            matchingJob.result = {
-              ...result,
-              message: `LoanDisk search failed: ${result.searchError}`,
-            }
-          }
-        })
-        .catch((e) => {
-          matchingJob.status = 'failed'
-          matchingJob.finishedAt = new Date().toISOString()
-          matchingJob.error = e.message
-          console.error('Matching job failed:', e)
-        })
+    if (!started) {
+      matchingJob.status = 'idle'
+      return res.json({ status: 'busy', message: `Server busy with ${activeJob}` })
+    }
+
+    res.json({
+      status: 'started',
+      message: 'Matching started in background worker',
+      progress: matchingJob.progress,
     })
   } catch (e) {
     res.status(400).json({ error: e.message })

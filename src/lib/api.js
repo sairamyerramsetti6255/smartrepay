@@ -28,52 +28,63 @@ export function setToken(token) {
 
 
 
-async function request(path, options = {}) {
+function isRetryableError(e, status) {
+  if (e?.name === 'AbortError') return true
+  if (e?.message?.includes('Failed to fetch') || e?.message?.includes('NetworkError')) return true
+  if (status === 502 || status === 503 || status === 504) return true
+  return false
+}
 
+async function requestOnce(path, options = {}) {
   const headers = {
-
     'Content-Type': 'application/json',
-
     'Cache-Control': 'no-cache',
-
     ...options.headers,
-
   }
-
   const token = getToken()
-
   if (token) headers.Authorization = `Bearer ${token}`
 
-
-
   const controller = new AbortController()
-
-  const timeout = setTimeout(() => controller.abort(), options.timeout ?? 60000)
-
-
+  const timeoutMs = options.timeout ?? 90000
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
-
     const res = await fetch(`${getApiUrl()}${path}`, { ...options, headers, signal: controller.signal })
-
     const data = await res.json().catch(() => ({}))
-
-    if (!res.ok) throw new Error(data.error || res.statusText || 'Request failed')
-
+    if (!res.ok) {
+      const err = new Error(data.error || res.statusText || 'Request failed')
+      err.status = res.status
+      throw err
+    }
     return data
-
   } catch (e) {
-
-    if (e?.name === 'AbortError') throw new Error('Request timed out — is the API server running?')
-
+    if (e?.name === 'AbortError') {
+      const err = new Error('Request timed out — server may be busy, retrying…')
+      err.status = 408
+      throw err
+    }
     throw e
-
   } finally {
-
     clearTimeout(timeout)
-
   }
+}
 
+async function request(path, options = {}) {
+  const method = (options.method || 'GET').toUpperCase()
+  const maxAttempts = options.retries ?? (method === 'GET' ? 3 : 1)
+  let lastError
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await requestOnce(path, options)
+    } catch (e) {
+      lastError = e
+      if (attempt >= maxAttempts || e.status === 401 || e.status === 403 || e.status === 400) throw e
+      if (!isRetryableError(e, e.status)) throw e
+      await sleep(1000 * attempt)
+    }
+  }
+  throw lastError
 }
 
 
@@ -208,20 +219,28 @@ export const matching = {
 
   start: () => request('/matching/run', { method: 'POST', body: '{}', timeout: 30000 }),
 
-  status: () => request('/matching/status', { timeout: 45000 }),
+  status: () => request('/matching/status', { timeout: 90000, retries: 2 }),
 
   async pollUntilComplete(onProgress) {
-    const deadline = Date.now() + 20 * 60 * 1000
+    const deadline = Date.now() + 30 * 60 * 1000
+    let statusErrors = 0
     while (Date.now() < deadline) {
-      const snap = await matching.status()
-      if (snap.progress) onProgress?.(snap.progress)
-      if (snap.status === 'completed') return snap.result
-      if (snap.status === 'failed') throw new Error(snap.error || 'Matching failed')
-      if (snap.status === 'idle') throw new Error('Matching stopped unexpectedly')
-      await sleep(2000)
+      try {
+        const snap = await matching.status()
+        statusErrors = 0
+        if (snap.progress) onProgress?.(snap.progress)
+        if (snap.status === 'completed') return snap.result
+        if (snap.status === 'failed') throw new Error(snap.error || 'Matching failed')
+        if (snap.status === 'idle') throw new Error('Matching stopped unexpectedly')
+      } catch (e) {
+        statusErrors++
+        if (statusErrors >= 20) throw e
+        // Server busy — keep polling; do not cancel other API calls
+      }
+      await sleep(3000)
     }
     throw new Error(
-      'Matching is still running on the server — wait a minute, refresh the page, and check Match results.'
+      'Matching is still running on the server — refresh the page and check Match results.'
     )
   },
 

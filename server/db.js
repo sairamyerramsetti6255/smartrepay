@@ -1,38 +1,11 @@
-import { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'crypto'
 import bcrypt from 'bcryptjs'
-import { DB_PATH, ensureDataDirs } from './paths.js'
+import { ensureDataDirs } from './paths.js'
+import { openDatabase } from './dbFactory.js'
 
 ensureDataDirs()
 
-/** Thin wrapper so existing better-sqlite3-style calls keep working. */
-class SqliteDatabase {
-  constructor(filePath) {
-    this._db = new DatabaseSync(filePath)
-  }
-
-  pragma(statement) {
-    this._db.exec(`PRAGMA ${statement}`)
-  }
-
-  exec(sql) {
-    this._db.exec(sql)
-  }
-
-  prepare(sql) {
-    const stmt = this._db.prepare(sql)
-    return {
-      get: (...params) => stmt.get(...params),
-      all: (...params) => stmt.all(...params),
-      run: (...params) => stmt.run(...params),
-    }
-  }
-}
-
-const db = new SqliteDatabase(DB_PATH)
-db.pragma('journal_mode = WAL')
-db.pragma('foreign_keys = ON')
-db.pragma('busy_timeout = 10000')
+const db = openDatabase()
 
 function tableExists(name) {
   const row = db.prepare("select name from sqlite_master where type='table' and name=?").get(name)
