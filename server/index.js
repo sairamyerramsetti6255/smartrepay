@@ -152,7 +152,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.6.1',
+    build: '1.7.1',
     heavyJob: getActiveJobName(),
     features: {
       documents: true,
@@ -601,10 +601,30 @@ app.post('/api/loandisk/search', authMiddleware, async (req, res) => {
 
 app.get('/api/loandisk/borrower/:id', authMiddleware, async (req, res) => {
   try {
-    const result = await fetchBorrowerById(req.params.id)
+    const param = req.params.id
+    const local = db.prepare('select * from borrowers where id = ? or loandisk_id = ?').get(param, param)
+    const loandiskId = local?.loandisk_id || param
+    const result = await fetchBorrowerById(loandiskId)
+    let localId = local?.id
     if (result.borrower) {
-      const { id } = upsertBorrowerRecord(result.borrower)
-      result.borrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
+      const apiBorrower = result.borrower
+      const upserted = upsertBorrowerRecord(apiBorrower)
+      localId = upserted.id
+      const dbRow = rowBorrower(db.prepare('select * from borrowers where id = ?').get(localId))
+      result.borrower = {
+        ...dbRow,
+        email: apiBorrower.email ?? null,
+        mobile: apiBorrower.mobile ?? null,
+        unique_number: apiBorrower.unique_number ?? null,
+        loan_amount: apiBorrower.loan_amount ?? null,
+        emi: apiBorrower.emi ?? null,
+      }
+    }
+    if (localId && result.loans?.length) {
+      const { upsertLoansForBorrower } = await import('./loanDiskLoans.js')
+      result.loans = upsertLoansForBorrower(db, localId, result.loans)
+    } else if (localId) {
+      result.loans = db.prepare('select * from loans where borrower_id = ?').all(localId)
     }
     res.json(result)
   } catch (e) {
