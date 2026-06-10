@@ -7,6 +7,7 @@ import { explainMatch, confidenceVariant, confidenceLabel } from '@/lib/matcher'
 import { writeAuditLog } from '@/lib/audit'
 import { useAuth } from '@/context/AuthContext'
 import { useMatchingProgress } from '@/context/MatchingProgressContext'
+import { useBorrowerSync } from '@/context/BorrowerSyncContext'
 import { useTransactions } from '@/hooks/useTransactions'
 import { useBorrowers } from '@/hooks/useBorrowers'
 import { Button } from '@/components/ui/button'
@@ -52,6 +53,7 @@ export function Match() {
   const [detailTx, setDetailTx] = useState(null)
   const [filter, setFilter] = useState('all')
   const { running: isRunning, progress: matchProgress, result: matchResult, startMatching } = useMatchingProgress()
+  const { syncing: borrowersSyncing, waitMessage, canRunMatching } = useBorrowerSync()
   const [syncing, setSyncing] = useState(false)
   const [documents, setDocuments] = useState([])
   const [docsLoading, setDocsLoading] = useState(true)
@@ -291,6 +293,14 @@ export function Match() {
   }
 
   async function runMatching() {
+    if (!canRunMatching(borrowers.length)) {
+      toast.error(waitMessage || 'Please wait — borrowers are still loading from LoanDisk…')
+      return
+    }
+    if (borrowers.length === 0) {
+      toast.error('No borrowers loaded yet — wait for background sync to finish')
+      return
+    }
     setShowMatchPanel(true)
     try {
       const result = await startMatching()
@@ -373,9 +383,20 @@ export function Match() {
               <FileSpreadsheet className="h-4 w-4" />
               Export Matched
             </Button>
-            <Button size="sm" onClick={runMatching} disabled={isRunning || syncing}>
-              {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {isRunning && matchProgress ? matchProgressLabel(matchProgress) : 'Run Matching'}
+            <Button
+              size="sm"
+              onClick={runMatching}
+              disabled={isRunning || syncing || (borrowersSyncing && borrowers.length === 0)}
+              title={borrowersSyncing && borrowers.length === 0 ? waitMessage : undefined}
+            >
+              {isRunning || (borrowersSyncing && borrowers.length === 0) ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : null}
+              {isRunning && matchProgress
+                ? matchProgressLabel(matchProgress)
+                : borrowersSyncing && borrowers.length === 0
+                  ? 'Loading borrowers…'
+                  : 'Run Matching'}
             </Button>
           </div>
         }

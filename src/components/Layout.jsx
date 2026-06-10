@@ -1,10 +1,12 @@
 import { Outlet } from 'react-router-dom'
+import { BorrowerSyncProvider } from '@/context/BorrowerSyncContext'
 import { Sidebar } from './Sidebar'
 import { TopBar } from './TopBar'
 import { DemoDataBanner } from './DemoDataBanner'
 
 export function Layout() {
   return (
+    <BorrowerSyncProvider>
     <div className="min-h-screen bg-[var(--bg-app)]">
       <Sidebar />
       <TopBar />
@@ -17,5 +19,6 @@ export function Layout() {
         </div>
       </main>
     </div>
+    </BorrowerSyncProvider>
   )
 }
