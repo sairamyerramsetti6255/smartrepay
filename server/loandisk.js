@@ -346,18 +346,15 @@ export function buildTransactionSearchPlan(transactions) {
     const payer = String(tx.payer || '').trim()
     if (!payer) continue
     const payerKey = payer.toLowerCase()
-    const emi = formatSearchAmount(tx.amount)
     const terms = [borrowerSearchTerm(payer), payer].filter(Boolean)
 
     for (const term of terms) {
       const termKey = term.toLowerCase().trim()
       if (!termToMeta.has(termKey)) {
-        termToMeta.set(termKey, { term, emi, loanAmount: '', payerKeys: new Set() })
+        termToMeta.set(termKey, { term, emi: '', loanAmount: '', payerKeys: new Set() })
         orderedTerms.push(term)
       }
-      const meta = termToMeta.get(termKey)
-      meta.payerKeys.add(payerKey)
-      if (emi && !meta.emi) meta.emi = emi
+      termToMeta.get(termKey).payerKeys.add(payerKey)
     }
   }
 

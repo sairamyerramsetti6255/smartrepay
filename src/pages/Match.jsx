@@ -120,13 +120,18 @@ export function Match() {
         render: (row) => <span className="text-[var(--text-secondary)]">{formatDate(row.date)}</span>,
       },
       {
-        key: 'source_filename',
-        label: 'Document',
-        render: (row) => (
-          <span className="truncate max-w-[160px] block text-[var(--text-secondary)]" title={row.source_filename}>
-            {row.source_filename || '—'}
-          </span>
-        ),
+        key: 'loandisk_id',
+        label: 'LoanDisk ID',
+        render: (row) => {
+          const id =
+            row.matched_borrower_id ? borrowerById[row.matched_borrower_id]?.loandisk_id : null
+          if (!id) return <span className="text-[var(--text-tertiary)]">—</span>
+          return (
+            <span className="mono text-[12px] font-medium text-[var(--text-primary)] tabular-nums">
+              {id}
+            </span>
+          )
+        },
       },
       {
         key: 'payer',

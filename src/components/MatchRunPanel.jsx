@@ -165,7 +165,7 @@ export function MatchRunPanel({
         <div>
           <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Branch matching</h2>
           <p className="text-[12px] text-[var(--text-secondary)] mt-0.5">
-            First name + last name match first · EMI disambiguates ties · multi-loan sum checked
+            First name + last name match · LoanDisk ID from reference when available
           </p>
         </div>
         {running ? (
