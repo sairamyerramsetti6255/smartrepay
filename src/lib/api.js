@@ -252,6 +252,12 @@ export const matching = {
   /** Start background matching and poll until complete (up to 20 min). */
   async run(onProgress) {
     const started = await matching.start()
+    if (started.status === 'busy') {
+      throw new Error(started.message || `Server busy with ${started.activeJob || 'another job'}`)
+    }
+    if (started.status === 'running' && started.message?.includes('already in progress')) {
+      return matching.pollUntilComplete(onProgress)
+    }
     if (started.message && started.matched === 0 && started.excepted === 0 && started.status === 'idle') {
       return started
     }
@@ -317,7 +323,25 @@ export const loandisk = {
 
     request('/loandisk/search', { method: 'POST', body: JSON.stringify({ searchCriteria }), timeout: 120000 }),
 
-  borrower: (id) => request(`/loandisk/borrower/${id}`, { timeout: 60000 }),
+  borrower: (id, { refresh = false } = {}) =>
+    request(`/loandisk/borrower/${encodeURIComponent(id)}${refresh ? '?refresh=1' : ''}`, {
+      timeout: 20000,
+      retries: 3,
+    }),
+
+  async pollUntilReady(id, onProgress, { refresh = false, maxMinutes = 5 } = {}) {
+    const deadline = Date.now() + maxMinutes * 60 * 1000
+    let first = true
+    while (Date.now() < deadline) {
+      const snap = await loandisk.borrower(id, { refresh: refresh && first })
+      first = false
+      onProgress?.(snap)
+      if (snap.status === 'ready') return snap
+      if (snap.status === 'failed') throw new Error(snap.error || snap.message || 'LoanDisk fetch failed')
+      await sleep(4000)
+    }
+    throw new Error('Still loading from LoanDisk — tap Refresh to check again')
+  },
 
   importBorrowers: (borrowers) =>
 

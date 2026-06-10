@@ -1,9 +1,7 @@
 import { randomUUID } from 'crypto'
 import { rowBorrower } from './db.js'
-import { createCandidateMatcher, detectExceptionType, parsePayerName } from './matcher.js'
+import { createCandidateMatcher, detectExceptionType } from './matcher.js'
 import { yieldEventLoop } from './asyncUtil.js'
-import { fetchBorrowersForTransactions, fetchAllBorrowers, fetchBorrowerLoansFromApi } from './loandisk.js'
-import { upsertLoansForBorrower } from './loanDiskLoans.js'
 import {
   groupBorrowersByBranch,
   buildLoansByBorrowerId,
@@ -11,14 +9,7 @@ import {
   enrichTxForMatching,
 } from './matchingBranches.js'
 
-const LARGE_BATCH = 200
-const MAX_BORROWER_SEARCH_TERMS = 300
-const TX_BATCH_SIZE = 300
-const LOAN_ENRICH_CONCURRENCY = 8
-
-function loanDiskConfigured() {
-  return !!(process.env.LOANDISK_USERNAME || process.env.LOANDISK_PASSWORD || process.env.LOANDISK_ACCESS_TOKEN)
-}
+const REPORT_EVERY = 25
 
 function getSettings(db) {
   const row = db.prepare('select value from app_settings where key = ?').get('global')
@@ -74,64 +65,29 @@ function upsertBorrowerRecord(db, b) {
     b.branch_id,
     b.branch_name
   )
-  return { id, created: true }
+  return { id, created: false }
 }
 
-async function loadAllBorrowersFallback() {
-  const { borrowers } = await fetchAllBorrowers()
-  return borrowers
+function branchKeyForBorrower(b) {
+  return String(b?.branch_id || b?.branch_name || 'unknown')
 }
 
-/** Enrich EMI data from OperationsNewForId for payers likely to match. */
-async function enrichLoanEmisForMatching(db, localBorrowers, toMatch, loansByBorrowerId, onProgress) {
-  if (!loanDiskConfigured()) return 0
+function findBranchStat(branchStats, borrower) {
+  const key = branchKeyForBorrower(borrower)
+  return branchStats.find((s) => String(s.branchKey) === key)
+}
 
-  const payerKeys = new Set(
-    toMatch.map((t) => {
-      const p = parsePayerName(t.payer)
-      return `${normalizeKey(p.first)}|${normalizeKey(p.last)}`
-    })
-  )
-
-  const needsEnrich = localBorrowers.filter((b) => {
-    if (!b.loandisk_id) return false
-    const loans = loansByBorrowerId.get(b.id) || []
-    if (loans.some((l) => l.emi != null && Number(l.emi) > 0)) return false
-    const p = parsePayerName(b.full_name)
-    const key = `${normalizeKey(p.first)}|${normalizeKey(p.last)}`
-    const keyFirst = `${normalizeKey(p.first)}|`
-    return [...payerKeys].some((pk) => pk === key || pk.startsWith(keyFirst))
-  })
-
-  let done = 0
-  const total = needsEnrich.length
-  onProgress?.({ phase: 'loading_loans', loansLoaded: 0, loansTotal: total })
-
-  for (let i = 0; i < needsEnrich.length; i += LOAN_ENRICH_CONCURRENCY) {
-    const chunk = needsEnrich.slice(i, i + LOAN_ENRICH_CONCURRENCY)
-    await Promise.all(
-      chunk.map(async (b) => {
-        try {
-          const parsed = await fetchBorrowerLoansFromApi(b.loandisk_id)
-          const { id } = upsertBorrowerRecord(db, parsed.borrower || b)
-          if (parsed.loans?.length) {
-            const saved = upsertLoansForBorrower(db, id, parsed.loans)
-            loansByBorrowerId.set(id, saved)
-          }
-        } catch (e) {
-          console.warn(`Loan enrich ${b.loandisk_id}:`, e.message)
-        }
-      })
-    )
-    done += chunk.length
-    onProgress?.({ phase: 'loading_loans', loansLoaded: done, loansTotal: total })
-    await yieldEventLoop()
+function liveRow(tx, borrower, status) {
+  return {
+    id: tx.id,
+    payer: tx.payer,
+    amount: tx.amount,
+    date: tx.date,
+    status,
+    borrowerName: borrower?.full_name || null,
+    loandiskId: borrower?.loandisk_id || null,
+    branchName: borrower?.branch_name || null,
   }
-  return done
-}
-
-function normalizeKey(s) {
-  return String(s || '').toLowerCase().trim()
 }
 
 export function getMatchingPreview(db) {
@@ -181,34 +137,13 @@ export function getBranchTransactions(db, branchKey, status = 'all') {
   }))
 }
 
-function updateBranchStatsFromMatches(db, branchStats, branchGroups) {
-  const allMatched = db
-    .prepare(
-      `select t.amount, t.matched_borrower_id, b.branch_id, b.branch_name
-       from transactions t
-       left join borrowers b on b.id = t.matched_borrower_id
-       where t.status in ('matched','posted') and t.matched_borrower_id is not null`
-    )
-    .all()
-
-  for (const stat of branchStats) {
-    const rows = allMatched.filter(
-      (t) => String(t.branch_id || t.branch_name || 'unknown') === String(stat.branchKey)
-    )
-    stat.matched = rows.length
-    stat.totalEmiReceived = Math.round(rows.reduce((s, r) => s + (Number(r.amount) || 0), 0) * 100) / 100
-    stat.unmatched = 0
-    stat.percent = 100
-    stat.status = 'done'
-  }
-}
-
+/** Fast name-only matching with live matched/unmatched progress. */
 export async function runMatchingBatch(db, actor, onProgress) {
   const report = (patch) => onProgress?.(patch)
 
   const settings = getSettings(db)
   const threshold = settings.autoApproveThreshold ?? 80
-  let localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
+  const localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
   const toMatch = db
     .prepare("select * from transactions where status in ('pending', 'exception') order by date asc")
     .all()
@@ -217,72 +152,17 @@ export async function runMatchingBatch(db, actor, onProgress) {
     db.prepare('select id, filename from documents').all().map((d) => [d.id, d.filename])
   )
 
-  let loans = db.prepare('select * from loans').all()
+  const loans = db.prepare('select * from loans').all()
   let branchGroups = groupBorrowersByBranch(localBorrowers)
   let branchStats = buildBranchSummaries(branchGroups, loans, toMatch)
-  const txBatchesTotal = Math.max(1, Math.ceil(toMatch.length / TX_BATCH_SIZE))
 
-  report({
-    phase: 'preparing',
-    processed: 0,
-    total: toMatch.length,
-    matched: 0,
-    excepted: 0,
-    branches: branchStats,
-    batchIndex: 0,
-    batchTotal: txBatchesTotal,
-  })
-  await yieldEventLoop()
-
-  let searchSource = 'local'
-  let searchError = null
-  let termsSearched = 0
-
-  if (loanDiskConfigured()) {
-    report({ phase: 'loading_borrowers', processed: 0, total: toMatch.length, matched: 0, excepted: 0, branches: branchStats })
-    try {
-      const all = await loadAllBorrowersFallback()
-      if (all.length) {
-        searchSource = 'GetAllBorrowers'
-        for (const b of all) upsertBorrowerRecord(db, b)
-        localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
-        loans = db.prepare('select * from loans').all()
-        branchGroups = groupBorrowersByBranch(localBorrowers)
-        branchStats = buildBranchSummaries(branchGroups, loans, toMatch)
-      }
-    } catch (e) {
-      searchError = e.message
-      console.warn('GetAllBorrowers failed:', e.message)
-    }
+  if (!branchGroups.length) {
+    branchGroups = [{ branchKey: 'unknown', branchId: null, branchName: 'All borrowers', borrowers: localBorrowers }]
+    branchStats = buildBranchSummaries(branchGroups, loans, toMatch)
   }
 
-  const uniquePayerCount = new Set(toMatch.map((t) => String(t.payer || '').trim().toLowerCase()).filter(Boolean)).size
-  if (loanDiskConfigured() && toMatch.length <= LARGE_BATCH && uniquePayerCount <= MAX_BORROWER_SEARCH_TERMS) {
-    try {
-      const searchResult = await fetchBorrowersForTransactions(toMatch, report)
-      for (const b of searchResult.apiPool) upsertBorrowerRecord(db, b)
-      termsSearched = searchResult.termsSearched
-      searchSource = searchSource === 'GetAllBorrowers' ? 'GetAllBorrowers+BorrowerSerch' : 'BorrowerSerch'
-      localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
-      loans = db.prepare('select * from loans').all()
-      branchGroups = groupBorrowersByBranch(localBorrowers)
-      branchStats = buildBranchSummaries(branchGroups, loans, toMatch)
-    } catch (e) {
-      if (!searchError) searchError = e.message
-    }
-  }
-
-  const loansByBorrowerId = buildLoansByBorrowerId(loans)
-  await enrichLoanEmisForMatching(db, localBorrowers, toMatch, loansByBorrowerId, report)
-  loans = db.prepare('select * from loans').all()
-  for (const loan of loans) {
-    if (!loansByBorrowerId.has(loan.borrower_id)) loansByBorrowerId.set(loan.borrower_id, [])
-    const list = loansByBorrowerId.get(loan.borrower_id)
-    if (!list.some((l) => l.id === loan.id)) list.push(loan)
-  }
-
-  const matchAll = createCandidateMatcher(localBorrowers, loansByBorrowerId)
-  const pendingIds = new Set(toMatch.map((t) => t.id))
+  const recentMatched = []
+  const recentUnmatched = []
   let matched = 0
   let excepted = 0
 
@@ -292,103 +172,116 @@ export async function runMatchingBatch(db, actor, onProgress) {
     total: toMatch.length,
     matched: 0,
     excepted: 0,
+    percent: 0,
     branches: branchStats,
-    batchIndex: 0,
-    batchTotal: txBatchesTotal,
+    recentMatched: [],
+    recentUnmatched: [],
   })
 
-  for (let batchIdx = 0; batchIdx < txBatchesTotal; batchIdx++) {
-    const batchStart = batchIdx * TX_BATCH_SIZE
-    const batch = toMatch.slice(batchStart, batchStart + TX_BATCH_SIZE)
-
-    for (const rawTx of batch) {
-      if (!pendingIds.has(rawTx.id)) continue
-      const tx = enrichTxForMatching(rawTx, docFilenames)
-      const { borrower, score, loan } = matchAll(tx)
-
-      if (score >= threshold && borrower) {
-        let resolvedBorrower = borrower
-        if (borrower.loandisk_id) {
-          const { id } = upsertBorrowerRecord(db, borrower)
-          resolvedBorrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
-        }
-        const loanId = loan?.id || db.prepare('select id from loans where borrower_id = ?').get(resolvedBorrower.id)?.id
-
-        db.prepare(
-          `update transactions set status = 'matched', confidence_score = ?, matched_borrower_id = ?, loan_id = ? where id = ?`
-        ).run(score, resolvedBorrower.id, loanId || null, tx.id)
-        db.prepare(
-          `update exceptions set status = 'resolved', resolved_at = datetime('now')
-           where transaction_id = ? and status = 'open'`
-        ).run(tx.id)
-
-        pendingIds.delete(tx.id)
-        matched++
-      }
-    }
-
-    const processed = Math.min(toMatch.length, batchStart + batch.length)
-    report({
-      phase: 'matching',
-      processed,
-      total: toMatch.length,
-      matched,
-      excepted,
+  if (!localBorrowers.length) {
+    report({ phase: 'done', processed: 0, total: 0, matched: 0, excepted: 0, percent: 100, branches: branchStats })
+    return {
+      matched: 0,
+      excepted: 0,
+      pending: 0,
+      borrowers: 0,
+      searchSource: 'local',
+      message: 'No borrowers — sync LoanDisk first',
       branches: branchStats,
-      batchIndex: batchIdx + 1,
-      batchTotal: txBatchesTotal,
-      percent: Math.round((processed / Math.max(1, toMatch.length)) * 100),
-    })
-    await yieldEventLoop()
-  }
-
-  for (const rawTx of toMatch) {
-    if (!pendingIds.has(rawTx.id)) continue
-    const tx = enrichTxForMatching(rawTx, docFilenames)
-    const exType = detectExceptionType(tx, allTx, 0)
-    db.prepare(
-      `update transactions set status = 'exception', confidence_score = ?, matched_borrower_id = ? where id = ?`
-    ).run(0, null, tx.id)
-    const existing = db.prepare("select id from exceptions where transaction_id = ? and status = 'open'").get(tx.id)
-    if (!existing) {
-      const sla = settings.slaHours?.[exType] ?? 24
-      db.prepare(
-        `insert into exceptions (id, transaction_id, type, status, assigned_to, sla_hours) values (?, ?, ?, 'open', ?, ?)`
-      ).run(randomUUID(), tx.id, exType, actor, sla)
     }
-    excepted++
-    pendingIds.delete(rawTx.id)
   }
 
-  updateBranchStatsFromMatches(db, branchStats, branchGroups)
+  const loansByBorrowerId = buildLoansByBorrowerId(loans)
+  const matchAll = createCandidateMatcher(localBorrowers, loansByBorrowerId)
 
-  report({
-    phase: 'done',
-    processed: toMatch.length,
-    total: toMatch.length,
-    matched,
-    excepted,
-    branches: branchStats,
-    percent: 100,
-  })
+  for (let i = 0; i < toMatch.length; i++) {
+    const rawTx = toMatch[i]
+    const tx = enrichTxForMatching(rawTx, docFilenames)
+    const { borrower, score, loan } = matchAll(tx)
 
-  audit(db, 'matching', null, 'run', actor, null, {
-    matched,
-    excepted,
-    searchSource,
-    termsSearched,
-    searchError,
-  })
+    if (score >= threshold && borrower) {
+      let resolvedBorrower = borrower
+      if (borrower.loandisk_id) {
+        const { id } = upsertBorrowerRecord(db, borrower)
+        resolvedBorrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
+      }
+      const loanId = loan?.id || db.prepare('select id from loans where borrower_id = ?').get(resolvedBorrower.id)?.id
+
+      db.prepare(
+        `update transactions set status = 'matched', confidence_score = ?, matched_borrower_id = ?, loan_id = ? where id = ?`
+      ).run(score, resolvedBorrower.id, loanId || null, tx.id)
+      db.prepare(
+        `update exceptions set status = 'resolved', resolved_at = datetime('now')
+         where transaction_id = ? and status = 'open'`
+      ).run(tx.id)
+
+      matched++
+      const stat = findBranchStat(branchStats, resolvedBorrower)
+      if (stat) {
+        stat.matched++
+        stat.totalEmiReceived = Math.round((stat.totalEmiReceived + Number(tx.amount || 0)) * 100) / 100
+        stat.processed++
+        stat.percent = stat.processed > 0 ? Math.min(100, Math.round((stat.matched / stat.processed) * 100)) : 0
+        stat.status = 'running'
+      }
+
+      recentMatched.unshift(liveRow(tx, resolvedBorrower, 'matched'))
+      if (recentMatched.length > 30) recentMatched.pop()
+    } else {
+      const exType = detectExceptionType(tx, allTx, score)
+      db.prepare(
+        `update transactions set status = 'exception', confidence_score = ?, matched_borrower_id = ? where id = ?`
+      ).run(0, null, tx.id)
+      const existing = db.prepare("select id from exceptions where transaction_id = ? and status = 'open'").get(tx.id)
+      if (!existing) {
+        const sla = settings.slaHours?.[exType] ?? 24
+        db.prepare(
+          `insert into exceptions (id, transaction_id, type, status, assigned_to, sla_hours) values (?, ?, ?, 'open', ?, ?)`
+        ).run(randomUUID(), tx.id, exType, actor, sla)
+      }
+      excepted++
+      recentUnmatched.unshift(liveRow(tx, null, 'exception'))
+      if (recentUnmatched.length > 30) recentUnmatched.pop()
+    }
+
+    const processed = i + 1
+    if (processed % REPORT_EVERY === 0 || processed === toMatch.length) {
+      const percent = Math.round((processed / Math.max(1, toMatch.length)) * 100)
+      for (const stat of branchStats) {
+        if (stat.status === 'running') stat.percent = percent
+        if (processed === toMatch.length) {
+          stat.status = 'done'
+          stat.percent = 100
+          stat.unmatched = Math.max(0, (stat.processed || 0) - (stat.matched || 0))
+        }
+      }
+      report({
+        phase: processed === toMatch.length ? 'done' : 'matching',
+        processed,
+        total: toMatch.length,
+        matched,
+        excepted,
+        percent,
+        branches: branchStats,
+        recentMatched: [...recentMatched],
+        recentUnmatched: [...recentUnmatched],
+      })
+      await yieldEventLoop()
+    }
+  }
+
+  audit(db, 'matching', null, 'run', actor, null, { matched, excepted, searchSource: 'local-name' })
 
   return {
     matched,
     excepted,
     pending: toMatch.length,
     borrowers: localBorrowers.length,
-    searchSource,
-    termsSearched,
+    searchSource: 'local-name',
+    termsSearched: 0,
     candidatesFound: localBorrowers.length,
-    searchError,
     branches: branchStats,
+    recentMatched,
+    recentUnmatched,
   }
 }

@@ -1,6 +1,7 @@
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Toaster } from 'react-hot-toast'
 import { AuthProvider } from '@/context/AuthContext'
+import { MatchingProgressProvider } from '@/context/MatchingProgressContext'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { Layout } from '@/components/Layout'
 import { Login } from '@/pages/Login'
@@ -18,6 +19,7 @@ import { ReportsDaily } from '@/pages/ReportsDaily'
 export default function App() {
   return (
     <AuthProvider>
+      <MatchingProgressProvider>
       <HashRouter>
         <Toaster
           position="bottom-right"
@@ -52,6 +54,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </HashRouter>
+      </MatchingProgressProvider>
     </AuthProvider>
   )
 }

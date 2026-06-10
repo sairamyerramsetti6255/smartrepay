@@ -6,6 +6,7 @@ import * as api from '@/lib/api'
 import { explainMatch, confidenceVariant, confidenceLabel } from '@/lib/matcher'
 import { writeAuditLog } from '@/lib/audit'
 import { useAuth } from '@/context/AuthContext'
+import { useMatchingProgress } from '@/context/MatchingProgressContext'
 import { useTransactions } from '@/hooks/useTransactions'
 import { useBorrowers } from '@/hooks/useBorrowers'
 import { Button } from '@/components/ui/button'
@@ -50,15 +51,13 @@ export function Match() {
   const { borrowers, loans, loading: brLoading, refreshing: brRefreshing, error: brError, refetch: refetchBorrowers, syncFromLoanDisk } = useBorrowers()
   const [detailTx, setDetailTx] = useState(null)
   const [filter, setFilter] = useState('all')
-  const [running, setRunning] = useState(false)
+  const { running: isRunning, progress: matchProgress, result: matchResult, startMatching } = useMatchingProgress()
   const [syncing, setSyncing] = useState(false)
   const [documents, setDocuments] = useState([])
   const [docsLoading, setDocsLoading] = useState(true)
   const [documentFilter, setDocumentFilter] = useState(null)
   const [selectedBorrowerId, setSelectedBorrowerId] = useState('')
   const [borrowerSearch, setBorrowerSearch] = useState('')
-  const [matchProgress, setMatchProgress] = useState(null)
-  const [matchResult, setMatchResult] = useState(null)
   const [showMatchPanel, setShowMatchPanel] = useState(false)
 
   const initialLoading = txLoading || brLoading
@@ -197,28 +196,32 @@ export function Match() {
   }, [])
 
   useEffect(() => {
-    api.matching.status().then((snap) => {
-      if (snap.status !== 'running') return
-      setRunning(true)
-      setShowMatchPanel(true)
-      setMatchProgress(snap.progress || { phase: 'matching' })
-      api.matching
-        .pollUntilComplete((p) => setMatchProgress(p))
-        .then((result) => {
-          if (result?.matched != null) {
-            toast.success(`${result.matched} matched, ${result.excepted} unmatched`)
-            refetch()
-            refetchBorrowers()
-            loadDocuments()
-          }
-        })
-        .catch((e) => toast.error(e.message))
-        .finally(() => {
-          setRunning(false)
-          setMatchProgress(null)
-        })
-    }).catch(() => {})
-  }, [])
+    const onDone = (e) => {
+      const result = e.detail
+      if (result?.matched != null) {
+        setShowMatchPanel(true)
+        refetch()
+        refetchBorrowers()
+        loadDocuments()
+      }
+    }
+    window.addEventListener('smartrepay:matching-done', onDone)
+    return () => window.removeEventListener('smartrepay:matching-done', onDone)
+  }, [refetch, refetchBorrowers])
+
+  useEffect(() => {
+    if (isRunning) setShowMatchPanel(true)
+  }, [isRunning])
+
+  useEffect(() => {
+    const onProgress = () => refetch()
+    window.addEventListener('smartrepay:matching-progress', onProgress)
+    return () => window.removeEventListener('smartrepay:matching-progress', onProgress)
+  }, [refetch])
+
+  useEffect(() => {
+    if (matchResult?.matched > 0) setFilter('matched')
+  }, [matchResult])
 
   useEffect(() => {
     if (!detailTx) {
@@ -280,36 +283,25 @@ export function Match() {
 
   function matchProgressLabel(progress) {
     if (!progress) return 'Running matching…'
-    if (progress.phase === 'searching') {
-      return `Searching LoanDisk (${progress.batchesDone ?? '?'}/${progress.batchesTotal ?? '?'})…`
-    }
-    if (progress.phase === 'matching') {
-      return `Matching ${progress.processed ?? 0}/${progress.total ?? '?'}…`
+    if (progress.phase === 'matching' || progress.processed != null) {
+      const pct = progress.percent ?? Math.round(((progress.processed ?? 0) / Math.max(1, progress.total ?? 1)) * 100)
+      return `Matching ${progress.processed ?? 0}/${progress.total ?? '?'} · ${progress.matched ?? 0} matched (${pct}%)`
     }
     return 'Running matching…'
   }
 
   async function runMatching() {
-    setRunning(true)
     setShowMatchPanel(true)
-    setMatchResult(null)
-    setMatchProgress({ phase: 'starting' })
     try {
-      const result = await api.matching.run((p) => setMatchProgress(p))
-      if (result.message && result.matched === 0 && result.excepted === 0) {
+      const result = await startMatching()
+      if (result?.message && result.matched === 0 && result.excepted === 0) {
         toast.error(result.message)
-      } else {
-        setMatchResult(result)
-        toast.success(`${result.matched} matched, ${result.excepted} unmatched across ${result.branches?.length ?? 0} branches`)
+      } else if (result?.matched != null) {
+        toast.success(`${result.matched} matched, ${result.excepted} unmatched`)
         if (result.searchError) toast.error(`LoanDisk warning: ${result.searchError}`)
       }
-      refetch()
-      refetchBorrowers()
-      loadDocuments()
     } catch (e) {
       toast.error(e.message)
-    } finally {
-      setRunning(false)
     }
   }
 
@@ -370,10 +362,10 @@ export function Match() {
         actions={
           <div className="flex items-center gap-2 flex-wrap justify-end">
             {refreshing && <Loader2 className="h-4 w-4 animate-spin text-[var(--text-tertiary)]" />}
-            <Button variant="secondary" size="sm" onClick={resetData} disabled={syncing || running}>
+            <Button variant="secondary" size="sm" onClick={resetData} disabled={syncing || isRunning}>
               Reset
             </Button>
-            <Button variant="secondary" size="sm" onClick={syncLoanDisk} disabled={syncing || running}>
+            <Button variant="secondary" size="sm" onClick={syncLoanDisk} disabled={syncing || isRunning}>
               {syncing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Sync
             </Button>
@@ -381,9 +373,9 @@ export function Match() {
               <FileSpreadsheet className="h-4 w-4" />
               Export Matched
             </Button>
-            <Button size="sm" onClick={runMatching} disabled={running || syncing}>
-              {running ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {running && matchProgress ? matchProgressLabel(matchProgress) : 'Run Matching'}
+            <Button size="sm" onClick={runMatching} disabled={isRunning || syncing}>
+              {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {isRunning && matchProgress ? matchProgressLabel(matchProgress) : 'Run Matching'}
             </Button>
           </div>
         }
@@ -395,17 +387,15 @@ export function Match() {
         </div>
       )}
 
-      {(showMatchPanel || running || matchResult) && (
+      {(showMatchPanel || isRunning || matchResult) && (
         <MatchRunPanel
-          running={running}
+          running={isRunning}
           progress={matchProgress}
           result={matchResult}
           borrowers={borrowers}
           loans={loans}
           onComplete={() => {
             setShowMatchPanel(false)
-            setMatchResult(null)
-            setMatchProgress(null)
             refetch()
           }}
           onAssign={() => {

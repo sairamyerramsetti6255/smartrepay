@@ -152,7 +152,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.7.2',
+    build: '1.7.3',
     heavyJob: getActiveJobName(),
     features: {
       documents: true,
@@ -664,6 +664,7 @@ app.get('/api/matching/branches/:branchKey/transactions', authMiddleware, (req, 
 })
 
 app.get('/api/matching/status', authMiddleware, (_req, res) => {
+  resetStaleJob(matchingJob, 'Matching')
   res.json({
     status: matchingJob.status,
     progress: matchingJob.progress,
@@ -671,17 +672,39 @@ app.get('/api/matching/status', authMiddleware, (_req, res) => {
     error: matchingJob.error,
     startedAt: matchingJob.startedAt,
     finishedAt: matchingJob.finishedAt,
+    activeJob: getActiveJobName(),
   })
 })
 
+function resetStaleJob(job, jobName) {
+  if (job.status === 'running' && !isHeavyJobRunning()) {
+    job.status = 'idle'
+    job.error = job.error || `${jobName} interrupted — safe to retry`
+    return true
+  }
+  return false
+}
+
 app.post('/api/matching/run', authMiddleware, (req, res) => {
   try {
-    if (matchingJob.status === 'running' || isHeavyJobRunning()) {
+    resetStaleJob(matchingJob, 'Matching')
+    resetStaleJob(syncJob, 'Sync')
+
+    const activeJob = getActiveJobName()
+    if (matchingJob.status === 'running' && activeJob === 'matching') {
       return res.json({
         status: 'running',
         message: 'Matching already in progress',
         progress: matchingJob.progress,
-        activeJob: getActiveJobName(),
+        activeJob,
+      })
+    }
+    if (isHeavyJobRunning() && activeJob !== 'matching') {
+      return res.json({
+        status: 'busy',
+        message: `Server busy with ${activeJob} — wait or retry in a moment`,
+        progress: matchingJob.progress,
+        activeJob,
       })
     }
 

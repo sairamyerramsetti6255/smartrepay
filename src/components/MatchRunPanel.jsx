@@ -20,6 +20,45 @@ function ProgressBar({ value, className }) {
   )
 }
 
+function LiveResultList({ title, count, rows, variant, emptyLabel }) {
+  const isMatched = variant === 'matched'
+  return (
+    <div className="rounded-[var(--radius-md)] border border-[var(--border-light)] overflow-hidden">
+      <div
+        className={cn(
+          'px-4 py-2.5 flex items-center justify-between border-b border-[var(--border-light)]',
+          isMatched ? 'bg-[var(--success-bg)]' : 'bg-[var(--bg-subtle)]'
+        )}
+      >
+        <span className="text-[13px] font-semibold text-[var(--text-primary)]">{title}</span>
+        <span className={cn('text-[13px] font-bold mono', isMatched ? 'text-[var(--success)]' : 'text-[var(--text-secondary)]')}>
+          {count}
+        </span>
+      </div>
+      <div className="max-h-[220px] overflow-y-auto">
+        {rows.length ? (
+          <table className="w-full text-[12px]">
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="border-t border-[var(--border-light)]">
+                  <td className="px-3 py-2 text-[var(--text-secondary)] whitespace-nowrap">{formatDate(r.date)}</td>
+                  <td className="px-3 py-2 font-medium truncate max-w-[140px]">{r.payer || '—'}</td>
+                  <td className="px-3 py-2 mono text-right">{formatCurrency(r.amount)}</td>
+                  {isMatched && (
+                    <td className="px-3 py-2 text-[var(--accent)] truncate max-w-[120px]">{r.borrowerName || '—'}</td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="px-4 py-6 text-center text-[12px] text-[var(--text-tertiary)]">{emptyLabel}</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export function MatchRunPanel({
   running,
   progress,
@@ -41,16 +80,18 @@ export function MatchRunPanel({
   const branches = progress?.branches || result?.branches || preview?.branches || []
 
   const overallPercent = useMemo(() => {
+    if (progress?.percent != null) return progress.percent
+    if (progress?.total) return Math.round(((progress.processed ?? 0) / progress.total) * 100)
     if (!branches.length) return 0
     if (progress?.phase === 'done' || result) return 100
     const done = branches.filter((b) => b.status === 'done').length
-    const runningBr = branches.find((b) => b.status === 'running')
-    const base = (done / branches.length) * 100
-    if (runningBr && runningBr.processed > 0) {
-      return base + (1 / branches.length) * Math.min(99, runningBr.percent || 50)
-    }
-    return base
+    return branches.length ? Math.round((done / branches.length) * 100) : 0
   }, [branches, progress, result])
+
+  const recentMatched = progress?.recentMatched || result?.recentMatched || []
+  const recentUnmatched = progress?.recentUnmatched || result?.recentUnmatched || []
+  const liveMatched = progress?.matched ?? result?.matched ?? 0
+  const liveUnmatched = progress?.excepted ?? result?.excepted ?? 0
 
   const loadPreview = useCallback(async () => {
     try {
@@ -165,13 +206,15 @@ export function MatchRunPanel({
         <div>
           <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Branch matching</h2>
           <p className="text-[12px] text-[var(--text-secondary)] mt-0.5">
-            First name + last name match · LoanDisk ID from reference when available
+            First + last name only — fast matching, live results below
           </p>
         </div>
         {running ? (
           <span className="flex items-center gap-2 text-[12px] text-[var(--accent)]">
             <Loader2 className="h-4 w-4 animate-spin" />
-            {progress?.currentBranch ? `Processing ${progress.currentBranch}…` : 'Starting…'}
+            {progress?.processed != null
+              ? `${progress.processed}/${progress.total} · ${liveMatched} matched · ${liveUnmatched} unmatched`
+              : 'Starting…'}
           </span>
         ) : result ? (
           <span className="flex items-center gap-2 text-[12px] text-[var(--success)]">
@@ -248,9 +291,28 @@ export function MatchRunPanel({
         </table>
       </div>
 
+      {(running || result) && (
+        <div className="grid md:grid-cols-2 gap-4">
+          <LiveResultList
+            title="Matched"
+            count={liveMatched}
+            rows={recentMatched}
+            variant="matched"
+            emptyLabel={running ? 'Matching in progress…' : 'No matches'}
+          />
+          <LiveResultList
+            title="Unmatched"
+            count={liveUnmatched}
+            rows={recentUnmatched}
+            variant="unmatched"
+            emptyLabel={running ? 'Waiting for results…' : 'All matched'}
+          />
+        </div>
+      )}
+
       {preview && !running && !result && (
         <p className="text-[12px] text-[var(--text-secondary)]">
-          {preview.pendingCount} transactions pending · {formatCurrency(preview.totalPendingEmi)} total EMI to match
+          {preview.pendingCount} transactions pending · sync borrowers first, then run name matching
         </p>
       )}
 

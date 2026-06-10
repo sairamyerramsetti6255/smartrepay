@@ -2,6 +2,7 @@ import { useLocation, Link } from 'react-router-dom'
 import { Search, Bell } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { NotificationsBell } from './NotificationsBell'
+import { MatchingProgressBar } from './MatchingProgressBar'
 import { useAuth } from '@/context/AuthContext'
 
 const routeLabels = {
@@ -40,6 +41,7 @@ export function TopBar() {
       </nav>
 
       <div className="flex items-center gap-3">
+        <MatchingProgressBar />
         <div className="relative hidden md:block">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--text-tertiary)]" strokeWidth={1.75} />
           <Input className="w-52 pl-9 h-8 text-[13px]" placeholder="Search..." />
