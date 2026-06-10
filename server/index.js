@@ -152,7 +152,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.7.4',
+    build: '1.7.5',
     heavyJob: getActiveJobName(),
     features: {
       documents: true,
@@ -690,21 +690,21 @@ app.post('/api/matching/run', authMiddleware, (req, res) => {
     resetStaleJob(matchingJob, 'Matching')
     resetStaleJob(syncJob, 'Sync')
 
-    const activeJob = getActiveJobName()
-    if (matchingJob.status === 'running' && activeJob === 'matching') {
+    const currentJob = getActiveJobName()
+    if (matchingJob.status === 'running' && currentJob === 'matching') {
       return res.json({
         status: 'running',
         message: 'Matching already in progress',
         progress: matchingJob.progress,
-        activeJob,
+        activeJob: currentJob,
       })
     }
-    if (isHeavyJobRunning() && activeJob !== 'matching') {
+    if (isHeavyJobRunning() && currentJob !== 'matching') {
       return res.json({
         status: 'busy',
-        message: `Server busy with ${activeJob} — wait or retry in a moment`,
+        message: `Server busy with ${currentJob} — wait or retry in a moment`,
         progress: matchingJob.progress,
-        activeJob,
+        activeJob: currentJob,
       })
     }
 
