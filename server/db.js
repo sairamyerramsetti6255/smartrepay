@@ -32,6 +32,7 @@ class SqliteDatabase {
 const db = new SqliteDatabase(DB_PATH)
 db.pragma('journal_mode = WAL')
 db.pragma('foreign_keys = ON')
+db.pragma('busy_timeout = 10000')
 
 function tableExists(name) {
   const row = db.prepare("select name from sqlite_master where type='table' and name=?").get(name)

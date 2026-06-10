@@ -335,26 +335,27 @@ export function buildPayerSearchPlan(payerNames) {
 const SEARCH_BATCH_SIZE = 25
 
 /** Bulk BorrowerSerch for many payers; returns candidate pool + per-payer lists. */
-export async function fetchBorrowersForPayers(payerNames) {
+export async function fetchBorrowersForPayers(payerNames, onProgress) {
   const { orderedTerms, termToPayers } = buildPayerSearchPlan(payerNames)
   const apiPool = []
   const byPayer = new Map()
   const seen = new Set()
   let batches = 0
+  const batchesTotal = Math.max(1, Math.ceil(orderedTerms.length / SEARCH_BATCH_SIZE))
 
   for (let i = 0; i < orderedTerms.length; i += SEARCH_BATCH_SIZE) {
     const batch = orderedTerms.slice(i, i + SEARCH_BATCH_SIZE)
     const criteria = batch.map((name) => ({ name, loanAmount: '', emi: '', branchId: '' }))
     const data = await borrowerSearch(criteria)
     const { borrowers, bySearchName } = parseBorrowerSearchResults(data, batch)
-    batches++
-
     for (const b of borrowers) {
       if (!seen.has(b.loandisk_id)) {
         seen.add(b.loandisk_id)
         apiPool.push(b)
       }
     }
+    batches++
+    onProgress?.({ phase: 'searching', batchesDone: batches, batchesTotal, candidatesFound: apiPool.length })
 
     for (const term of batch) {
       const termKey = term.toLowerCase().trim()
