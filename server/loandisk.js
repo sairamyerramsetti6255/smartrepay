@@ -1,3 +1,5 @@
+import { parseOperationsLoanRows } from './loanDiskLoans.js'
+
 const API_BASE = process.env.LOANDISK_API_URL || 'https://simplifiedapi.meanhost.in/v1/api'
 const FETCH_TIMEOUT_MS = Number(process.env.LOANDISK_FETCH_TIMEOUT_MS) || 180_000
 
@@ -8,7 +10,7 @@ function isSuccessCode(code) {
   return code === 1 || code === 'SUCCESS' || code === 'success'
 }
 
-function pickField(row, ...keys) {
+export function pickField(row, ...keys) {
   for (const key of keys) {
     const val = row?.[key]
     if (val !== undefined && val !== null && String(val).trim() !== '') return val
@@ -120,7 +122,7 @@ export function normalizeLoanDiskBorrower(row) {
   const business = String(pickField(row, 'borrower_business_name', 'BorrowerBusinessName') || '').trim()
   const full_name = business || `${first} ${last}`.trim() || `Borrower ${loandisk_id}`
   const employer = String(
-    pickField(row, 'custom_field_8239', 'borrower_working_status', 'employer', 'Employer') || ''
+    pickField(row, 'custom_field_8239', 'borrower_working_status', 'employer', 'Employer', 'EmployerName') || ''
   ).trim()
   const email = pickField(row, 'borrower_email', 'BorrowerEmail', 'email')
   const mobile = pickField(row, 'borrower_mobile', 'BorrowerMobile', 'mobile')
@@ -422,26 +424,39 @@ export async function fetchBorrowersForPayers(payerNames, onProgress) {
   return fetchBorrowersForTransactions(payerNames.map((payer) => ({ payer, amount: null })), onProgress)
 }
 
-/** GET /SP/Loandisk_OperationsNewForId?borrowerId= — single borrower detail. */
+/** GET /SP/Loandisk_OperationsNewForId?borrowerId= — borrower + loan/EMI details. */
 export async function fetchBorrowerById(borrowerId) {
   const token = await getLoanDiskToken()
   const id = String(borrowerId).trim()
   const res = await fetch(`${API_BASE}/SP/Loandisk_OperationsNewForId?borrowerId=${encodeURIComponent(id)}`, {
     method: 'GET',
     headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(180_000),
   })
-
   const data = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(data.message || data.title || `OperationsNewForId HTTP ${res.status}`)
-  if (data.code !== undefined && !isSuccessCode(data.code)) {
-    throw new Error(data.message || data.title || 'Borrower lookup failed')
-  }
-
   const doc = data.document
-  const row = Array.isArray(doc) ? doc[0] : doc?.response?.Results?.[0]?.[0] ?? doc
-  const normalized = normalizeLoanDiskBorrower(row?.borrower_id ? row : { ...row, borrower_id: id })
-  return { raw: data, borrower: normalized }
+  const root = Array.isArray(doc) ? doc[0] : doc
+  let borrowerRow =
+    root?.borrower ||
+    root?.Borrower ||
+    root?.data?.response?.Results?.[0]?.[0] ||
+    root?.response?.Results?.[0]?.[0] ||
+    (root?.borrower_id || root?.borrower_firstname ? root : { borrower_id: id })
+  if (!borrowerRow?.borrower_id && !borrowerRow?.BorrowerId) {
+    borrowerRow = { ...borrowerRow, borrower_id: id }
+  }
+  const firstLoan = root?.Loans?.[0] || root?.loans?.[0]
+  if (firstLoan?.EmployerName && !pickField(borrowerRow, 'employer', 'Employer', 'EmployerName')) {
+    borrowerRow = { ...borrowerRow, EmployerName: firstLoan.EmployerName }
+  }
+  const borrower = normalizeLoanDiskBorrower(borrowerRow)
+  const { loans, raw } = parseOperationsLoanRows(data, id, borrower)
+  return { raw, borrower, loans }
+}
+
+export async function fetchBorrowerLoansFromApi(borrowerId) {
+  return fetchBorrowerById(borrowerId)
 }
 
 export const fetchLoanDiskBorrowers = fetchAllBorrowers
