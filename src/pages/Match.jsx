@@ -56,6 +56,7 @@ export function Match() {
   const [documentFilter, setDocumentFilter] = useState(null)
   const [selectedBorrowerId, setSelectedBorrowerId] = useState('')
   const [borrowerSearch, setBorrowerSearch] = useState('')
+  const [matchProgress, setMatchProgress] = useState(null)
 
   const initialLoading = txLoading || brLoading
   const refreshing = txRefreshing || brRefreshing
@@ -188,6 +189,29 @@ export function Match() {
   }, [])
 
   useEffect(() => {
+    api.matching.status().then((snap) => {
+      if (snap.status !== 'running') return
+      setRunning(true)
+      setMatchProgress(snap.progress || { phase: 'matching' })
+      api.matching
+        .pollUntilComplete((p) => setMatchProgress(p))
+        .then((result) => {
+          if (result?.matched != null) {
+            toast.success(`${result.matched} matched, ${result.excepted} unmatched`)
+            refetch()
+            refetchBorrowers()
+            loadDocuments()
+          }
+        })
+        .catch((e) => toast.error(e.message))
+        .finally(() => {
+          setRunning(false)
+          setMatchProgress(null)
+        })
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
     if (!detailTx) {
       setSelectedBorrowerId('')
       setBorrowerSearch('')
@@ -245,10 +269,22 @@ export function Match() {
     }
   }
 
+  function matchProgressLabel(progress) {
+    if (!progress) return 'Running matching…'
+    if (progress.phase === 'searching') {
+      return `Searching LoanDisk (${progress.batchesDone ?? '?'}/${progress.batchesTotal ?? '?'})…`
+    }
+    if (progress.phase === 'matching') {
+      return `Matching ${progress.processed ?? 0}/${progress.total ?? '?'}…`
+    }
+    return 'Running matching…'
+  }
+
   async function runMatching() {
     setRunning(true)
+    setMatchProgress({ phase: 'starting' })
     try {
-      const result = await api.matching.run()
+      const result = await api.matching.run((p) => setMatchProgress(p))
       if (result.message && result.matched === 0 && result.excepted === 0) {
         toast.error(result.message)
       } else {
@@ -272,6 +308,7 @@ export function Match() {
       toast.error(e.message)
     } finally {
       setRunning(false)
+      setMatchProgress(null)
     }
   }
 
@@ -345,7 +382,7 @@ export function Match() {
             </Button>
             <Button size="sm" onClick={runMatching} disabled={running || syncing}>
               {running ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Run Matching
+              {running && matchProgress ? matchProgressLabel(matchProgress) : 'Run Matching'}
             </Button>
           </div>
         }

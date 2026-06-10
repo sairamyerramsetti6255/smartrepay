@@ -356,6 +356,7 @@ export async function fetchBorrowersForPayers(payerNames, onProgress) {
     }
     batches++
     onProgress?.({ phase: 'searching', batchesDone: batches, batchesTotal, candidatesFound: apiPool.length })
+    await new Promise((resolve) => setImmediate(resolve))
 
     for (const term of batch) {
       const termKey = term.toLowerCase().trim()

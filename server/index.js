@@ -9,7 +9,8 @@ import { fileURLToPath } from 'url'
 import { randomUUID, createHash } from 'crypto'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
-import { bestMatchFromCandidates, matchTransaction, detectExceptionType } from './matcher.js'
+import { bestMatchFromCandidates, createCandidateMatcher, matchTransaction, detectExceptionType } from './matcher.js'
+import { yieldEventLoop } from './asyncUtil.js'
 import { parseStatementBuffer } from './parseStatement.js'
 import {
   getLoanDiskToken,
@@ -152,7 +153,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.2.0',
+    build: '1.3.0',
     features: {
       documents: true,
       loandiskBorrowerSearch: true,
@@ -457,26 +458,40 @@ function upsertBorrowerRecord(b) {
   return { id, created: true }
 }
 
-function importBorrowerBatch(borrowers, actor, meta = {}) {
+async function importBorrowerBatch(borrowers, actor, meta = {}, onProgress) {
   let created = 0
   let updated = 0
 
-  for (const raw of borrowers) {
+  for (let i = 0; i < borrowers.length; i++) {
+    const raw = borrowers[i]
     const b = raw.loandisk_id && raw.full_name ? raw : normalizeLoanDiskBorrower(raw.raw || raw)
-    if (!b?.loandisk_id) continue
-    const result = upsertBorrowerRecord(b)
-    if (result.created) created++
-    else updated++
+    if (b?.loandisk_id) {
+      const result = upsertBorrowerRecord(b)
+      if (result.created) created++
+      else updated++
+    }
+    if (i % 50 === 0) {
+      onProgress?.({ processed: i, total: borrowers.length, created, updated })
+      await yieldEventLoop()
+    }
   }
 
   audit('loandisk', null, 'import_borrowers', actor, null, { created, updated, ...meta })
   return { created, updated, synced: created + updated, total: borrowers.length, source: 'GetAllBorrowers', ...meta }
 }
 
-async function syncLoanDiskToDb(actor) {
+async function syncLoanDiskToDb(actor, onProgress) {
   const { borrowers, total, orgId, source, branches, totalReported, message } = await fetchAllBorrowers()
-  const result = importBorrowerBatch(borrowers, actor, { total, orgId, source, branches, totalReported, message })
+  const result = await importBorrowerBatch(borrowers, actor, { total, orgId, source, branches, totalReported, message }, onProgress)
   return result
+}
+
+const syncJob = {
+  status: 'idle',
+  startedAt: null,
+  finishedAt: null,
+  result: null,
+  error: null,
 }
 
 async function loadAllBorrowersFallback() {
@@ -506,7 +521,6 @@ async function runMatchingBatch(actor, onProgress) {
   const settings = getSettings()
   const threshold = settings.autoApproveThreshold ?? 80
   const localBorrowers = db.prepare('select * from borrowers').all().map(rowBorrower)
-  let loans = db.prepare('select * from loans').all()
   const toMatch = db
     .prepare("select * from transactions where status in ('pending', 'exception') order by date asc")
     .all()
@@ -556,6 +570,10 @@ async function runMatchingBatch(actor, onProgress) {
 
   let matched = 0
   let excepted = 0
+  const loans = db.prepare('select * from loans').all()
+  const loanByBorrower = new Map(loans.map((l) => [l.borrower_id, l]))
+  const matchFromPool = apiPool.length ? createCandidateMatcher(apiPool) : null
+  const matchFromLocal = localBorrowers.length ? createCandidateMatcher(localBorrowers) : null
 
   report({ phase: 'matching', processed: 0, total: toMatch.length, matched: 0, excepted: 0 })
 
@@ -563,18 +581,19 @@ async function runMatchingBatch(actor, onProgress) {
     const tx = toMatch[i]
     const payerKey = String(tx.payer || '').trim().toLowerCase()
     const payerCandidates = byPayer.get(payerKey) || []
-    let candidates = payerCandidates.length ? payerCandidates : apiPool.length ? apiPool : localBorrowers
 
-    let { borrower, score } = bestMatchFromCandidates(tx, candidates)
-    if (score < threshold && apiPool.length) {
-      const poolMatch = bestMatchFromCandidates(tx, apiPool)
+    let { borrower, score } = payerCandidates.length
+      ? bestMatchFromCandidates(tx, payerCandidates)
+      : { borrower: null, score: 0 }
+    if (score < threshold && matchFromPool) {
+      const poolMatch = matchFromPool(tx)
       if (poolMatch.score > score) {
         borrower = poolMatch.borrower
         score = poolMatch.score
       }
     }
-    if (score < threshold && localBorrowers.length) {
-      const localMatch = bestMatchFromCandidates(tx, localBorrowers)
+    if (score < threshold && matchFromLocal) {
+      const localMatch = matchFromLocal(tx)
       if (localMatch.score > score) {
         borrower = localMatch.borrower
         score = localMatch.score
@@ -585,10 +604,11 @@ async function runMatchingBatch(actor, onProgress) {
     if (borrower?.loandisk_id) {
       const { id } = upsertBorrowerRecord(borrower)
       resolvedBorrower = rowBorrower(db.prepare('select * from borrowers where id = ?').get(id))
-      loans = db.prepare('select * from loans').all()
+      const loanRow = db.prepare('select * from loans where borrower_id = ?').get(id)
+      if (loanRow) loanByBorrower.set(id, loanRow)
     }
 
-    const loan = resolvedBorrower ? loans.find((l) => l.borrower_id === resolvedBorrower.id) : null
+    const loan = resolvedBorrower ? loanByBorrower.get(resolvedBorrower.id) : null
 
     if (score >= threshold && resolvedBorrower) {
       db.prepare(
@@ -616,8 +636,9 @@ async function runMatchingBatch(actor, onProgress) {
       excepted++
     }
 
-    if (i % 25 === 0 || i === toMatch.length - 1) {
+    if (i % 10 === 0 || i === toMatch.length - 1) {
       report({ phase: 'matching', processed: i + 1, total: toMatch.length, matched, excepted })
+      await yieldEventLoop()
     }
   }
 
@@ -653,10 +674,10 @@ app.get('/api/loandisk/token', authMiddleware, async (_req, res) => {
   }
 })
 
-app.post('/api/loandisk/import-raw', authMiddleware, (req, res) => {
+app.post('/api/loandisk/import-raw', authMiddleware, async (req, res) => {
   try {
     const parsed = normalizeBorrowersFromPayload(req.body)
-    const result = importBorrowerBatch(parsed.borrowers, req.user.email, {
+    const result = await importBorrowerBatch(parsed.borrowers, req.user.email, {
       branches: parsed.branches,
       totalReported: parsed.totalReported,
       message: parsed.message,
@@ -667,11 +688,11 @@ app.post('/api/loandisk/import-raw', authMiddleware, (req, res) => {
   }
 })
 
-app.post('/api/loandisk/import-borrowers', authMiddleware, (req, res) => {
+app.post('/api/loandisk/import-borrowers', authMiddleware, async (req, res) => {
   try {
     const incoming = req.body.borrowers || req.body.rows || []
     if (!incoming.length) return res.status(400).json({ error: 'No borrowers to import' })
-    res.json(importBorrowerBatch(incoming, req.user.email))
+    res.json(await importBorrowerBatch(incoming, req.user.email))
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -693,10 +714,44 @@ app.get('/api/loandisk/status', authMiddleware, async (_req, res) => {
   }
 })
 
-app.post('/api/loandisk/sync', authMiddleware, async (req, res) => {
+app.get('/api/loandisk/sync/status', authMiddleware, (_req, res) => {
+  res.json({
+    status: syncJob.status,
+    result: syncJob.result,
+    error: syncJob.error,
+    startedAt: syncJob.startedAt,
+    finishedAt: syncJob.finishedAt,
+  })
+})
+
+app.post('/api/loandisk/sync', authMiddleware, (req, res) => {
   try {
-    const result = await syncLoanDiskToDb(req.user.email)
-    res.json(result)
+    if (syncJob.status === 'running') {
+      return res.json({ status: 'running', message: 'Borrower sync already in progress' })
+    }
+    syncJob.status = 'running'
+    syncJob.startedAt = new Date().toISOString()
+    syncJob.finishedAt = null
+    syncJob.result = null
+    syncJob.error = null
+
+    res.json({ status: 'started', message: 'Borrower sync started in background' })
+
+    const actor = req.user.email
+    setImmediate(() => {
+      syncLoanDiskToDb(actor)
+        .then((result) => {
+          syncJob.status = 'completed'
+          syncJob.finishedAt = new Date().toISOString()
+          syncJob.result = result
+        })
+        .catch((e) => {
+          syncJob.status = 'failed'
+          syncJob.finishedAt = new Date().toISOString()
+          syncJob.error = e.message
+          console.error('Borrower sync failed:', e)
+        })
+    })
   } catch (e) {
     res.status(400).json({ error: e.message })
   }

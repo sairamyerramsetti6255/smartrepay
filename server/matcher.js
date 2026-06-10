@@ -42,8 +42,20 @@ function exactNameScore(payer, borrower) {
   return 0
 }
 
-/** Score payer against a list of API/local borrower candidates. */
-export function bestMatchFromCandidates(tx, candidates) {
+const FUSE_OPTIONS = {
+  keys: [
+    { name: 'full_name', weight: 0.45 },
+    { name: 'first_name', weight: 0.2 },
+    { name: 'last_name', weight: 0.2 },
+    { name: 'aliases', weight: 0.1 },
+    { name: 'employer', weight: 0.05 },
+  ],
+  includeScore: true,
+  threshold: 0.38,
+  ignoreLocation: true,
+}
+
+function scoreAgainstCandidates(tx, candidates, fuse) {
   const payer = tx.payer || ''
   let best = { borrower: null, score: 0 }
   for (const b of candidates) {
@@ -52,6 +64,20 @@ export function bestMatchFromCandidates(tx, candidates) {
   }
   if (best.score >= 80) return best
 
+  if (!fuse) return best
+  const results = fuse.search(`${payer} ${tx.description || ''}`.trim())
+  if (results.length) {
+    const fuseScore = Math.round((1 - results[0].score) * 100)
+    if (fuseScore > best.score) best = { borrower: results[0].item, score: fuseScore }
+  }
+  return best
+}
+
+/** Build a reusable matcher — avoids rebuilding Fuse index on every transaction. */
+export function createCandidateMatcher(candidates) {
+  if (!candidates?.length) {
+    return () => ({ borrower: null, score: 0 })
+  }
   const searchable = candidates.map((b) => {
     const names = borrowerNames(b)
     return {
@@ -61,26 +87,27 @@ export function bestMatchFromCandidates(tx, candidates) {
       aliases: Array.isArray(b.aliases) ? b.aliases.join(' ') : b.aliases || '',
     }
   })
+  const fuse = new Fuse(searchable, FUSE_OPTIONS)
+  return (tx) => scoreAgainstCandidates(tx, candidates, fuse)
+}
 
-  const fuse = new Fuse(searchable, {
-    keys: [
-      { name: 'full_name', weight: 0.45 },
-      { name: 'first_name', weight: 0.2 },
-      { name: 'last_name', weight: 0.2 },
-      { name: 'aliases', weight: 0.1 },
-      { name: 'employer', weight: 0.05 },
-    ],
-    includeScore: true,
-    threshold: 0.38,
-    ignoreLocation: true,
-  })
-
-  const results = fuse.search(`${payer} ${tx.description || ''}`.trim())
-  if (results.length) {
-    const fuseScore = Math.round((1 - results[0].score) * 100)
-    if (fuseScore > best.score) best = { borrower: results[0].item, score: fuseScore }
+/** Score payer against a list of API/local borrower candidates. */
+export function bestMatchFromCandidates(tx, candidates) {
+  if (!candidates?.length) return { borrower: null, score: 0 }
+  if (candidates.length > 40) {
+    return createCandidateMatcher(candidates)(tx)
   }
-  return best
+  const searchable = candidates.map((b) => {
+    const names = borrowerNames(b)
+    return {
+      ...b,
+      first_name: names.first,
+      last_name: names.last,
+      aliases: Array.isArray(b.aliases) ? b.aliases.join(' ') : b.aliases || '',
+    }
+  })
+  const fuse = new Fuse(searchable, FUSE_OPTIONS)
+  return scoreAgainstCandidates(tx, candidates, fuse)
 }
 
 export function matchTransaction(tx, borrowers) {

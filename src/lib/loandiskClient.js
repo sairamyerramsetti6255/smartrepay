@@ -34,7 +34,7 @@ async function syncViaServer() {
 
   const controller = new AbortController()
 
-  const timeout = setTimeout(() => controller.abort(), 300_000)
+  const timeout = setTimeout(() => controller.abort(), 30_000)
 
   try {
 
@@ -59,6 +59,12 @@ async function syncViaServer() {
     const data = await res.json().catch(() => ({}))
 
     if (!res.ok) throw new Error(data.error || 'LoanDisk sync failed')
+
+    if (data.status === 'started' || data.status === 'running') {
+
+      return { ...data, synced: data.result?.synced ?? 0, background: true }
+
+    }
 
     return data
 

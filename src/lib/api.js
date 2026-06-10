@@ -48,7 +48,7 @@ async function request(path, options = {}) {
 
   const controller = new AbortController()
 
-  const timeout = setTimeout(() => controller.abort(), options.timeout ?? 30000)
+  const timeout = setTimeout(() => controller.abort(), options.timeout ?? 60000)
 
 
 
@@ -202,9 +202,38 @@ export const audit = {
 
 
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 export const matching = {
 
-  run: () => request('/matching/run', { method: 'POST', body: '{}', timeout: 180000 }),
+  start: () => request('/matching/run', { method: 'POST', body: '{}', timeout: 30000 }),
+
+  status: () => request('/matching/status', { timeout: 45000 }),
+
+  async pollUntilComplete(onProgress) {
+    const deadline = Date.now() + 20 * 60 * 1000
+    while (Date.now() < deadline) {
+      const snap = await matching.status()
+      if (snap.progress) onProgress?.(snap.progress)
+      if (snap.status === 'completed') return snap.result
+      if (snap.status === 'failed') throw new Error(snap.error || 'Matching failed')
+      if (snap.status === 'idle') throw new Error('Matching stopped unexpectedly')
+      await sleep(2000)
+    }
+    throw new Error(
+      'Matching is still running on the server — wait a minute, refresh the page, and check Match results.'
+    )
+  },
+
+  /** Start background matching and poll until complete (up to 20 min). */
+  async run(onProgress) {
+    const started = await matching.start()
+    if (started.message && started.matched === 0 && started.excepted === 0 && started.status === 'idle') {
+      return started
+    }
+    if (started.progress) onProgress?.(started.progress)
+    return matching.pollUntilComplete(onProgress)
+  },
 
 }
 
@@ -256,7 +285,9 @@ export const loandisk = {
 
   token: () => request('/loandisk/token'),
 
-  sync: () => request('/loandisk/sync', { method: 'POST', body: '{}', timeout: 180000 }),
+  sync: () => request('/loandisk/sync', { method: 'POST', body: '{}', timeout: 30000 }),
+
+  syncStatus: () => request('/loandisk/sync/status', { timeout: 30000 }),
 
   search: (searchCriteria) =>
 
