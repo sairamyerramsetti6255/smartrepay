@@ -217,6 +217,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export const matching = {
 
+  preview: () => request('/matching/preview'),
+
+  branchTransactions: (branchKey, status = 'all') =>
+    request(`/matching/branches/${encodeURIComponent(branchKey)}/transactions?status=${status}`),
+
   start: () => request('/matching/run', { method: 'POST', body: '{}', timeout: 30000 }),
 
   status: () => request('/matching/status', { timeout: 90000, retries: 2 }),

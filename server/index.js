@@ -11,6 +11,7 @@ import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
 import { matchTransaction, detectExceptionType } from './matcher.js'
 import { runHeavyJob, isHeavyJobRunning, getActiveJobName } from './jobRunner.js'
+import { getMatchingPreview, getBranchTransactions } from './matchingService.js'
 import { parseStatementBuffer } from './parseStatement.js'
 import {
   getLoanDiskToken,
@@ -151,7 +152,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.5.0',
+    build: '1.6.0',
     heavyJob: getActiveJobName(),
     features: {
       documents: true,
@@ -649,6 +650,23 @@ app.get('/api/documents/:id/transactions', authMiddleware, (req, res) => {
 })
 
 // --- Matching (background job — avoids proxy/client timeout on large files) ---
+app.get('/api/matching/preview', authMiddleware, (_req, res) => {
+  try {
+    res.json(getMatchingPreview(db))
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/matching/branches/:branchKey/transactions', authMiddleware, (req, res) => {
+  try {
+    const status = req.query.status || 'all'
+    res.json(getBranchTransactions(db, req.params.branchKey, status))
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
 app.get('/api/matching/status', authMiddleware, (_req, res) => {
   res.json({
     status: matchingJob.status,

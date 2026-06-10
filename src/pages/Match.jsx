@@ -18,6 +18,7 @@ import { Drawer } from '@/components/Drawer'
 import { PageLoader } from '@/components/PageLoader'
 import { formatCurrency, formatDate, cn, toUuidOrNull } from '@/lib/utils'
 import { exportMatchedTransactions } from '@/lib/transactionExport'
+import { MatchRunPanel } from '@/components/MatchRunPanel'
 
 const FILTERS = [
   { value: 'all', label: 'All' },
@@ -57,6 +58,8 @@ export function Match() {
   const [selectedBorrowerId, setSelectedBorrowerId] = useState('')
   const [borrowerSearch, setBorrowerSearch] = useState('')
   const [matchProgress, setMatchProgress] = useState(null)
+  const [matchResult, setMatchResult] = useState(null)
+  const [showMatchPanel, setShowMatchPanel] = useState(false)
 
   const initialLoading = txLoading || brLoading
   const refreshing = txRefreshing || brRefreshing
@@ -192,6 +195,7 @@ export function Match() {
     api.matching.status().then((snap) => {
       if (snap.status !== 'running') return
       setRunning(true)
+      setShowMatchPanel(true)
       setMatchProgress(snap.progress || { phase: 'matching' })
       api.matching
         .pollUntilComplete((p) => setMatchProgress(p))
@@ -282,23 +286,16 @@ export function Match() {
 
   async function runMatching() {
     setRunning(true)
+    setShowMatchPanel(true)
+    setMatchResult(null)
     setMatchProgress({ phase: 'starting' })
     try {
       const result = await api.matching.run((p) => setMatchProgress(p))
       if (result.message && result.matched === 0 && result.excepted === 0) {
         toast.error(result.message)
       } else {
-        const via =
-          result.searchSource?.includes('BorrowerSerch')
-            ? ' via LoanDisk BorrowerSerch'
-            : result.searchSource === 'GetAllBorrowers'
-              ? ' via GetAllBorrowers'
-              : ''
-        const extra =
-          result.candidatesFound != null
-            ? ` · ${result.candidatesFound} borrowers from ${result.termsSearched ?? '?'} searches`
-            : ''
-        toast.success(`${result.matched} matched, ${result.excepted} unmatched${via}${extra}`)
+        setMatchResult(result)
+        toast.success(`${result.matched} matched, ${result.excepted} unmatched across ${result.branches?.length ?? 0} branches`)
         if (result.searchError) toast.error(`LoanDisk warning: ${result.searchError}`)
       }
       refetch()
@@ -308,7 +305,6 @@ export function Match() {
       toast.error(e.message)
     } finally {
       setRunning(false)
-      setMatchProgress(null)
     }
   }
 
@@ -392,6 +388,26 @@ export function Match() {
         <div className="rounded-[var(--radius-md)] border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-[13px] text-[var(--danger)]">
           {error}
         </div>
+      )}
+
+      {(showMatchPanel || running || matchResult) && (
+        <MatchRunPanel
+          running={running}
+          progress={matchProgress}
+          result={matchResult}
+          borrowers={borrowers}
+          loans={loans}
+          onComplete={() => {
+            setShowMatchPanel(false)
+            setMatchResult(null)
+            setMatchProgress(null)
+            refetch()
+          }}
+          onAssign={() => {
+            refetch()
+            refetchBorrowers()
+          }}
+        />
       )}
 
       <div className="grid grid-cols-3 gap-3">

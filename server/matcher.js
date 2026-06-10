@@ -22,7 +22,6 @@ function borrowerNames(b) {
   return { first, last, full: b.full_name || `${first} ${last}`.trim() }
 }
 
-/** Pull LoanDisk / loan numbers from reference, description, payer. */
 export function extractBorrowerIdsFromText(text) {
   const ids = new Set()
   const s = String(text || '')
@@ -35,7 +34,7 @@ export function extractBorrowerIdsFromTx(tx) {
   return extractBorrowerIdsFromText(`${tx.reference || ''} ${tx.description || ''} ${tx.payer || ''}`)
 }
 
-function amountsClose(a, b, tolerance = 0.02) {
+export function amountsClose(a, b, tolerance = 0.02) {
   const x = Number(a)
   const y = Number(b)
   if (!x || !y || isNaN(x) || isNaN(y)) return false
@@ -44,15 +43,19 @@ function amountsClose(a, b, tolerance = 0.02) {
   return Math.abs(x - y) / denom <= 0.02
 }
 
-function amountMatchBoost(txAmount, borrower, loan) {
-  const amt = Number(txAmount)
-  if (!amt || isNaN(amt)) return 0
-  const targets = [borrower?.emi, borrower?.loan_amount, loan?.emi, loan?.outstanding_balance].filter(
-    (v) => v != null && !isNaN(Number(v))
-  )
-  for (const t of targets) {
-    if (amountsClose(amt, t)) return 25
-  }
+/** Priority 1: first name + last name (space-separated). */
+export function firstLastNameScore(payer, borrower) {
+  const p = parsePayerName(payer)
+  const b = borrowerNames(borrower)
+  if (!p.first) return 0
+  const pf = normalizeName(p.first)
+  const pl = normalizeName(p.last)
+  const bf = normalizeName(b.first)
+  const bl = normalizeName(b.last)
+
+  if (p.last && pf && pl && bf && bl && pf === bf && pl === bl) return 100
+  if (p.last && pf && pl && bf && bl && pf === bf && (bl.includes(pl) || pl.includes(bl))) return 96
+  if (!p.last && pf && bf === pf) return 78
   return 0
 }
 
@@ -61,98 +64,134 @@ function idMatchScore(tx, borrower) {
   if (!ids.length) return 0
   const bid = String(borrower.loandisk_id || '')
   const unum = String(borrower.unique_number || '')
-  const loanNum = String(borrower.loan_number || '')
   for (const id of ids) {
     if (bid && (bid === id || bid.endsWith(id))) return 100
     if (unum && (unum === id || unum.includes(id))) return 99
-    if (loanNum && (loanNum === id || loanNum.replace(/\D/g, '') === id)) return 98
   }
   return 0
 }
 
-function exactNameScore(payer, borrower) {
-  const p = parsePayerName(payer)
-  const b = borrowerNames(borrower)
-  const pf = normalizeName(p.first)
-  const pl = normalizeName(p.last)
-  const pfull = normalizeName(p.full)
-  const bf = normalizeName(b.first)
-  const bl = normalizeName(b.last)
-  const bfull = normalizeName(b.full)
+/** Pick loan row: single EMI match, or combined EMI sum when amount exceeds one loan. */
+export function pickLoanForAmount(amount, loans = []) {
+  const amt = Number(amount)
+  if (!amt || isNaN(amt) || !loans.length) return null
 
-  if (!pfull && !pf) return 0
-  if (pfull && bfull && pfull === bfull) return 100
-  if (pf && pl && bf === pf && bl === pl) return 98
-  if (pf && pl && bf === pf && bl.includes(pl)) return 93
-  if (pf && pl && bf.includes(pf) && bl === pl) return 93
-  if (pf && !pl && bf === pf) return 80
-  if (pfull && bfull && (bfull.includes(pfull) || pfull.includes(bfull))) return 85
+  const withEmi = loans.filter((l) => l.emi != null && !isNaN(Number(l.emi)))
+  for (const loan of withEmi) {
+    if (amountsClose(amt, loan.emi)) return loan
+  }
+
+  const emis = withEmi.map((l) => Number(l.emi))
+  const sum = emis.reduce((a, b) => a + b, 0)
+  if (emis.length > 1 && amountsClose(amt, sum)) {
+    return withEmi[0] || null
+  }
+
+  return null
+}
+
+/** EMI fit: single loan EMI or sum of all borrower loans. */
+export function emiFitScore(amount, loans = []) {
+  const amt = Number(amount)
+  if (!amt || isNaN(amt)) return 0
+  const withEmi = loans.filter((l) => l.emi != null && !isNaN(Number(l.emi)))
+  if (!withEmi.length) return 0
+
+  for (const loan of withEmi) {
+    if (amountsClose(amt, loan.emi)) return 40
+  }
+
+  const sum = withEmi.reduce((s, l) => s + Number(l.emi), 0)
+  if (withEmi.length > 1 && amountsClose(amt, sum)) return 45
   return 0
+}
+
+function resolveNameTies(tx, ties, loansByBorrowerId) {
+  if (!ties.length) return { borrower: null, score: 0, loan: null }
+  if (ties.length === 1) {
+    const loans = loansByBorrowerId?.get(ties[0].borrower.id) || loansByBorrowerId?.get(ties[0].borrower.loandisk_id) || []
+    const emi = emiFitScore(tx.amount, loans)
+    return {
+      borrower: ties[0].borrower,
+      score: emi > 0 ? 100 : ties[0].nameScore,
+      loan: pickLoanForAmount(tx.amount, loans),
+    }
+  }
+
+  let best = null
+  let bestTotal = -1
+  for (const t of ties) {
+    const loans = loansByBorrowerId?.get(t.borrower.id) || loansByBorrowerId?.get(t.borrower.loandisk_id) || []
+    const emi = emiFitScore(tx.amount, loans)
+    const total = t.nameScore + emi
+    if (total > bestTotal) {
+      bestTotal = total
+      best = { borrower: t.borrower, score: emi > 0 ? 100 : 82, loan: pickLoanForAmount(tx.amount, loans) }
+    }
+  }
+  return best || { borrower: ties[0].borrower, score: 75, loan: null }
+}
+
+function scoreAgainstCandidates(tx, candidates, fuse, loansByBorrowerId) {
+  const payer = tx.payer || ''
+  let idBest = { borrower: null, score: 0, loan: null }
+
+  const nameTies = []
+  for (const b of candidates) {
+    const idScore = idMatchScore(tx, b)
+    if (idScore > idBest.score) {
+      const loans = loansByBorrowerId?.get(b.id) || loansByBorrowerId?.get(b.loandisk_id) || []
+      idBest = { borrower: b, score: idScore, loan: pickLoanForAmount(tx.amount, loans) }
+    }
+    const ns = firstLastNameScore(payer, b)
+    if (ns >= 95) nameTies.push({ borrower: b, nameScore: ns })
+  }
+
+  if (idBest.score >= 98) return idBest
+  if (nameTies.length) return resolveNameTies(tx, nameTies, loansByBorrowerId)
+
+  let best = { borrower: null, score: 0, loan: null }
+  for (const b of candidates) {
+    const loans = loansByBorrowerId?.get(b.id) || loansByBorrowerId?.get(b.loandisk_id) || []
+    const ns = firstLastNameScore(payer, b)
+    const emi = emiFitScore(tx.amount, loans)
+    const score = ns > 0 ? Math.min(100, ns + (emi > 0 ? Math.min(emi, 20) : 0)) : emi > 0 ? 72 : 0
+    if (score > best.score) {
+      best = { borrower: b, score, loan: pickLoanForAmount(tx.amount, loans) }
+    }
+  }
+  if (best.score >= 80) return best
+
+  if (!fuse) return best
+  const results = fuse.search(`${payer} ${tx.description || ''} ${tx.reference || ''}`.trim())
+  if (results.length) {
+    const item = results[0].item
+    const loans = loansByBorrowerId?.get(item.id) || loansByBorrowerId?.get(item.loandisk_id) || []
+    const fuseScore = Math.round((1 - results[0].score) * 100)
+    const emi = emiFitScore(tx.amount, loans)
+    const score = Math.min(100, fuseScore + (emi > 0 ? 15 : 0))
+    if (score > best.score) {
+      best = { borrower: item, score, loan: pickLoanForAmount(tx.amount, loans) }
+    }
+  }
+  return best
 }
 
 const FUSE_OPTIONS = {
   keys: [
     { name: 'full_name', weight: 0.35 },
-    { name: 'first_name', weight: 0.15 },
-    { name: 'last_name', weight: 0.15 },
-    { name: 'loandisk_id', weight: 0.1 },
-    { name: 'unique_number', weight: 0.1 },
-    { name: 'aliases', weight: 0.1 },
-    { name: 'employer', weight: 0.05 },
+    { name: 'first_name', weight: 0.25 },
+    { name: 'last_name', weight: 0.25 },
+    { name: 'loandisk_id', weight: 0.08 },
+    { name: 'unique_number', weight: 0.07 },
   ],
   includeScore: true,
-  threshold: 0.4,
+  threshold: 0.38,
   ignoreLocation: true,
 }
 
-function combineScore(tx, borrower, nameScore, loan) {
-  const idScore = idMatchScore(tx, borrower)
-  if (idScore >= 98) return { borrower, score: idScore }
-
-  const boost = amountMatchBoost(tx.amount, borrower, loan)
-  let score = nameScore
-  if (boost && nameScore >= 50) score = Math.min(100, nameScore + boost)
-  else if (boost && nameScore >= 30) score = Math.min(95, nameScore + boost)
-  else if (boost && nameScore > 0) score = Math.min(85, nameScore + boost)
-
-  // Strong amount + weak name still worth reviewing
-  if (boost >= 25 && nameScore >= 40) score = Math.max(score, 82)
-
-  return { borrower, score }
-}
-
-function scoreAgainstCandidates(tx, candidates, fuse, loanByBorrowerId) {
-  const payer = tx.payer || ''
-  let best = { borrower: null, score: 0 }
-
-  for (const b of candidates) {
-    const loan = loanByBorrowerId?.get(b.id) || loanByBorrowerId?.get(b.loandisk_id)
-    const idScore = idMatchScore(tx, b)
-    if (idScore > best.score) best = { borrower: b, score: idScore }
-    const exact = exactNameScore(payer, b)
-    const combined = combineScore(tx, b, exact, loan)
-    if (combined.score > best.score) best = combined
-  }
-
-  if (best.score >= 80) return best
-  if (!fuse) return best
-
-  const results = fuse.search(`${payer} ${tx.description || ''} ${tx.reference || ''}`.trim())
-  if (results.length) {
-    const item = results[0].item
-    const fuseScore = Math.round((1 - results[0].score) * 100)
-    const loan = loanByBorrowerId?.get(item.id) || loanByBorrowerId?.get(item.loandisk_id)
-    const combined = combineScore(tx, item, fuseScore, loan)
-    if (combined.score > best.score) best = combined
-  }
-  return best
-}
-
-/** Build a reusable matcher — avoids rebuilding Fuse index on every transaction. */
-export function createCandidateMatcher(candidates, loanByBorrowerId = null) {
-  if (!candidates?.length) {
-    return () => ({ borrower: null, score: 0 })
-  }
+export function createCandidateMatcher(candidates, loansByBorrowerId = null) {
+  if (!candidates?.length) return () => ({ borrower: null, score: 0, loan: null })
   const searchable = candidates.map((b) => {
     const names = borrowerNames(b)
     return {
@@ -165,32 +204,16 @@ export function createCandidateMatcher(candidates, loanByBorrowerId = null) {
     }
   })
   const fuse = new Fuse(searchable, FUSE_OPTIONS)
-  return (tx) => scoreAgainstCandidates(tx, candidates, fuse, loanByBorrowerId)
+  return (tx) => scoreAgainstCandidates(tx, candidates, fuse, loansByBorrowerId)
 }
 
-/** Score payer against a list of API/local borrower candidates. */
-export function bestMatchFromCandidates(tx, candidates, loanByBorrowerId = null) {
-  if (!candidates?.length) return { borrower: null, score: 0 }
-  if (candidates.length > 40) {
-    return createCandidateMatcher(candidates, loanByBorrowerId)(tx)
-  }
-  const searchable = candidates.map((b) => {
-    const names = borrowerNames(b)
-    return {
-      ...b,
-      first_name: names.first,
-      last_name: names.last,
-      loandisk_id: b.loandisk_id ? String(b.loandisk_id) : '',
-      unique_number: b.unique_number ? String(b.unique_number) : '',
-      aliases: Array.isArray(b.aliases) ? b.aliases.join(' ') : b.aliases || '',
-    }
-  })
-  const fuse = new Fuse(searchable, FUSE_OPTIONS)
-  return scoreAgainstCandidates(tx, candidates, fuse, loanByBorrowerId)
+export function bestMatchFromCandidates(tx, candidates, loansByBorrowerId = null) {
+  if (!candidates?.length) return { borrower: null, score: 0, loan: null }
+  return createCandidateMatcher(candidates, loansByBorrowerId)(tx)
 }
 
-export function matchTransaction(tx, borrowers, loanByBorrowerId = null) {
-  return bestMatchFromCandidates(tx, borrowers, loanByBorrowerId)
+export function matchTransaction(tx, borrowers, loansByBorrowerId = null) {
+  return bestMatchFromCandidates(tx, borrowers, loansByBorrowerId)
 }
 
 export function detectExceptionType(tx, allTransactions, score) {
