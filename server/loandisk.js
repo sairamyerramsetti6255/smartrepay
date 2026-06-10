@@ -125,7 +125,28 @@ export function normalizeLoanDiskBorrower(row) {
   const email = pickField(row, 'borrower_email', 'BorrowerEmail', 'email')
   const mobile = pickField(row, 'borrower_mobile', 'BorrowerMobile', 'mobile')
   const unique_number = pickField(row, 'borrower_unique_number', 'BorrowerUniqueNumber', 'uniqueNumber')
-  const aliases = [email, mobile, unique_number, first && last ? `${first} ${last}` : null]
+  const loan_amount = pickField(
+    row,
+    'loan_principal_amount',
+    'loan_amount',
+    'LoanAmount',
+    'principal_amount',
+    'PrincipalAmount',
+    'loan_principal'
+  )
+  const emi = pickField(
+    row,
+    'loan_installment_amount',
+    'monthly_repayment',
+    'monthly_repayment_amount',
+    'emi_amount',
+    'installment_amount',
+    'borrower_monthly_due',
+    'emi',
+    'EMI',
+    'loan_emi'
+  )
+  const aliases = [email, mobile, unique_number, loandisk_id, first && last ? `${first} ${last}` : null]
     .filter(Boolean)
     .map(String)
 
@@ -141,6 +162,8 @@ export function normalizeLoanDiskBorrower(row) {
     email: email ? String(email) : null,
     mobile: mobile ? String(mobile) : null,
     unique_number: unique_number ? String(unique_number) : null,
+    loan_amount: loan_amount != null ? Number(loan_amount) : null,
+    emi: emi != null ? Number(emi) : null,
   }
 }
 
@@ -308,35 +331,49 @@ export function parseBorrowerSearchResults(data, searchNames = []) {
   return { borrowers: ctx.all, bySearchName: ctx.bySearchName, message: data.message || null }
 }
 
-/** Build deduped BorrowerSerch criteria + map search term → payer keys. */
-export function buildPayerSearchPlan(payerNames) {
-  const termToPayers = new Map()
+function formatSearchAmount(amount) {
+  const n = Number(amount)
+  if (!amount || isNaN(n) || n <= 0) return ''
+  return String(Math.round(n * 100) / 100)
+}
+
+/** Build BorrowerSerch criteria from transactions (name + EMI/amount). */
+export function buildTransactionSearchPlan(transactions) {
+  const termToMeta = new Map()
   const orderedTerms = []
 
-  for (const raw of payerNames) {
-    const payer = String(raw || '').trim()
+  for (const tx of transactions) {
+    const payer = String(tx.payer || '').trim()
     if (!payer) continue
     const payerKey = payer.toLowerCase()
-    const terms = new Set([payer, borrowerSearchTerm(payer)].filter(Boolean))
+    const emi = formatSearchAmount(tx.amount)
+    const terms = [borrowerSearchTerm(payer), payer].filter(Boolean)
 
     for (const term of terms) {
       const termKey = term.toLowerCase().trim()
-      if (!termToPayers.has(termKey)) {
-        termToPayers.set(termKey, new Set())
+      if (!termToMeta.has(termKey)) {
+        termToMeta.set(termKey, { term, emi, loanAmount: '', payerKeys: new Set() })
         orderedTerms.push(term)
       }
-      termToPayers.get(termKey).add(payerKey)
+      const meta = termToMeta.get(termKey)
+      meta.payerKeys.add(payerKey)
+      if (emi && !meta.emi) meta.emi = emi
     }
   }
 
-  return { orderedTerms, termToPayers }
+  return { orderedTerms, termToMeta }
+}
+
+/** Build deduped BorrowerSerch criteria + map search term → payer keys. */
+export function buildPayerSearchPlan(payerNames) {
+  return buildTransactionSearchPlan(payerNames.map((payer) => ({ payer, amount: null })))
 }
 
 const SEARCH_BATCH_SIZE = 25
 
-/** Bulk BorrowerSerch for many payers; returns candidate pool + per-payer lists. */
-export async function fetchBorrowersForPayers(payerNames, onProgress) {
-  const { orderedTerms, termToPayers } = buildPayerSearchPlan(payerNames)
+/** Bulk BorrowerSerch — uses payer name + transaction amount as EMI hint. */
+export async function fetchBorrowersForTransactions(transactions, onProgress) {
+  const { orderedTerms, termToMeta } = buildTransactionSearchPlan(transactions)
   const apiPool = []
   const byPayer = new Map()
   const seen = new Set()
@@ -344,10 +381,18 @@ export async function fetchBorrowersForPayers(payerNames, onProgress) {
   const batchesTotal = Math.max(1, Math.ceil(orderedTerms.length / SEARCH_BATCH_SIZE))
 
   for (let i = 0; i < orderedTerms.length; i += SEARCH_BATCH_SIZE) {
-    const batch = orderedTerms.slice(i, i + SEARCH_BATCH_SIZE)
-    const criteria = batch.map((name) => ({ name, loanAmount: '', emi: '', branchId: '' }))
+    const batchTerms = orderedTerms.slice(i, i + SEARCH_BATCH_SIZE)
+    const criteria = batchTerms.map((term) => {
+      const meta = termToMeta.get(term.toLowerCase().trim())
+      return {
+        name: meta?.term || term,
+        loanAmount: meta?.loanAmount || '',
+        emi: meta?.emi || '',
+        branchId: '',
+      }
+    })
     const data = await borrowerSearch(criteria)
-    const { borrowers, bySearchName } = parseBorrowerSearchResults(data, batch)
+    const { borrowers, bySearchName } = parseBorrowerSearchResults(data, batchTerms)
     for (const b of borrowers) {
       if (!seen.has(b.loandisk_id)) {
         seen.add(b.loandisk_id)
@@ -358,10 +403,10 @@ export async function fetchBorrowersForPayers(payerNames, onProgress) {
     onProgress?.({ phase: 'searching', batchesDone: batches, batchesTotal, candidatesFound: apiPool.length })
     await new Promise((resolve) => setImmediate(resolve))
 
-    for (const term of batch) {
+    for (const term of batchTerms) {
       const termKey = term.toLowerCase().trim()
       const candidates = bySearchName.get(termKey) || []
-      const payerKeys = termToPayers.get(termKey) || new Set()
+      const payerKeys = termToMeta.get(termKey)?.payerKeys || new Set()
       for (const payerKey of payerKeys) {
         if (!byPayer.has(payerKey)) byPayer.set(payerKey, [])
         const list = byPayer.get(payerKey)
@@ -373,6 +418,11 @@ export async function fetchBorrowersForPayers(payerNames, onProgress) {
   }
 
   return { apiPool, byPayer, batches, termsSearched: orderedTerms.length }
+}
+
+/** @deprecated use fetchBorrowersForTransactions */
+export async function fetchBorrowersForPayers(payerNames, onProgress) {
+  return fetchBorrowersForTransactions(payerNames.map((payer) => ({ payer, amount: null })), onProgress)
 }
 
 /** GET /SP/Loandisk_OperationsNewForId?borrowerId= — single borrower detail. */

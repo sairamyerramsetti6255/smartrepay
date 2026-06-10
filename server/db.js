@@ -31,6 +31,9 @@ function migrateDb() {
     db.exec('alter table transactions add column source_document_id text references documents(id)')
     db.exec('create index if not exists idx_transactions_document on transactions(source_document_id)')
   }
+  if (tableExists('loans') && !columnExists('loans', 'emi')) {
+    db.exec('alter table loans add column emi real')
+  }
 }
 
 export function resetAppData() {

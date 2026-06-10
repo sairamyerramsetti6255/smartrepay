@@ -151,7 +151,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.4.0',
+    build: '1.5.0',
     heavyJob: getActiveJobName(),
     features: {
       documents: true,
