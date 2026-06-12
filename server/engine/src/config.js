@@ -38,9 +38,12 @@ function parseBranches(raw) {
 
 export const config = {
   loandisk: {
+    // NOTE: these are only needed by the LoanDisk SYNC. Keep them soft so simply
+    // importing this module (e.g. for in-process matching, or to boot the web
+    // server) never throws when they are absent. The sync validates at run time.
     baseUrl: (process.env.LOANDISK_BASE_URL || 'https://api-main.loandisk.com').replace(/\/+$/, ''),
-    publicKey: required('LOANDISK_PUBLIC_KEY'),
-    authToken: required('LOANDISK_AUTH_TOKEN'),
+    publicKey: process.env.LOANDISK_PUBLIC_KEY || '',
+    authToken: process.env.LOANDISK_AUTH_TOKEN || '',
     branches: parseBranches(process.env.LOANDISK_BRANCHES || 'SimplifiedLending:18279'),
   },
   db: {
