@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
-import { Upload, Check, X, Loader2, Sparkles, FileSpreadsheet, FileText, Download } from 'lucide-react'
+import { Upload, Check, X, Loader2, Sparkles, FileSpreadsheet, FileText, Trash2 } from 'lucide-react'
 import * as api from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { PageHeader } from '@/components/PageHeader'
 import { Card, CardBody, CardHeader } from '@/components/Card'
 import { Badge } from '@/components/Badge'
+import { DataTable } from '@/components/DataTable'
+import { WorkflowStepper } from '@/components/WorkflowStepper'
 import { formatCurrency, formatDate, cn } from '@/lib/utils'
 
 const ACCEPT = '.csv,.xlsx,.xls,.xlsm,.pdf'
@@ -46,6 +48,8 @@ export function Ingest() {
   const [dragOver, setDragOver] = useState(false)
   const [documents, setDocuments] = useState([])
   const [docsLoading, setDocsLoading] = useState(true)
+  const [bankTx, setBankTx] = useState([])
+  const [bankTxLoading, setBankTxLoading] = useState(true)
 
   const isBankPdf = source === 'bank' || source === 'pdf'
   const isEmployerPdf = source === 'employer'
@@ -127,10 +131,24 @@ export function Ingest() {
     if (!readyCount) return toast.error('No new rows to import')
     setImporting(true)
     try {
-      const { inserted } = await api.ingest.import(parseId)
+      const { inserted, staged, stagedDuplicates, stagedFileName, stagingError } =
+        await api.ingest.import(parseId)
       toast.success(`Imported ${inserted} transactions — go to Match to run matching`)
+      if (stagingError) {
+        toast.error(`Staging to SQL failed: ${stagingError}`)
+      } else if (staged > 0) {
+        toast.success(
+          `Staged ${staged} new credit${staged === 1 ? '' : 's'} as "${stagedFileName}"` +
+            (stagedDuplicates > 0 ? ` · skipped ${stagedDuplicates} duplicate${stagedDuplicates === 1 ? '' : 's'}` : '')
+        )
+      } else if (stagedDuplicates > 0) {
+        toast(`All ${stagedDuplicates} credit${stagedDuplicates === 1 ? '' : 's'} already staged — no new rows to match`, {
+          icon: 'ℹ️',
+        })
+      }
       reset()
       await loadDocuments()
+      await loadBankTx()
       window.dispatchEvent(new Event('smartrepay:demo-loaded'))
     } catch (e) {
       toast.error(e.message)
@@ -155,13 +173,50 @@ export function Ingest() {
     }
   }
 
+  async function loadBankTx() {
+    setBankTxLoading(true)
+    try {
+      const { rows } = await api.bankTransactions.list()
+      setBankTx(Array.isArray(rows) ? rows : [])
+    } catch {
+      setBankTx([])
+    } finally {
+      setBankTxLoading(false)
+    }
+  }
+
   useEffect(() => {
     loadDocuments()
+    loadBankTx()
   }, [])
 
-  async function downloadDoc(doc) {
+  const bankTxColumns = [
+    { key: 'TransDate', label: 'Date', render: (r) => (r.TransDate ? formatDate(r.TransDate) : '—') },
+    { key: 'BorrowerName', label: 'Borrower', render: (r) => <span className="font-medium">{r.BorrowerName || '—'}</span> },
+    {
+      key: 'EmiPaidAmount',
+      label: 'EMI Paid',
+      align: 'right',
+      render: (r) => (r.EmiPaidAmount != null ? formatCurrency(r.EmiPaidAmount) : '—'),
+    },
+    { key: 'SourceType', label: 'Source', render: (r) => (r.SourceType ? <Badge variant="posted">{r.SourceType}</Badge> : '—') },
+    { key: 'EmployerOrBank', label: 'Employer / Bank', render: (r) => r.EmployerOrBank || '—' },
+    { key: 'ReferenceNo', label: 'Reference', render: (r) => <span className="mono text-[12px]">{r.ReferenceNo || '—'}</span> },
+    {
+      key: 'FileName',
+      label: 'File',
+      render: (r) => <span className="text-[12px] text-[var(--text-secondary)] truncate max-w-[200px] inline-block">{r.FileName || '—'}</span>,
+    },
+    { key: 'UploadedDate', label: 'Uploaded', render: (r) => (r.UploadedDate ? formatDate(r.UploadedDate) : '—') },
+  ]
+
+  async function deleteDoc(doc) {
+    if (!window.confirm(`Delete "${doc.filename}" and all its staged credits from SQL Server? This cannot be undone.`)) return
     try {
-      await api.documents.download(doc.id, doc.filename)
+      const { deleted } = await api.documents.remove(doc.id)
+      toast.success(`Removed ${deleted ?? 0} staged credit(s) for ${doc.filename}`)
+      loadDocuments()
+      loadBankTx()
     } catch (e) {
       toast.error(e.message)
     }
@@ -169,7 +224,10 @@ export function Ingest() {
 
   return (
     <div className={cn('space-y-8', isPdfDoc ? 'max-w-6xl' : 'max-w-5xl')}>
+      <WorkflowStepper current="upload" />
+
       <PageHeader
+        eyebrow="Step 1 of 4"
         title="Upload Documents"
         subtitle="Upload bank statements (CSV, Excel, PDF) or employer salary reports. Imported files are saved and listed below."
       />
@@ -491,9 +549,40 @@ export function Ingest() {
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
             {documents.map((doc) => (
-              <DocumentGridCard key={doc.id} doc={doc} onDownload={() => downloadDoc(doc)} />
+              <DocumentGridCard key={doc.id} doc={doc} onDelete={() => deleteDoc(doc)} />
             ))}
           </div>
+        )}
+      </section>
+
+      {/* Staged bank transactions (SQL Server: Staging_BankTransactions) */}
+      <section className="space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Bank transactions (staged)</h2>
+            <p className="text-[12px] text-[var(--text-tertiary)] mt-0.5">
+              Credit transactions extracted into Staging_BankTransactions, ready for matching
+            </p>
+          </div>
+          <span className="text-[12px] font-medium text-[var(--text-secondary)] bg-[var(--bg-subtle)] px-3 py-1 rounded-full">
+            {bankTx.length} row{bankTx.length !== 1 ? 's' : ''}
+          </span>
+        </div>
+
+        {bankTxLoading ? (
+          <div className="flex justify-center py-16 card">
+            <Loader2 className="h-6 w-6 animate-spin text-[var(--text-tertiary)]" />
+          </div>
+        ) : (
+          <DataTable
+            data={bankTx}
+            columns={bankTxColumns}
+            pageSize={25}
+            sortable
+            filterable
+            emptyMessage="No staged bank transactions"
+            emptyDescription="Import a statement above to stage credit transactions here."
+          />
         )}
       </section>
     </div>
@@ -514,7 +603,7 @@ const DOC_TYPE_LABELS = {
   pdf: 'PDF',
 }
 
-function DocumentGridCard({ doc, onDownload }) {
+function DocumentGridCard({ doc, onDelete }) {
   const ext = doc.filename?.split('.').pop()?.toLowerCase() || ''
   const isPdf = ext === 'pdf'
   const isSheet = ['csv', 'xlsx', 'xls', 'xlsm'].includes(ext)
@@ -604,9 +693,9 @@ function DocumentGridCard({ doc, onDownload }) {
       </div>
 
       <div className="px-4 py-3 border-t border-[var(--border-light)]">
-        <Button variant="secondary" size="sm" className="w-full" onClick={onDownload}>
-          <Download className="h-3.5 w-3.5" />
-          Download original
+        <Button variant="secondary" size="sm" className="w-full text-[var(--danger)]" onClick={onDelete}>
+          <Trash2 className="h-3.5 w-3.5" />
+          Delete
         </Button>
       </div>
     </article>

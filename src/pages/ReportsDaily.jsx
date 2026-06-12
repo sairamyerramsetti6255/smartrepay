@@ -50,11 +50,6 @@ export function ReportsDaily() {
 
   return (
     <div className="space-y-6">
-      {error && (
-        <div className="rounded-[var(--radius-md)] border border-[var(--danger-border)] bg-[var(--danger-bg)] px-5 py-3.5 text-[13px] text-[var(--danger)]">
-          {error} — ensure the API is running (<code className="mono text-[12px]">npm run dev</code>)
-        </div>
-      )}
       <PageHeader
         title="Daily Report"
         actions={

@@ -11,6 +11,7 @@ import { Card, CardBody, CardHeader } from '@/components/Card'
 import { LoanDiskPreviewModal } from '@/components/LoanDiskPreviewModal'
 import { DataTable } from '@/components/DataTable'
 import { PageLoader } from '@/components/PageLoader'
+import { WorkflowStepper } from '@/components/WorkflowStepper'
 import { formatCurrency, formatDate, cn } from '@/lib/utils'
 
 function groupByDate(rows) {
@@ -102,8 +103,12 @@ export function Reconcile() {
           {error}
         </div>
       )}
+      <WorkflowStepper current="reconcile" />
+
       <PageHeader
+        eyebrow="Step 4 of 4"
         title="Reconciliation"
+        subtitle="Approve matched payments and export them to LoanDisk."
         actions={
           <div className="flex items-center gap-2">
             <input

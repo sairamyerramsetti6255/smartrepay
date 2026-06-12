@@ -13,6 +13,7 @@ import { Drawer } from '@/components/Drawer'
 export function ExceptionDrawer({ exception, open, onClose, borrowers, loans, onResolved }) {
   const [borrowerId, setBorrowerId] = useState('')
   const [borrowerSearch, setBorrowerSearch] = useState('')
+  const [changing, setChanging] = useState(false)
   const [saving, setSaving] = useState(false)
 
   const tx = exception?.transactions
@@ -25,6 +26,7 @@ export function ExceptionDrawer({ exception, open, onClose, borrowers, loans, on
     if (exception) {
       setBorrowerId(tx?.matched_borrower_id || '')
       setBorrowerSearch('')
+      setChanging(false)
     }
   }, [exception, tx?.matched_borrower_id])
 
@@ -163,58 +165,73 @@ export function ExceptionDrawer({ exception, open, onClose, borrowers, loans, on
               <h3 className="text-xs font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mb-3">
                 Proposed borrower
               </h3>
-              <div className="flex items-start gap-4 mb-4">
+              <div className="flex items-start gap-4 rounded-[var(--radius-md)] border border-[var(--border-light)] p-4">
                 <ConfidenceRing score={score} />
-                <div>
-                  <p className="text-[15px] font-semibold">
+                <div className="min-w-0">
+                  <p className="text-[15px] font-semibold truncate">
                     {selectedBorrower?.full_name || tx?.borrowers?.full_name || '—'}
                   </p>
                   <p className="text-[13px] text-[var(--text-secondary)] mt-0.5">
-                    {selectedBorrower?.employer || '—'}
+                    {[selectedBorrower?.employer, selectedBorrower?.branch_name].filter(Boolean).join(' · ') || '—'}
                   </p>
+                  {selectedBorrower?.loandisk_id && (
+                    <p className="mono text-[12px] text-[var(--text-secondary)] mt-1">ID {selectedBorrower.loandisk_id}</p>
+                  )}
                   {selectedLoan?.loan_number && (
-                    <p className="mono text-[13px] text-[var(--text-secondary)] mt-2">{selectedLoan.loan_number}</p>
+                    <p className="mono text-[13px] text-[var(--text-secondary)] mt-1">{selectedLoan.loan_number}</p>
                   )}
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={() => setChanging((v) => !v)}
+                className="mt-3 text-[12px] font-medium text-[var(--accent)] hover:underline"
+              >
+                {changing ? 'Hide search' : 'Change borrower'}
+              </button>
             </section>
 
-            <section className="rounded-[var(--radius-md)] border border-[var(--border-light)] bg-[var(--bg-card)] p-4 space-y-3">
-              <div>
-                <Label className="mb-1.5 block text-[12px]">Search borrower</Label>
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--text-tertiary)]" />
-                  <Input
-                    className="pl-9"
-                    placeholder="Type name, employer, or LoanDisk ID…"
-                    value={borrowerSearch}
-                    onChange={(e) => setBorrowerSearch(e.target.value)}
-                  />
+            {changing && (
+              <section className="rounded-[var(--radius-md)] border border-[var(--border-light)] bg-[var(--bg-card)] p-4 space-y-3">
+                <div>
+                  <Label className="mb-1.5 block text-[12px]">Search borrower</Label>
+                  <div className="relative">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--text-tertiary)]" />
+                    <Input
+                      className="pl-9"
+                      placeholder="Type name, employer, or LoanDisk ID…"
+                      value={borrowerSearch}
+                      onChange={(e) => setBorrowerSearch(e.target.value)}
+                    />
+                  </div>
                 </div>
-              </div>
-              <div className="max-h-[220px] overflow-y-auto rounded-[var(--radius-md)] border border-[var(--border-light)] divide-y divide-[var(--border-light)]">
-                {filteredBorrowers.length === 0 ? (
-                  <p className="px-3 py-6 text-center text-[12px] text-[var(--text-tertiary)]">No borrowers found</p>
-                ) : (
-                  filteredBorrowers.map((b) => (
-                    <button
-                      key={b.id}
-                      type="button"
-                      onClick={() => setBorrowerId(b.id)}
-                      className={cn(
-                        'w-full text-left px-3 py-2.5 text-[12px] transition-colors hover:bg-[var(--bg-hover)]',
-                        borrowerId === b.id && 'bg-[var(--accent-subtle)]'
-                      )}
-                    >
-                      <p className="font-semibold text-[var(--text-primary)]">{b.full_name}</p>
-                      <p className="text-[var(--text-tertiary)] mt-0.5 truncate">
-                        {[b.employer, b.branch_name, b.loandisk_id ? `ID ${b.loandisk_id}` : null].filter(Boolean).join(' · ') || '—'}
-                      </p>
-                    </button>
-                  ))
-                )}
-              </div>
-            </section>
+                <div className="max-h-[220px] overflow-y-auto rounded-[var(--radius-md)] border border-[var(--border-light)] divide-y divide-[var(--border-light)]">
+                  {filteredBorrowers.length === 0 ? (
+                    <p className="px-3 py-6 text-center text-[12px] text-[var(--text-tertiary)]">No borrowers found</p>
+                  ) : (
+                    filteredBorrowers.map((b) => (
+                      <button
+                        key={b.id}
+                        type="button"
+                        onClick={() => {
+                          setBorrowerId(b.id)
+                          setChanging(false)
+                        }}
+                        className={cn(
+                          'w-full text-left px-3 py-2.5 text-[12px] transition-colors hover:bg-[var(--bg-hover)]',
+                          borrowerId === b.id && 'bg-[var(--accent-subtle)]'
+                        )}
+                      >
+                        <p className="font-semibold text-[var(--text-primary)]">{b.full_name}</p>
+                        <p className="text-[var(--text-tertiary)] mt-0.5 truncate">
+                          {[b.employer, b.branch_name, b.loandisk_id ? `ID ${b.loandisk_id}` : null].filter(Boolean).join(' · ') || '—'}
+                        </p>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </section>
+            )}
           </>
         )}
       </div>

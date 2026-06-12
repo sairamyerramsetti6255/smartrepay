@@ -12,6 +12,8 @@ import { Exceptions } from '@/pages/Exceptions'
 import { Reconcile } from '@/pages/Reconcile'
 import { Audit } from '@/pages/Audit'
 import { Borrowers } from '@/pages/Borrowers'
+import { ActiveLoans } from '@/pages/ActiveLoans'
+import { LoanAnalytics } from '@/pages/LoanAnalytics'
 import { SettingsSla } from '@/pages/SettingsSla'
 import { SettingsRules } from '@/pages/SettingsRules'
 import { ReportsDaily } from '@/pages/ReportsDaily'
@@ -46,6 +48,8 @@ export default function App() {
             <Route path="exceptions" element={<Exceptions />} />
             <Route path="reconcile" element={<Reconcile />} />
             <Route path="audit" element={<Audit />} />
+            <Route path="active-loans" element={<ActiveLoans />} />
+            <Route path="active-loans/analytics" element={<LoanAnalytics />} />
             <Route path="borrowers" element={<Borrowers />} />
             <Route path="settings/sla" element={<SettingsSla />} />
             <Route path="settings/rules" element={<SettingsRules />} />

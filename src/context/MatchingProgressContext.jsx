@@ -1,71 +1,87 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import * as api from '@/lib/api'
 
 const MatchingProgressContext = createContext(null)
 
+/**
+ * Global matching progress — drives the navbar progress bar and the Match page.
+ * Backed by the SQL/AI matching runner in the Node service (OpenRouter), polled
+ * via /api/sql/match/status. Progress is reported batch-wise (25 per batch).
+ */
 export function MatchingProgressProvider({ children }) {
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState(null)
-  const [result, setResult] = useState(null)
+  const [summary, setSummary] = useState(null)
   const [error, setError] = useState(null)
+  const pollRef = useRef(null)
 
-  const refreshStatus = useCallback(async () => {
+  const stopPoll = useCallback(() => {
+    if (pollRef.current) {
+      clearTimeout(pollRef.current)
+      pollRef.current = null
+    }
+  }, [])
+
+  const poll = useCallback(async () => {
     try {
-      const snap = await api.matching.status()
-      if (snap.progress) setProgress(snap.progress)
-      if (snap.status === 'running') {
+      const s = await api.sqlMatch.status()
+      setProgress(s.progress || null)
+      if (s.status === 'running') {
         setRunning(true)
-        window.dispatchEvent(new CustomEvent('smartrepay:matching-progress', { detail: snap.progress }))
-        return snap
-      }
-      if (snap.status === 'completed') {
+        window.dispatchEvent(new CustomEvent('smartrepay:matching-progress', { detail: s.progress }))
+        pollRef.current = setTimeout(poll, 1500)
+      } else {
         setRunning(false)
-        setResult(snap.result)
-        window.dispatchEvent(new CustomEvent('smartrepay:matching-done', { detail: snap.result }))
-        return snap
+        setSummary(s.summary || null)
+        if (s.status === 'error') setError(s.error || 'Matching failed')
+        window.dispatchEvent(new CustomEvent('smartrepay:matching-done', { detail: s }))
       }
-      if (snap.status === 'failed') {
-        setRunning(false)
-        setError(snap.error || 'Matching failed')
-        return snap
-      }
-      setRunning(false)
-      return snap
     } catch {
-      return null
+      // transient — keep last state, stop polling
+      setRunning(false)
     }
   }, [])
 
+  // Resume polling if a run is already in flight (e.g. after a page reload).
   useEffect(() => {
-    refreshStatus()
-  }, [refreshStatus])
+    api.sqlMatch
+      .status()
+      .then((s) => {
+        if (s?.status === 'running') {
+          setRunning(true)
+          setProgress(s.progress || null)
+          poll()
+        }
+      })
+      .catch(() => {})
+    return stopPoll
+  }, [poll, stopPoll])
 
-  useEffect(() => {
-    if (!running) return undefined
-    const id = setInterval(refreshStatus, 2000)
-    return () => clearInterval(id)
-  }, [running, refreshStatus])
-
-  const startMatching = useCallback(async () => {
-    setError(null)
-    setResult(null)
-    setProgress({ phase: 'starting' })
-    setRunning(true)
-    try {
-      const res = await api.matching.run((p) => setProgress(p))
-      setResult(res)
-      setRunning(false)
-      window.dispatchEvent(new CustomEvent('smartrepay:matching-done', { detail: res }))
-      return res
-    } catch (e) {
-      setError(e.message)
-      setRunning(false)
-      throw e
-    }
-  }, [])
+  const startMatching = useCallback(
+    async (useAi = true) => {
+      setError(null)
+      setSummary(null)
+      setProgress({ phase: 'starting' })
+      setRunning(true)
+      try {
+        const r = await api.sqlMatch.run(useAi)
+        if (r.status === 'started' || r.status === 'running') {
+          poll()
+          return r
+        }
+        setRunning(false)
+        throw new Error(r.message || 'Could not start matching')
+      } catch (e) {
+        setError(e.message)
+        setRunning(false)
+        throw e
+      }
+    },
+    [poll]
+  )
 
   return (
-    <MatchingProgressContext.Provider value={{ running, progress, result, error, startMatching, refreshStatus }}>
+    <MatchingProgressContext.Provider value={{ running, progress, summary, error, startMatching }}>
       {children}
     </MatchingProgressContext.Provider>
   )

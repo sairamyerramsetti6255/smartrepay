@@ -1,8 +1,14 @@
-import { ChevronLeft, ChevronRight } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { ChevronLeft, ChevronRight, ArrowUp, ArrowDown, ChevronsUpDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useSortableTable } from '@/hooks/useSortableTable'
 import { cn } from '@/lib/utils'
 import { EmptyState } from '@/components/EmptyState'
+
+function SortIcon({ active, dir }) {
+  if (!active) return <ChevronsUpDown className="h-3 w-3 opacity-40" />
+  return dir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+}
 
 export function DataTable({
   data,
@@ -13,8 +19,30 @@ export function DataTable({
   emptyDescription,
   emptyAction,
   rowClassName,
+  sortable = false,
+  filterable = false,
 }) {
-  const { paginated, page, setPage, totalPages, total } = useSortableTable(data, pageSize)
+  const [filters, setFilters] = useState({})
+
+  const isFilterable = (col) => filterable && col.filterable !== false && col.key !== 'actions'
+  const isSortable = (col) => sortable && col.sortable !== false && col.key !== 'actions'
+
+  const filtered = useMemo(() => {
+    const active = Object.entries(filters).filter(([, v]) => v && v.trim())
+    if (!active.length) return data
+    return data.filter((row) =>
+      active.every(([key, val]) => {
+        const col = columns.find((c) => c.key === key)
+        const raw = col?.filterAccessor ? col.filterAccessor(row) : row[key]
+        return String(raw ?? '').toLowerCase().includes(val.trim().toLowerCase())
+      })
+    )
+  }, [data, filters, columns])
+
+  const { paginated, page, setPage, totalPages, total, sortKey, sortDir, toggleSort } = useSortableTable(
+    filtered,
+    pageSize
+  )
 
   if (!data.length) {
     return (
@@ -24,8 +52,13 @@ export function DataTable({
     )
   }
 
+  function updateFilter(key, value) {
+    setFilters((f) => ({ ...f, [key]: value }))
+    setPage(1)
+  }
+
   return (
-    <div className="bg-[var(--bg-card)] border border-[var(--border-light)] rounded-[var(--radius-lg)] shadow-[var(--shadow-xs)] overflow-hidden">
+    <div className="bg-[var(--bg-card)] border border-[var(--border-light)] rounded-[var(--radius-lg)] shadow-[var(--shadow-xs)] overflow-x-auto">
       <table className="w-full">
         <thead>
           <tr className="bg-[#FAFAF8] border-b border-[var(--border-light)]">
@@ -33,14 +66,48 @@ export function DataTable({
               <th
                 key={col.key}
                 className={cn(
-                  'h-10 px-5 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)]',
+                  'h-10 px-5 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] whitespace-nowrap',
                   col.align === 'right' && 'text-right'
                 )}
               >
-                {col.label}
+                {isSortable(col) ? (
+                  <button
+                    type="button"
+                    onClick={() => toggleSort(col.key)}
+                    className={cn(
+                      'inline-flex items-center gap-1 uppercase tracking-[0.06em] hover:text-[var(--text-primary)] transition-colors',
+                      col.align === 'right' && 'flex-row-reverse',
+                      sortKey === col.key && 'text-[var(--text-primary)]'
+                    )}
+                  >
+                    {col.label}
+                    <SortIcon active={sortKey === col.key} dir={sortDir} />
+                  </button>
+                ) : (
+                  col.label
+                )}
               </th>
             ))}
           </tr>
+          {filterable && (
+            <tr className="bg-[#FAFAF8] border-b border-[var(--border-light)]">
+              {columns.map((col) => (
+                <th key={col.key} className="px-3 pb-2 pt-0 align-top">
+                  {isFilterable(col) ? (
+                    <input
+                      value={filters[col.key] || ''}
+                      onChange={(e) => updateFilter(col.key, e.target.value)}
+                      placeholder="Filter…"
+                      className={cn(
+                        'w-full h-7 rounded-[var(--radius-sm)] border border-[var(--border-light)] bg-[var(--bg-card)] px-2 text-[12px] font-normal normal-case tracking-normal text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]',
+                        col.align === 'right' && 'text-right'
+                      )}
+                    />
+                  ) : null}
+                </th>
+              ))}
+            </tr>
+          )}
         </thead>
         <tbody>
           {paginated.map((row, i) => (
@@ -66,6 +133,13 @@ export function DataTable({
               ))}
             </tr>
           ))}
+          {!paginated.length && (
+            <tr>
+              <td colSpan={columns.length} className="px-5 py-10 text-center text-[13px] text-[var(--text-tertiary)]">
+                No rows match the current filters.
+              </td>
+            </tr>
+          )}
         </tbody>
       </table>
       {total > pageSize && (

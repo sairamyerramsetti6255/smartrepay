@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom'
 
-export function PageHeader({ title, subtitle, actions, breadcrumb, children }) {
+export function PageHeader({ title, subtitle, actions, breadcrumb, eyebrow, children }) {
   if (breadcrumb) {
     return (
       <div className="mb-8 flex items-center justify-between gap-4">
@@ -26,6 +26,11 @@ export function PageHeader({ title, subtitle, actions, breadcrumb, children }) {
   return (
     <div className="mb-8 flex items-start justify-between gap-4">
       <div>
+        {eyebrow && (
+          <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-[var(--accent)] mb-1.5">
+            {eyebrow}
+          </p>
+        )}
         {title && (
           <h1 className="text-2xl font-semibold text-[var(--text-primary)] tracking-[-0.025em] leading-[28px]">
             {title}

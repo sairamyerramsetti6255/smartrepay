@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ROLES } from '@/lib/roles'
 import { checkApiConnection } from '@/lib/api'
+import logo from '@/assets/simplfied_logo.webp'
 
 export function Login() {
   const { user, signIn, signUp, loading } = useAuth()
@@ -44,11 +45,59 @@ export function Login() {
   }
 
   return (
-    <div className="min-h-screen bg-[var(--bg-app)] flex items-center justify-center p-10">
+    <div className="min-h-screen bg-[var(--bg-app)] grid lg:grid-cols-2">
+      {/* Brand panel */}
+      <div className="relative hidden lg:flex flex-col justify-between overflow-hidden bg-[var(--accent)] p-12 text-white">
+        <div
+          className="absolute inset-0 opacity-30"
+          style={{ background: 'radial-gradient(circle at 30% 20%, rgba(255,255,255,0.25), transparent 55%)' }}
+        />
+        <div className="relative flex items-center">
+          <div className="rounded-[var(--radius-md)] bg-white px-3 py-2 shadow-sm">
+            <img src={logo} alt="Simplified Lending" className="h-10 w-auto object-contain" />
+          </div>
+        </div>
+
+        <div className="relative max-w-sm">
+          <h2 className="text-[26px] font-bold tracking-[-0.02em] leading-snug">
+            Reconcile loan repayments in four guided steps.
+          </h2>
+          <ul className="mt-7 space-y-3.5">
+            {[
+              { n: '1', t: 'Upload statement', d: 'Bank or employer files in seconds' },
+              { n: '2', t: 'Run matching', d: 'Payments matched to borrowers automatically' },
+              { n: '3', t: 'Review unmatched', d: 'Resolve exceptions with full context' },
+              { n: '4', t: 'Reconcile & post', d: 'Approve and export to LoanDisk' },
+            ].map((s) => (
+              <li key={s.n} className="flex items-start gap-3">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/15 text-[13px] font-bold">
+                  {s.n}
+                </span>
+                <div>
+                  <p className="text-[14px] font-semibold leading-tight">{s.t}</p>
+                  <p className="text-[12px] text-white/70 mt-0.5">{s.d}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <p className="relative text-[12px] text-white/60">© {new Date().getFullYear()} Simplified Lending</p>
+      </div>
+
+      {/* Form panel */}
+      <div className="flex items-center justify-center p-8 sm:p-12">
       <div className="card w-full max-w-md p-10">
-        <header className="mb-10">
-          <h1 className="text-[22px] font-semibold text-[var(--text-primary)] tracking-tight">SmartRepay AI</h1>
-          <p className="text-[13px] text-[var(--text-tertiary)] mt-1">Simplified Lending</p>
+        <header className="mb-8">
+          <div className="flex items-center lg:hidden mb-6">
+            <img src={logo} alt="Simplified Lending" className="h-10 w-auto object-contain" />
+          </div>
+          <h1 className="text-[22px] font-semibold text-[var(--text-primary)] tracking-tight">
+            {mode === 'signin' ? 'Welcome back' : 'Create your account'}
+          </h1>
+          <p className="text-[13px] text-[var(--text-tertiary)] mt-1">
+            {mode === 'signin' ? 'Sign in to continue to your dashboard.' : 'Set up access to SmartRepay AI.'}
+          </p>
         </header>
 
         {!conn.checking && conn.ok === false && (
@@ -99,6 +148,7 @@ export function Login() {
         >
           {mode === 'signin' ? 'Create an account' : 'Sign in instead'}
         </button>
+      </div>
       </div>
     </div>
   )

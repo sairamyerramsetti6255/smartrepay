@@ -7,7 +7,11 @@
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "node scripts/free-port.mjs 3001 && node --watch index.js"
+    "dev": "node scripts/free-port.mjs 3001 && node --watch index.js",
+    "sync": "node engine/scripts/runSync.js",
+    "match": "node engine/scripts/matchTransactions.js",
+    "import": "node engine/scripts/importTransactions.js",
+    "init-db": "node engine/scripts/initDb.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -16,6 +20,7 @@
     "express": "^4.21.2",
     "fuse.js": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
+    "mssql": "^12.5.5",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^2.4.5",
     "xlsx": "^0.18.5"

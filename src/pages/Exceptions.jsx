@@ -1,93 +1,130 @@
-import { useMemo, useState } from 'react'
-import { useExceptions } from '@/hooks/useExceptions'
-import { useBorrowers } from '@/hooks/useBorrowers'
-import { useTransactions } from '@/hooks/useTransactions'
-import { ExceptionDrawer } from '@/components/ExceptionDrawer'
+import { useEffect, useMemo, useState } from 'react'
+import toast from 'react-hot-toast'
+import { FileSpreadsheet, Loader2, RefreshCw } from 'lucide-react'
+import * as api from '@/lib/api'
+import { useAuth } from '@/context/AuthContext'
+import { confidenceVariant } from '@/lib/matcher'
 import { PageHeader } from '@/components/PageHeader'
 import { DataTable } from '@/components/DataTable'
-import { SegmentedControl } from '@/components/SegmentedControl'
 import { Badge } from '@/components/Badge'
-import { Input } from '@/components/ui/input'
-import toast from 'react-hot-toast'
-import { FileSpreadsheet } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { formatCurrency } from '@/lib/utils'
-import { getSlaBucket, aggregateSlaBuckets } from '@/lib/sla'
-import { exportUnmatchedTransactions } from '@/lib/transactionExport'
+import { Input } from '@/components/ui/input'
 import { Card } from '@/components/Card'
 import { PageLoader } from '@/components/PageLoader'
+import { WorkflowStepper } from '@/components/WorkflowStepper'
+import { MatchReviewDrawer, STATUS_META } from '@/components/MatchReviewDrawer'
+import { formatCurrency, formatDate, cn } from '@/lib/utils'
+import { exportUnmatchedTransactions } from '@/lib/transactionExport'
 
-const TYPE_FILTERS = [
-  { value: '', label: 'All' },
-  { value: 'unmatched', label: 'Unmatched' },
-  { value: 'duplicate', label: 'Duplicate' },
-  { value: 'partial', label: 'Partial' },
-  { value: 'suspicious', label: 'Suspicious' },
+const FILTERS = [
+  { value: 'open', label: 'Needs action' },
+  { value: 'exception', label: 'Unmatched' },
+  { value: 'pending', label: 'Needs review' },
+  { value: 'all', label: 'All' },
 ]
 
 export function Exceptions() {
-  const { exceptions, loading, error, refetch } = useExceptions()
-  const { transactions } = useTransactions()
-  const { borrowers, loans } = useBorrowers()
-  const borrowerById = useMemo(() => Object.fromEntries(borrowers.map((b) => [b.id, b])), [borrowers])
-  const exceptionByTxId = useMemo(
-    () => Object.fromEntries(exceptions.map((ex) => [ex.transaction_id, ex])),
-    [exceptions]
-  )
-  const [selected, setSelected] = useState(null)
-  const [drawerOpen, setDrawerOpen] = useState(false)
-  const [typeFilter, setTypeFilter] = useState('')
-  const [statusFilter, setStatusFilter] = useState('')
+  const { user } = useAuth()
+  const [transactions, setTransactions] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [filter, setFilter] = useState('open')
   const [search, setSearch] = useState('')
+  const [selected, setSelected] = useState(null)
 
-  const open = exceptions.filter((e) => e.status === 'open')
-  const heatmap = aggregateSlaBuckets(open)
+  async function load({ silent } = {}) {
+    if (silent) setRefreshing(true)
+    else setLoading(true)
+    try {
+      const { transactions: rows } = await api.sqlMatch.results()
+      setTransactions(Array.isArray(rows) ? rows : [])
+    } catch (e) {
+      toast.error(e.message)
+      setTransactions([])
+    } finally {
+      setLoading(false)
+      setRefreshing(false)
+    }
+  }
 
-  const filtered = useMemo(
-    () =>
-      exceptions.filter((ex) => {
-        if (typeFilter && ex.type !== typeFilter) return false
-        if (statusFilter && ex.status !== statusFilter) return false
-        if (search) {
-          const tx = ex.transactions
-          const hay = `${tx?.payer} ${ex.assigned_to}`.toLowerCase()
-          if (!hay.includes(search.toLowerCase())) return false
-        }
-        return true
-      }),
-    [exceptions, typeFilter, statusFilter, search]
+  useEffect(() => {
+    load()
+  }, [])
+
+  // Everything that is not a confirmed match is part of the unmatched queue.
+  const queue = useMemo(
+    () => transactions.filter((t) => t.status === 'exception' || t.status === 'pending'),
+    [transactions]
+  )
+
+  const filtered = useMemo(() => {
+    let list = queue
+    if (filter === 'exception') list = list.filter((t) => t.status === 'exception')
+    else if (filter === 'pending') list = list.filter((t) => t.status === 'pending')
+    // 'open' and 'all' both show the full unmatched queue here
+    if (search.trim()) {
+      const q = search.trim().toLowerCase()
+      list = list.filter((t) =>
+        [t.payer, t.matched_borrower_name, t.reference, t.source_filename]
+          .some((v) => String(v ?? '').toLowerCase().includes(q))
+      )
+    }
+    const order = { pending: 0, exception: 1 }
+    return [...list].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9))
+  }, [queue, filter, search])
+
+  const counts = useMemo(
+    () => ({
+      open: queue.length,
+      exception: queue.filter((t) => t.status === 'exception').length,
+      pending: queue.filter((t) => t.status === 'pending').length,
+      all: queue.length,
+    }),
+    [queue]
   )
 
   const columns = [
-    { key: 'payer', label: 'Payer', render: (ex) => <span className="font-medium">{ex.transactions?.payer || '—'}</span> },
+    { key: 'date', label: 'Date', render: (t) => <span className="text-[var(--text-secondary)]">{formatDate(t.date)}</span> },
+    { key: 'payer', label: 'Payer', render: (t) => <span className="font-medium">{t.payer || '—'}</span> },
+    { key: 'amount', label: 'Amount', align: 'right', render: (t) => formatCurrency(t.amount) },
     {
-      key: 'amount',
-      label: 'Amount',
-      align: 'right',
-      render: (ex) => formatCurrency(ex.transactions?.amount),
+      key: 'status',
+      label: 'Status',
+      render: (t) => <Badge variant={STATUS_META[t.status]?.variant || 'exception'}>{STATUS_META[t.status]?.label || t.status}</Badge>,
     },
-    { key: 'type', label: 'Type', render: (ex) => <Badge variant="exception">{ex.type}</Badge> },
-    { key: 'assigned_to', label: 'Assigned', render: (ex) => ex.assigned_to || '—' },
     {
-      key: 'sla',
-      label: 'SLA Status',
-      render: (ex) => {
-        const sla = getSlaBucket(ex.created_at, ex.sla_hours)
-        const v = sla.bucket === 'breached' ? 'breached' : sla.bucket === 'at_risk' ? 'at_risk' : 'on_track'
-        return <Badge variant={v === 'on_track' ? 'on_track' : v === 'at_risk' ? 'at_risk' : 'breached'}>{sla.label}</Badge>
-      },
+      key: 'confidence_score',
+      label: 'Score',
+      align: 'right',
+      render: (t) =>
+        t.confidence_score == null ? (
+          <span className="text-[var(--text-tertiary)]">—</span>
+        ) : (
+          <Badge variant={confidenceVariant(t.confidence_score)} className="mono">
+            {Math.round(t.confidence_score)}%
+          </Badge>
+        ),
+    },
+    {
+      key: 'matched_borrower_name',
+      label: 'Suggested borrower',
+      render: (t) =>
+        t.matched_borrower_name ? (
+          <span className="text-[var(--text-secondary)]">{t.matched_borrower_name}</span>
+        ) : (
+          <span className="text-[var(--text-tertiary)]">—</span>
+        ),
     },
     {
       key: 'actions',
       label: '',
-      render: (ex) => (
+      render: (t) => (
         <button
           type="button"
           className="text-[13px] font-medium text-[var(--accent)] hover:text-[var(--accent-hover)]"
           onClick={(e) => {
             e.stopPropagation()
-            setSelected(ex)
-            setDrawerOpen(true)
+            setSelected(t)
           }}
         >
           Review →
@@ -96,91 +133,91 @@ export function Exceptions() {
     },
   ]
 
-  const unmatchedRows = useMemo(
-    () => transactions.filter((t) => t.status === 'exception'),
-    [transactions]
-  )
-
-  function exportUnmatchedExcel() {
-    const ok = exportUnmatchedTransactions(unmatchedRows, { exceptionByTxId, borrowerById })
+  function exportExcel() {
+    const ok = exportUnmatchedTransactions(filtered)
     if (!ok) toast.error('No unmatched transactions to export')
-    else toast.success(`Exported ${unmatchedRows.length} unmatched rows`)
+    else toast.success(`Exported ${filtered.length} unmatched rows`)
   }
+
+  async function onResolved() {
+    setSelected(null)
+    await load({ silent: true })
+  }
+
+  if (loading) return <PageLoader label="Loading unmatched queue from SQL…" />
 
   return (
     <div className="space-y-6">
+      <WorkflowStepper current="review" />
+
       <PageHeader
+        eyebrow="Step 3 of 4"
         title="Unmatched Queue"
+        subtitle="Resolve payments that could not be matched automatically — read directly from SQL Server."
         actions={
-          <Button variant="secondary" size="sm" onClick={exportUnmatchedExcel} disabled={!unmatchedRows.length}>
-            <FileSpreadsheet className="h-4 w-4" />
-            Export Unmatched
-          </Button>
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            {refreshing && <Loader2 className="h-4 w-4 animate-spin text-[var(--text-tertiary)]" />}
+            <Button variant="secondary" size="sm" onClick={() => load({ silent: true })} disabled={refreshing}>
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </Button>
+            <Button variant="secondary" size="sm" onClick={exportExcel} disabled={!filtered.length}>
+              <FileSpreadsheet className="h-4 w-4" />
+              Export Unmatched
+            </Button>
+          </div>
         }
       />
 
       <Card className="flex h-[72px] items-stretch overflow-hidden">
-        <SlaMetric label="On Track" value={heatmap.on_track} color="var(--success)" />
+        <QueueMetric label="In queue" value={counts.open} color="var(--text-primary)" />
         <div className="w-px bg-[var(--border-light)]" />
-        <SlaMetric label="At Risk" value={heatmap.at_risk} color="var(--warning)" />
+        <QueueMetric label="Unmatched" value={counts.exception} color="var(--danger)" />
         <div className="w-px bg-[var(--border-light)]" />
-        <SlaMetric label="Breached" value={heatmap.breached} color="var(--danger)" />
+        <QueueMetric label="Needs review" value={counts.pending} color="var(--warning)" />
       </Card>
 
       <div className="flex flex-wrap items-center gap-2 justify-between">
-        <SegmentedControl
-          options={TYPE_FILTERS}
-          value={typeFilter}
-          onChange={setTypeFilter}
-        />
-        <div className="flex flex-wrap gap-2">
-          <select
-            className="h-9 rounded-[var(--radius-md)] border border-[var(--border-medium)] px-3 text-[13px] bg-[var(--bg-card)]"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-          >
-            <option value="">Status</option>
-            <option value="open">Open</option>
-            <option value="resolved">Resolved</option>
-          </select>
-          <Input placeholder="Search..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-48" />
+        <div className="flex items-center gap-2 flex-wrap">
+          {FILTERS.map((f) => (
+            <button
+              key={f.value}
+              type="button"
+              onClick={() => setFilter(f.value)}
+              className={cn(
+                'h-8 px-3 rounded-[var(--radius-full)] text-[12px] font-medium transition-colors',
+                filter === f.value
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+              )}
+            >
+              {f.label}
+              <span className="ml-1.5 opacity-70">{counts[f.value] ?? counts.all}</span>
+            </button>
+          ))}
         </div>
+        <Input placeholder="Search..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-48" />
       </div>
 
-      {error && <p className="text-[13px] text-[var(--danger)]">{error}</p>}
-
-      {loading ? (
-        <PageLoader label="Loading unmatched queue…" />
-      ) : (
-        <DataTable
-          data={filtered}
-          columns={columns}
-          onRowClick={(ex) => {
-            setSelected(ex)
-            setDrawerOpen(true)
-          }}
-          rowClassName={(ex) => {
-            const sla = getSlaBucket(ex.created_at, ex.sla_hours)
-            return sla.bucket === 'breached' ? 'bg-[#FFF8F8]' : ''
-          }}
-          emptyMessage="No exceptions in queue"
-          emptyDescription="All items have been resolved"
-        />
-      )}
-
-      <ExceptionDrawer
-        exception={selected}
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        borrowers={borrowers}
-        loans={loans}
-        onResolved={refetch}
+      <DataTable
+        data={filtered}
+        columns={columns}
+        pageSize={25}
+        sortable
+        filterable
+        onRowClick={(t) => setSelected(t)}
+        emptyMessage={queue.length === 0 ? 'No unmatched transactions in SQL' : 'Nothing in this filter'}
+        emptyDescription={
+          queue.length === 0 ? 'Everything staged has been matched, or no documents are staged yet.' : 'Try another filter'
+        }
       />
+
+      <MatchReviewDrawer tx={selected} user={user} onClose={() => setSelected(null)} onResolved={onResolved} />
     </div>
   )
 }
 
-function SlaMetric({ label, value, color }) {
+function QueueMetric({ label, value, color }) {
   return (
     <div className="flex-1 flex flex-col items-center justify-center px-6">
       <p className="text-2xl font-bold mono" style={{ color }}>

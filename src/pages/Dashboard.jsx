@@ -5,6 +5,8 @@ import { format, subDays, startOfDay, isToday, formatDistanceToNow } from 'date-
 import * as api from '@/lib/api'
 import { useAuth } from '@/context/AuthContext'
 import { Card, CardBody, CardHeader } from '@/components/Card'
+import { NextStepHero } from '@/components/NextStepHero'
+import { WorkflowTracker } from '@/components/WorkflowTracker'
 import { KPICard } from '@/components/KPICard'
 import { Badge } from '@/components/Badge'
 import { CardSkeleton } from '@/components/Skeleton'
@@ -114,11 +116,6 @@ export function Dashboard() {
 
   return (
     <div className="space-y-8">
-      {error && (
-        <div className="rounded-[var(--radius-md)] border border-[var(--danger-border)] bg-[var(--danger-bg)] px-5 py-3.5 text-[13px] text-[var(--danger)]">
-          {error} — ensure the API is running (<code className="mono text-[12px]">npm run dev</code>)
-        </div>
-      )}
       {/* Header */}
       <header className="animate-fade-in">
         <div className="flex items-center justify-between">
@@ -128,7 +125,7 @@ export function Dashboard() {
               <span className="text-gradient ml-1">.</span>
             </h1>
             <p className="text-[14px] text-[var(--text-tertiary)] mt-1">
-              Here&apos;s your reconciliation overview for today.
+              Follow the steps below to reconcile today&apos;s payments.
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -143,8 +140,26 @@ export function Dashboard() {
         </div>
       </header>
 
+      {/* Guided next step */}
+      <div className="animate-fade-in" style={{ animationDelay: '0.03s' }}>
+        <NextStepHero />
+      </div>
+
+      {/* Workflow tracker */}
+      <div className="space-y-4 animate-fade-in" style={{ animationDelay: '0.05s' }}>
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">Reconciliation workflow</h2>
+            <p className="text-[13px] text-[var(--text-tertiary)] mt-0.5">
+              Four steps from statement to posted payment.
+            </p>
+          </div>
+        </div>
+        <WorkflowTracker />
+      </div>
+
       {/* KPI Cards */}
-      <div className="grid gap-5 grid-cols-2 lg:grid-cols-4 animate-fade-in" style={{ animationDelay: '0.05s' }}>
+      <div className="grid gap-5 grid-cols-2 lg:grid-cols-4 animate-fade-in" style={{ animationDelay: '0.08s' }}>
         {KPI_KEYS.map(({ key, label }) => (
           <KPICard
             key={key}

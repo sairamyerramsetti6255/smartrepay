@@ -273,6 +273,8 @@ export const documents = {
 
   list: () => request('/documents'),
 
+  remove: (id) => request(`/documents/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   transactions: (id) => request(`/documents/${id}/transactions`),
 
   downloadUrl: (id) => `${getApiUrl()}/documents/${id}/download`,
@@ -434,6 +436,54 @@ export const ingest = {
   import: (parseId) =>
 
     request('/ingest/import', { method: 'POST', body: JSON.stringify({ parseId }) }),
+
+}
+
+
+
+export const activeLoans = {
+
+  list: (search) =>
+
+    request(`/active-loans${search ? `?search=${encodeURIComponent(search)}` : ''}`),
+
+}
+
+
+
+export const bankTransactions = {
+
+  list: (search) =>
+
+    request(`/bank-transactions${search ? `?search=${encodeURIComponent(search)}` : ''}`),
+
+}
+
+
+
+export const staging = {
+
+  summary: () => request('/staging/summary'),
+
+}
+
+
+
+export const sqlMatch = {
+
+  results: (search) =>
+
+    request(`/sql/match-results${search ? `?search=${encodeURIComponent(search)}` : ''}`),
+
+  updateReview: (bankTxId, body) =>
+
+    request(`/sql/match-results/${bankTxId}`, { method: 'PATCH', body: JSON.stringify(body) }),
+
+  run: (useAi = true) =>
+
+    request('/sql/match/run', { method: 'POST', body: JSON.stringify({ useAi }) }),
+
+  status: () => request('/sql/match/status'),
 
 }
 

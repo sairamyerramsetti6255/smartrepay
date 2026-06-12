@@ -21,6 +21,19 @@ import {
   parseBorrowerSearchResults,
 } from './loandisk.js'
 import { getBorrowerResponse } from './borrowerFetchService.js'
+import { runMatch } from './matchRunner.js'
+import {
+  insertBankTransactions,
+  uniqueFileName,
+  getActiveLoans,
+  getBankTransactions,
+  getStagingCounts,
+  getSqlMatchResults,
+  updateSqlMatchReview,
+  getDocuments,
+  deleteDocument,
+  flagDuplicateRows,
+} from './stagingDb.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
 
@@ -152,7 +165,7 @@ app.get('/api/health', (_req, res) =>
     ok: true,
     backend: 'node-sqlite',
     ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.7.6',
+    build: '1.8.0',
     heavyJob: getActiveJobName(),
     features: {
       documents: true,
@@ -166,16 +179,17 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
     const result = await parseStatementBuffer(req.file.buffer, req.file.originalname)
-    const existing = db.prepare('select import_hash from transactions where import_hash is not null').all()
-    const hashSet = new Set(existing.map((r) => r.import_hash))
-    const rows = result.rows.map((r) => ({
+    // Duplicate detection now runs purely against SQL Server (Staging_BankTransactions),
+    // so an empty SQL table means zero duplicates regardless of old SQLite history.
+    const dupFlags = await flagDuplicateRows(result.rows)
+    const rows = result.rows.map((r, i) => ({
       date: r.date,
       payer: r.payer,
       description: r.description,
       amount: r.amount,
       reference: r.reference,
       import_hash: r.import_hash,
-      _duplicate: hashSet.has(r.import_hash),
+      _duplicate: dupFlags[i] || false,
     }))
     audit('ingest', null, 'parse_statement', req.user.email, null, {
       file: req.file.originalname,
@@ -189,6 +203,7 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
 
     cacheParse(parseId, {
       rows,
+      richRows: result.rows,
       userId: req.user.sub,
       filename: req.file.originalname,
       buffer: req.file.buffer,
@@ -215,7 +230,7 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
   }
 })
 
-app.post('/api/ingest/import', authMiddleware, (req, res) => {
+app.post('/api/ingest/import', authMiddleware, async (req, res) => {
   try {
     const { parseId } = req.body
     if (!parseId) return res.status(400).json({ error: 'Missing parseId — re-upload the file' })
@@ -237,18 +252,174 @@ app.post('/api/ingest/import', authMiddleware, (req, res) => {
     })
 
     const inserted = bulkInsertRows(toInsert, req.user.email, documentId)
+
+    // Stage the parsed credits into SQL Server (Staging_BankTransactions) under a
+    // unique, timestamped file name so they can be matched against LoanDisk.
+    const stagedFileName = uniqueFileName(cached.filename)
+    let staged = 0
+    let stagedDuplicates = 0
+    let stagingError = null
+    try {
+      const stagingRows = (cached.richRows || []).map((r) => ({
+        ...r,
+        documentType: r.documentType || cached.documentType,
+      }))
+      const stagingResult = await insertBankTransactions(stagingRows, {
+        fileName: stagedFileName,
+        uploadedDate: new Date(),
+      })
+      staged = stagingResult.inserted
+      stagedDuplicates = stagingResult.skipped
+    } catch (e) {
+      stagingError = e.message
+      console.error('Staging_BankTransactions insert failed:', e.message)
+    }
+
     parseCache.delete(parseId)
 
     audit('ingest', null, 'import_statement', req.user.email, null, {
       file: cached.filename,
+      stagedFile: stagedFileName,
       count: inserted.length,
+      staged,
+      stagedDuplicates,
       documentId,
     })
 
-    res.json({ inserted: inserted.length, documentId })
+    res.json({
+      inserted: inserted.length,
+      documentId,
+      staged,
+      stagedDuplicates,
+      stagedFileName,
+      stagingError,
+    })
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
+})
+
+// --- Active loans (LoanDisk due-records staging table on SQL Server) ---
+app.get('/api/active-loans', authMiddleware, async (req, res) => {
+  try {
+    const rows = await getActiveLoans({ search: req.query.search || '' })
+    res.json({ rows })
+  } catch (e) {
+    res.status(500).json({ error: `Could not load active loans: ${e.message}` })
+  }
+})
+
+// --- Staged bank transactions (Staging_BankTransactions on SQL Server) ---
+app.get('/api/bank-transactions', authMiddleware, async (req, res) => {
+  try {
+    const rows = await getBankTransactions({ search: req.query.search || '' })
+    res.json({ rows })
+  } catch (e) {
+    res.status(500).json({ error: `Could not load bank transactions: ${e.message}` })
+  }
+})
+
+// --- Staging counts for tiles ---
+app.get('/api/staging/summary', authMiddleware, async (_req, res) => {
+  try {
+    res.json(await getStagingCounts())
+  } catch (e) {
+    res.status(500).json({ error: `Could not load staging summary: ${e.message}` })
+  }
+})
+
+// --- Match results straight from SQL Server (the single source of truth) ---
+app.get('/api/sql/match-results', authMiddleware, async (req, res) => {
+  try {
+    res.json(await getSqlMatchResults({ search: req.query.search || '' }))
+  } catch (e) {
+    res.status(500).json({ error: `Could not load match results: ${e.message}` })
+  }
+})
+
+app.patch('/api/sql/match-results/:bankTxId', authMiddleware, async (req, res) => {
+  try {
+    await updateSqlMatchReview({
+      bankTransactionId: req.params.bankTxId,
+      reviewStatus: req.body.reviewStatus,
+      borrowerId: req.body.borrowerId ?? null,
+      borrowerName: req.body.borrowerName ?? null,
+      loanNumber: req.body.loanNumber ?? null,
+      confidence: req.body.confidence ?? null,
+    })
+    res.json({ ok: true })
+  } catch (e) {
+    res.status(500).json({ error: `Could not update match: ${e.message}` })
+  }
+})
+
+// --- SQL/AI matching runner -------------------------------------------------
+// Runs the reconciliation engine IN-PROCESS (no separate Node project): matches
+// Staging_BankTransactions against Staging_LoandiskDueRecords (fuzzy name +
+// subset-sum / bi-weekly EMI + OpenRouter AI for ambiguous ties) and upserts
+// Staging_TransactionMatches via CRIF_Operations.
+const sqlMatchJob = {
+  status: 'idle', // idle | running | done | error
+  startedAt: null,
+  finishedAt: null,
+  useAi: true,
+  progress: null, // { phase, done, total, bankTx, loans, matched, unmatched }
+  summary: null, // { autoMatched, unmatched, total, ai }
+  error: null,
+}
+
+app.post('/api/sql/match/run', authMiddleware, (req, res) => {
+  if (sqlMatchJob.status === 'running') {
+    return res.json({ status: 'running', message: 'Matching already in progress', progress: sqlMatchJob.progress })
+  }
+
+  const useAi = req.body?.useAi !== false
+  Object.assign(sqlMatchJob, {
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    useAi,
+    progress: { phase: 'starting', done: 0, total: 0 },
+    summary: null,
+    error: null,
+  })
+
+  // Fire-and-forget: the client polls /api/sql/match/status for progress.
+  runMatch({
+    useAi,
+    onProgress: (p) => {
+      sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), ...p }
+    },
+  })
+    .then((summary) => {
+      sqlMatchJob.summary = summary
+      sqlMatchJob.status = 'done'
+      sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), phase: 'done' }
+      sqlMatchJob.finishedAt = new Date().toISOString()
+    })
+    .catch((e) => {
+      sqlMatchJob.status = 'error'
+      sqlMatchJob.error = e.message
+      sqlMatchJob.finishedAt = new Date().toISOString()
+    })
+
+  res.json({
+    status: 'started',
+    useAi,
+    message: useAi ? 'AI matching started' : 'Deterministic matching started',
+  })
+})
+
+app.get('/api/sql/match/status', authMiddleware, (_req, res) => {
+  res.json({
+    status: sqlMatchJob.status,
+    useAi: sqlMatchJob.useAi,
+    progress: sqlMatchJob.progress,
+    summary: sqlMatchJob.summary,
+    error: sqlMatchJob.error,
+    startedAt: sqlMatchJob.startedAt,
+    finishedAt: sqlMatchJob.finishedAt,
+  })
 })
 
 // --- Auth ---
@@ -378,7 +549,24 @@ app.get('/api/transactions/counts', authMiddleware, (_req, res) => {
   const borrowers = db.prepare('select count(*) as c from borrowers').get().c
   const transactions = db.prepare('select count(*) as c from transactions').get().c
   const exceptions = db.prepare('select count(*) as c from exceptions').get().c
-  res.json({ borrowers, transactions, exceptions })
+  const documents = db.prepare('select count(*) as c from documents').get().c
+  const openExceptions = db.prepare("select count(*) as c from exceptions where status = 'open'").get().c
+  const statusRows = db.prepare('select status, count(*) as c from transactions group by status').all()
+  const byStatus = { pending: 0, matched: 0, exception: 0, posted: 0 }
+  for (const row of statusRows) {
+    if (row.status in byStatus) byStatus[row.status] = row.c
+  }
+  res.json({
+    borrowers,
+    transactions,
+    exceptions,
+    documents,
+    openExceptions,
+    pending: byStatus.pending,
+    matched: byStatus.matched,
+    unmatched: byStatus.exception,
+    posted: byStatus.posted,
+  })
 })
 
 app.post('/api/transactions/bulk', authMiddleware, (req, res) => {
@@ -609,20 +797,22 @@ app.get('/api/loandisk/borrower/:id', authMiddleware, (req, res) => {
 })
 
 // --- Documents ---
-app.get('/api/documents', authMiddleware, (_req, res) => {
-  const docs = db
-    .prepare(
-      `select d.*,
-        (select count(*) from transactions t where t.source_document_id = d.id) as total_rows,
-        (select count(*) from transactions t where t.source_document_id = d.id and t.status = 'matched') as matched_count,
-        (select count(*) from transactions t where t.source_document_id = d.id and t.status in ('exception','pending')) as unmatched_count,
-        (select min(t.date) from transactions t where t.source_document_id = d.id) as date_from,
-        (select max(t.date) from transactions t where t.source_document_id = d.id) as date_to
-      from documents d
-      order by d.created_at desc`
-    )
-    .all()
-  res.json(docs)
+app.get('/api/documents', authMiddleware, async (_req, res) => {
+  try {
+    res.json(await getDocuments())
+  } catch (e) {
+    res.status(500).json({ error: `Could not load documents: ${e.message}` })
+  }
+})
+
+// Cascade-delete a file's staged credits (and their matches) from SQL Server.
+app.delete('/api/documents/:id', authMiddleware, async (req, res) => {
+  try {
+    const deleted = await deleteDocument(decodeURIComponent(req.params.id))
+    res.json({ ok: true, deleted })
+  } catch (e) {
+    res.status(500).json({ error: `Could not delete document: ${e.message}` })
+  }
 })
 
 app.get('/api/documents/:id/download', authMiddleware, (req, res) => {
