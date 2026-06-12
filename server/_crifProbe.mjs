@@ -1,38 +1,23 @@
-// Throwaway probe: learn which read conditions CRIF_Operations supports
-const API_BASE = 'https://simplifiedapi.meanhost.in/v1/api'
+// Smoke test: the rewired stagingDb functions over the HTTP CRIF client
+import {
+  getDocuments,
+  getBankTransactions,
+  getSqlMatchResults,
+  getStagingCounts,
+  getActiveLoans,
+} from './stagingDb.js'
 
-async function getToken() {
-  const res = await fetch(`${API_BASE}/Token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ Username: 'api_admin', Password: 'api_admin@2024' }),
-  })
-  const data = await res.json()
-  return data?.document?.AccessToken
-}
+const docs = await getDocuments()
+console.log('getDocuments         ->', docs.length, 'files', docs[0]?.filename ?? '')
 
-async function callCrif(token, condition) {
-  const res = await fetch(`${API_BASE}/SP/CRIF_Operations`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ Json: '{}', Condition: condition, Type: '' }),
-  })
-  const raw = await res.json().catch(() => ({}))
-  let table = null
-  try { table = JSON.parse(raw.document)?.Table } catch {}
-  const first = Array.isArray(table) ? table[0] : null
-  console.log(`\n== ${condition} (HTTP ${res.status}, code=${raw.code}) rows=${Array.isArray(table) ? table.length : 'n/a'}`)
-  if (first) console.log('   cols:', Object.keys(first).join(', '))
-  else console.log('   msg:', raw.message, '| doc:', String(raw.document).slice(0, 200))
-}
+const bt = await getBankTransactions()
+console.log('getBankTransactions  ->', bt.length, 'rows')
 
-const token = await getToken()
-for (const c of [
-  'Get_BankTransactions',
-  'Get_TransactionMatches',
-  'Get_LoandiskDueRecords',
-  'Get_ActiveLoans',
-  'Get_DueRecords',
-]) {
-  await callCrif(token, c)
-}
+const { transactions, counts } = await getSqlMatchResults()
+console.log('getSqlMatchResults   ->', transactions.length, 'tx', JSON.stringify(counts))
+
+const counts2 = await getStagingCounts()
+console.log('getStagingCounts     ->', JSON.stringify(counts2))
+
+const loans = await getActiveLoans({ limit: 5 })
+console.log('getActiveLoans       ->', loans.length, '(0 until SQL condition applied)')

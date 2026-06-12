@@ -1,71 +1,13 @@
-import fs from 'fs'
 import path from 'path'
-import { fileURLToPath } from 'url'
-import dotenv from 'dotenv'
-import sql from 'mssql'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+import { crif } from './crifClient.js'
 
 /**
- * Resolve the SQL Server connection used for the staging tables.
- *
- * Single source of truth is this server's .env (DB_* live there). process.env
- * wins so deployments can override.
- */
-function loadStagingDbConfig() {
-  let fileEnv = {}
-  try {
-    // Single source of truth is this server's own .env (DB_* live there now).
-    fileEnv = dotenv.parse(fs.readFileSync(path.join(__dirname, '.env')))
-  } catch {
-    // ignore — fall back to process.env / defaults
-  }
-  const get = (key, fallback) => process.env[key] ?? fileEnv[key] ?? fallback
-  const truthy = (v) => /^(1|true|yes)$/i.test(String(v ?? ''))
-
-  return {
-    server: get('DB_SERVER', 'localhost'),
-    port: Number(get('DB_PORT', 1433)),
-    database: get('DB_DATABASE', 'SmartRepay'),
-    user: get('DB_USER', 'sa'),
-    password: get('DB_PASSWORD', ''),
-    options: {
-      encrypt: truthy(get('DB_ENCRYPT', 'false')),
-      trustServerCertificate: truthy(get('DB_TRUST_SERVER_CERT', 'true')),
-    },
-    pool: { max: 5, min: 0, idleTimeoutMillis: 30_000 },
-    requestTimeout: 60_000,
-  }
-}
-
-let poolPromise = null
-
-function getPool() {
-  if (!poolPromise) {
-    poolPromise = new sql.ConnectionPool(loadStagingDbConfig())
-      .connect()
-      .catch((e) => {
-        poolPromise = null
-        throw e
-      })
-  }
-  return poolPromise
-}
-
-/**
- * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations.
- * Returns the first result set (rows include Result/Message marker columns).
+ * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations over HTTP
+ * (meanhost API gateway) — see crifClient.js for why we no longer open a direct
+ * mssql connection. Returns the recordset (rows include Result/Message markers).
  */
 async function execCrif(json, condition, type = '') {
-  const pool = await getPool()
-  const payload = typeof json === 'string' ? json : JSON.stringify(json ?? {})
-  const res = await pool
-    .request()
-    .input('Json', sql.VarChar(sql.MAX), payload)
-    .input('Condition', sql.VarChar(100), condition)
-    .input('Type', sql.VarChar(100), type)
-    .execute('CRIF_Operations')
-  return res.recordset || []
+  return crif(json, condition, type)
 }
 
 const NAME_STOP_WORDS = new Set([
@@ -254,27 +196,17 @@ export async function insertBankTransactions(records, { fileName, uploadedDate }
  * / borrower id / branch.
  */
 export async function getActiveLoans({ search = '', limit = 10000 } = {}) {
-  const pool = await getPool()
-  const req = pool.request()
-  let where = ''
-  const q = String(search || '').trim()
-  if (q) {
-    req.input('q', sql.NVarChar, `%${q}%`)
-    where =
-      'WHERE BorrowerFullName LIKE @q OR LoanNumber LIKE @q OR BorrowerId LIKE @q OR BranchName LIKE @q'
-  }
-  req.input('lim', sql.Int, Math.min(Number(limit) || 10000, 20000))
-  const res = await req.query(`
-    SELECT TOP (@lim)
-      Id, LoanNumber, BorrowerId, BorrowerFullName, ExpectedEMIAmount,
-      PrincipalAmount, TotalLoanAmount, InterestRate, InterestAmount,
-      TotalDue, TotalPaid, LoanBalanceAmount, BorrowerEmail, BorrowerPhone,
-      EMILastPaidDate, LoanStatus, BranchName, SyncedAt
-    FROM Staging_LoandiskDueRecords
-    ${where}
-    ORDER BY CASE WHEN BorrowerFullName IS NULL OR BorrowerFullName = '' THEN 1 ELSE 0 END,
-             BorrowerFullName ASC, LoanNumber ASC`)
-  return res.recordset
+  const rows = await execCrif('{}', 'Get_LoandiskDueRecords')
+  const q = String(search || '').trim().toLowerCase()
+  const max = Math.min(Number(limit) || 10000, 20000)
+  const filtered = !q
+    ? rows
+    : rows.filter((r) =>
+        [r.BorrowerFullName, r.LoanNumber, r.BorrowerId, r.BranchName].some((v) =>
+          String(v ?? '').toLowerCase().includes(q)
+        )
+      )
+  return filtered.slice(0, max)
 }
 
 /** Staged bank/payroll credit transactions (for the Upload Documents grid). */

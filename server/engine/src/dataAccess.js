@@ -1,6 +1,7 @@
 import sql from 'mssql'
 import { config } from './config.js'
 import { chunk } from './concurrency.js'
+import { crif } from '../../crifClient.js'
 
 /**
  * Data access layer — port of dataaccess.cs.
@@ -40,19 +41,12 @@ function getPool() {
 }
 
 /**
- * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations.
- * @Json is the payload (object or array), @Condition selects the branch.
+ * Call dbo.CRIF_Operations over HTTP (meanhost API gateway) — see crifClient.js.
+ * The app/match path no longer opens a direct mssql connection (the deploy host
+ * is firewalled off port 1433/9933). @Json is the payload, @Condition the branch.
  */
 async function execCrif(json, condition, type = '') {
-  const pool = await getPool()
-  const payload = typeof json === 'string' ? json : JSON.stringify(json ?? {})
-  const res = await pool
-    .request()
-    .input('Json', sql.VarChar(sql.MAX), payload)
-    .input('Condition', sql.VarChar(100), condition)
-    .input('Type', sql.VarChar(100), type)
-    .execute('CRIF_Operations')
-  return res.recordset || []
+  return crif(json, condition, type)
 }
 
 /**
@@ -241,14 +235,10 @@ const cut = (v, n) => (v == null ? null : String(v).slice(0, n))
  */
 export async function bulkInsertBankTransactions(records, { fileName, uploadedDate }) {
   if (!records.length) return 0
-  const pool = await getPool()
 
-  // Idempotent per file: drop this file's prior rows first, then re-insert via the
-  // CRIF_Operations / Save_BankTransactions condition.
-  await pool
-    .request()
-    .input('fileName', sql.NVarChar(260), fileName)
-    .query('DELETE FROM Staging_BankTransactions WHERE FileName = @fileName')
+  // Idempotent per file: drop this file's prior rows (+ their matches) first via
+  // CRIF_Operations / Delete_Documents, then re-insert via Save_BankTransactions.
+  await crif({ FileName: fileName }, 'Delete_Documents')
 
   const isoDate = (v) => (v ? new Date(v).toISOString().slice(0, 10) : null)
   const uploaded = (uploadedDate ? new Date(uploadedDate) : new Date()).toISOString()
@@ -273,24 +263,14 @@ export async function bulkInsertBankTransactions(records, { fileName, uploadedDa
   return records.length
 }
 
-/** All credit transactions awaiting / available for matching. */
+/** All credit transactions awaiting / available for matching (via CRIF_Operations). */
 export async function getBankTransactions() {
-  const pool = await getPool()
-  const res = await pool.request().query(`
-    SELECT Id, FileName, SourceType, EmployerOrBank, TransDate, ReferenceNo,
-           Particulars, BorrowerName, NormalizedName, EmiPaidAmount
-    FROM Staging_BankTransactions`)
-  return res.recordset
+  return execCrif('{}', 'Get_BankTransactions')
 }
 
-/** LoanDisk due loans to match against. */
+/** LoanDisk due loans to match against (via CRIF_Operations). */
 export async function getLoanDiskDueRecords() {
-  const pool = await getPool()
-  const res = await pool.request().query(`
-    SELECT Id, LoanNumber, BorrowerId, BorrowerFullName, ExpectedEMIAmount,
-           LoanBalanceAmount, LoanStatus, BranchName
-    FROM Staging_LoandiskDueRecords`)
-  return res.recordset
+  return execCrif('{}', 'Get_LoandiskDueRecords')
 }
 
 /**

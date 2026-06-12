@@ -37,6 +37,19 @@
 		ORDER BY bt.ImportedAt DESC, bt.Id DESC;
 	END
 
+	-- Exec CRIF_Operations '{}','Get_LoandiskDueRecords','' -- Active Loans grid + matching source
+	ELSE IF (@Condition = 'Get_LoandiskDueRecords')
+	BEGIN
+		SELECT 'True' AS Result, 'Details found' AS Message,
+			Id, LoanNumber, BorrowerId, BorrowerFullName, ExpectedEMIAmount,
+			PrincipalAmount, TotalLoanAmount, InterestRate, InterestAmount,
+			TotalDue, TotalPaid, LoanBalanceAmount, BorrowerEmail, BorrowerPhone,
+			EMILastPaidDate, LoanStatus, BranchName, SyncedAt
+		FROM Staging_LoandiskDueRecords
+		ORDER BY CASE WHEN BorrowerFullName IS NULL OR BorrowerFullName = '' THEN 1 ELSE 0 END,
+			BorrowerFullName ASC, LoanNumber ASC;
+	END
+
 	-- Exec CRIF_Operations '{}','Get_MatchSummary',''
 	ELSE IF (@Condition = 'Get_MatchSummary')
 	BEGIN
