@@ -20,6 +20,7 @@ import { mapWithConcurrency } from './concurrency.js'
 const PAGE_SIZE = 500
 
 const RETURN_FIELDS = [
+  'loan_id',
   'loan_number',
   'full_name',
   'email_address',
@@ -31,7 +32,8 @@ const RETURN_FIELDS = [
   'loan_status',
 ].join(',')
 
-// Statuses that mean the loan is no longer collectable — skipped, as in repay.md.
+// Statuses that mean the loan is no longer collectable. Only skipped when
+// config.loandisk.sync.includeInactive is false (see mapDueLoanRecord).
 const INACTIVE_STATUSES = new Set(['closed', 'fully paid', 'settled', '2'])
 
 function formatDate(d) {
@@ -41,11 +43,12 @@ function formatDate(d) {
 }
 
 function collectionWindow() {
+  const { windowMonthsBack, windowMonthsForward } = config.loandisk.sync
   const today = new Date()
   const from = new Date(today)
-  from.setMonth(today.getMonth() - 1)
+  from.setMonth(today.getMonth() - windowMonthsBack)
   const to = new Date(today)
-  to.setMonth(today.getMonth() + 1)
+  to.setMonth(today.getMonth() + windowMonthsForward)
   return { from: formatDate(from), to: formatDate(to) }
 }
 
@@ -114,7 +117,12 @@ export function mapDueLoanRecord(row, branch) {
   }
 
   const status = String(pick(row, 'loan_status', 'LoanStatus') ?? '').trim()
-  if (INACTIVE_STATUSES.has(status.toLowerCase())) return null
+  // By default we keep every loan (incl. closed/settled) so the matcher can
+  // reconcile against the full book. Set DUE_LOANS_INCLUDE_INACTIVE=false to
+  // restore the legacy behaviour of skipping non-collectable loans.
+  if (!config.loandisk.sync.includeInactive && INACTIVE_STATUSES.has(status.toLowerCase())) {
+    return null
+  }
 
   return {
     loanId: loanId != null ? String(loanId) : null,

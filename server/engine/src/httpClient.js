@@ -33,12 +33,13 @@ export function branchUrl(branchId, path) {
  * Perform a LoanDisk request with timeout, retry and JSON parsing.
  * Returns parsed JSON, or null when `allowEmpty` and the resource is missing.
  */
-export async function loandiskRequest(url, { method = 'GET', body = null, allowEmpty = false } = {}) {
+export async function loandiskRequest(url, { method = 'GET', body = null, allowEmpty = false, timeoutMs } = {}) {
   let lastError
+  const effectiveTimeout = timeoutMs || requestTimeoutMs
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+    const timer = setTimeout(() => controller.abort(), effectiveTimeout)
 
     try {
       const init = { method, headers: { ...baseHeaders }, signal: controller.signal }

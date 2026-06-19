@@ -423,22 +423,9 @@ app.get('/api/sql/match/status', authMiddleware, (_req, res) => {
 })
 
 // --- Auth ---
-app.post('/api/auth/signup', (req, res) => {
-  const { email, password, role = 'collections' } = req.body
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' })
-  const existing = db.prepare('select id from users where email = ?').get(email)
-  if (existing) return res.status(400).json({ error: 'Email already registered' })
-  const id = randomUUID()
-  const hash = bcrypt.hashSync(password, 10)
-  db.prepare('insert into users (id, email, password_hash, role, full_name) values (?, ?, ?, ?, ?)').run(
-    id,
-    email,
-    hash,
-    role,
-    email.split('@')[0]
-  )
-  const token = signToken({ id, email, role })
-  res.json({ token, user: { id, email, role, full_name: email.split('@')[0] } })
+// Self-service signup is disabled — accounts are provisioned by the administrator.
+app.post('/api/auth/signup', (_req, res) => {
+  res.status(403).json({ error: 'Account creation is disabled. Contact the administrator.' })
 })
 
 app.post('/api/auth/signin', (req, res) => {
@@ -1116,7 +1103,7 @@ if (fs.existsSync(distPath)) {
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`SmartRepay running on 0.0.0.0:${PORT}`)
   console.log(`Ingest: POST /api/ingest/parse · AI: ${process.env.OPENROUTER_API_KEY ? 'enabled' : 'disabled'}`)
-  console.log(`Demo login: demo@smartrepay.local / demo1234`)
+  console.log('Login: admin@pbshope.com')
 })
 
 server.on('error', (err) => {

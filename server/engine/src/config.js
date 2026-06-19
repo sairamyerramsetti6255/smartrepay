@@ -45,6 +45,29 @@ export const config = {
     publicKey: process.env.LOANDISK_PUBLIC_KEY || '',
     authToken: process.env.LOANDISK_AUTH_TOKEN || '',
     branches: parseBranches(process.env.LOANDISK_BRANCHES || 'SimplifiedLending:18279'),
+    sync: {
+      // due_loans collection-date window, in months relative to today.
+      // Defaults are intentionally wide so the matcher sees the FULL loan book
+      // (every loan that ever had an installment scheduled), not just the
+      // ~active loans due in the next month. Narrow these to restore the
+      // legacy "active only" behaviour.
+      windowMonthsBack: Math.max(0, optionalNumber('DUE_LOANS_WINDOW_MONTHS_BACK', 120)),
+      windowMonthsForward: Math.max(0, optionalNumber('DUE_LOANS_WINDOW_MONTHS_FORWARD', 120)),
+      // LoanDisk "Current" status for advanced_search_loans (PDF §16).
+      currentLoanStatusId: optionalNumber('LOANDISK_CURRENT_LOAN_STATUS_ID', 18),
+      // Status ids pulled into staging: 1 = Active (open), 18 = Current.
+      // First match wins on de-dupe, so 18 (current) is listed first.
+      statusIds: (process.env.LOANDISK_STATUS_IDS || '18,1')
+        .split(',')
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isFinite(n)),
+      // advanced_search_loans presigns S3 file URLs server-side and is slow for
+      // big branches, so it gets a much longer per-request timeout.
+      searchTimeoutMs: optionalNumber('LOANDISK_SEARCH_TIMEOUT_MS', 180_000),
+      // When true, closed / fully paid / settled loans are also synced and
+      // matched (a bank credit can be the final payment that closed a loan).
+      includeInactive: optionalBool('DUE_LOANS_INCLUDE_INACTIVE', true),
+    },
   },
   db: {
     server: process.env.DB_SERVER || 'localhost',
@@ -68,7 +91,14 @@ export const config = {
     model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
     siteUrl: process.env.OPENROUTER_SITE_URL || 'http://localhost:4000',
     appName: process.env.OPENROUTER_APP_NAME || 'SmartRepay Matcher',
-    concurrency: Math.max(1, optionalNumber('MATCH_CONCURRENCY', 4)),
+    concurrency: Math.max(1, optionalNumber('MATCH_CONCURRENCY', 8)),
+    // Nitro = route to the fastest providers (provider.sort = throughput).
+    nitro: optionalBool('OPENROUTER_NITRO', true),
+    // Stream tokens (lower time-to-first-byte, snappier batch throughput).
+    stream: optionalBool('OPENROUTER_STREAM', true),
+    // Token budget for the answer. Reasoning models spend tokens "thinking"
+    // before the JSON, so keep enough headroom or responses get truncated.
+    maxTokens: Math.max(256, optionalNumber('OPENROUTER_MAX_TOKENS', 800)),
   },
   port: optionalNumber('PORT', 4000),
 }

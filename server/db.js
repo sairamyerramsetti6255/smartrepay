@@ -137,13 +137,13 @@ export function initDb() {
 
   migrateDb()
 
-  const userCount = db.prepare('select count(*) as c from users').get().c
-  if (userCount === 0) {
-    const id = randomUUID()
-    const hash = bcrypt.hashSync('demo1234', 10)
+  // Single admin login. The old demo account is removed so its credentials stop working.
+  db.prepare("delete from users where email = 'demo@smartrepay.local'").run()
+  const admin = db.prepare('select id from users where email = ?').get('admin@pbshope.com')
+  if (!admin) {
     db.prepare(
       'insert into users (id, email, password_hash, role, full_name) values (?, ?, ?, ?, ?)'
-    ).run(id, 'demo@smartrepay.local', hash, 'system_owner', 'Demo User')
+    ).run(randomUUID(), 'admin@pbshope.com', bcrypt.hashSync('pbs2026', 10), 'system_owner', 'Admin')
   }
 
   const settingsCount = db.prepare('select count(*) as c from app_settings').get().c

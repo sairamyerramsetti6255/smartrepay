@@ -15,7 +15,7 @@ import { crif } from '../../crifClient.js'
 
 let poolPromise = null
 
-function getPool() {
+export function getPool() {
   if (!poolPromise) {
     poolPromise = new sql.ConnectionPool({
       server: config.db.server,
@@ -171,6 +171,12 @@ const DUE_INSERT_BATCH = 100
  * place, new loans are INSERTED, and rows not present in this batch (e.g.
  * previously synced branches) are left untouched. No TRUNCATE/DELETE.
  */
+/** Remove all rows from Staging_LoandiskDueRecords (full refresh). */
+export async function truncateStagingDueRecords() {
+  const pool = await getPool()
+  await pool.request().query('TRUNCATE TABLE dbo.Staging_LoandiskDueRecords')
+}
+
 export async function bulkInsertStagingRecords(records) {
   if (!records.length) return { upserted: 0, inserted: 0, updated: 0 }
 

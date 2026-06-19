@@ -43,9 +43,39 @@ export function extractJson(text) {
   return null
 }
 
+/** Read an SSE chat stream and concatenate the delta content. */
+async function readStreamedContent(res) {
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let content = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    let nl
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim()
+      buffer = buffer.slice(nl + 1)
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (payload === '[DONE]') return content
+      try {
+        const json = JSON.parse(payload)
+        content += json?.choices?.[0]?.delta?.content || ''
+      } catch {
+        // Ignore keep-alive comments / partial frames.
+      }
+    }
+  }
+  return content
+}
+
 /**
  * Send a chat completion and return the model's parsed JSON object.
- * @param {{system?: string, user: string, model?: string, temperature?: number, maxTokens?: number, retries?: number}} opts
+ * @param {{system?: string, user: string, model?: string, temperature?: number, maxTokens?: number, retries?: number, nitro?: boolean, stream?: boolean}} opts
  */
 export async function chatJson(opts) {
   const {
@@ -53,9 +83,11 @@ export async function chatJson(opts) {
     user,
     model = config.openrouter.model,
     temperature = 0,
-    maxTokens = 700,
+    maxTokens = config.openrouter.maxTokens,
     retries = config.performance.maxRetries,
     timeoutMs = config.performance.requestTimeoutMs,
+    nitro = config.openrouter.nitro,
+    stream = config.openrouter.stream,
   } = opts
 
   if (!isOpenRouterEnabled()) {
@@ -66,13 +98,18 @@ export async function chatJson(opts) {
   if (system) messages.push({ role: 'system', content: system })
   messages.push({ role: 'user', content: user })
 
-  const body = JSON.stringify({
+  const payload = {
     model,
     messages,
     temperature,
     max_tokens: maxTokens,
     response_format: { type: 'json_object' },
-  })
+  }
+  // Nitro: prefer the fastest providers for this request (OpenRouter routing).
+  if (nitro) payload.provider = { sort: 'throughput' }
+  if (stream) payload.stream = true
+
+  const body = JSON.stringify(payload)
 
   let lastErr
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -84,6 +121,7 @@ export async function chatJson(opts) {
         headers: {
           Authorization: `Bearer ${config.openrouter.apiKey}`,
           'Content-Type': 'application/json',
+          Accept: stream ? 'text/event-stream' : 'application/json',
           'HTTP-Referer': config.openrouter.siteUrl,
           'X-Title': config.openrouter.appName,
         },
@@ -104,8 +142,10 @@ export async function chatJson(opts) {
         throw new Error(`OpenRouter HTTP ${res.status}: ${txt.slice(0, 200)}`)
       }
 
-      const data = await res.json()
-      const content = data?.choices?.[0]?.message?.content || ''
+      const content = stream && res.body
+        ? await readStreamedContent(res)
+        : (await res.json())?.choices?.[0]?.message?.content || ''
+
       const parsed = extractJson(content)
       if (!parsed) {
         lastErr = new Error('OpenRouter returned non-JSON content')
