@@ -189,3 +189,118 @@
 
 		SELECT 'True' AS Result, 'Updated' AS Message;
 	END
+
+	-- Exec CRIF_Operations '{"BorrowerId":"12345"}','Get_LoansByBorrowerId',''
+	ELSE IF (@Condition = 'Get_LoansByBorrowerId')
+	BEGIN
+		DECLARE @rc_bid VARCHAR(50) = JSON_VALUE(@Json, '$.BorrowerId');
+
+		SELECT 'True' AS Result, 'Details found' AS Message,
+			CAST(l.LoanId AS NVARCHAR(100)) AS LoanNumber,
+			CAST(l.BorrowerId AS VARCHAR(50)) AS BorrowerId,
+			COALESCE(
+				NULLIF(LTRIM(RTRIM(CONCAT(b.FirstName, ' ', b.LastName))), ''),
+				NULLIF(LTRIM(RTRIM(b.FullName)), ''),
+				CONCAT('Borrower ', l.BorrowerId)
+			) AS BorrowerFullName,
+			l.PrincipalAmount,
+			l.PrincipalAmount AS DisbursedAmount,
+			l.ReleasedDate AS DisbursedDate,
+			COALESCE(
+				NULLIF(CASE WHEN l.PendingDue > 0 THEN l.PendingDue END, NULL),
+				CASE WHEN l.NumOfRepayments > 0 AND l.TotalAmountDue > 0
+					THEN ROUND(l.TotalAmountDue / NULLIF(l.NumOfRepayments, 0), 2) END
+			) AS ExpectedEMIAmount,
+			l.TotalAmountDue AS TotalDue,
+			l.TotalPaid,
+			l.BalanceAmount AS LoanBalanceAmount,
+			l.NumOfRepayments AS TotalInstallments,
+			ISNULL(rc.Cnt, 0) AS InstallmentsPaid,
+			lr.LastRepaymentDate AS EMILastPaidDate,
+			l.BranchId,
+			l.BranchName,
+			CASE
+				WHEN ISJSON(l.RawJson) = 1 AND JSON_VALUE(l.RawJson, '$.child_status_id') = '18' THEN 'current'
+				ELSE 'active'
+			END AS LoanStatus
+		FROM dbo.SILLoans l
+		LEFT JOIN dbo.SILBorrowers b
+			ON b.BorrowerId = l.BorrowerId AND b.BranchId = l.BranchId
+		OUTER APPLY (
+			SELECT COUNT(*) AS Cnt
+			FROM dbo.SILloanrepayments r
+			WHERE r.LoanId = l.LoanId AND r.BranchId = l.BranchId
+		) rc
+		OUTER APPLY (
+			SELECT MAX(r.RepaymentCollectedDate) AS LastRepaymentDate
+			FROM dbo.SILloanrepayments r
+			WHERE r.LoanId = l.LoanId AND r.BranchId = l.BranchId
+		) lr
+		WHERE CAST(l.BorrowerId AS VARCHAR(50)) = @rc_bid
+		  AND (
+			l.LoanStatusId = '1'
+			OR (ISJSON(l.RawJson) = 1 AND JSON_VALUE(l.RawJson, '$.child_status_id') = '18')
+		  )
+		ORDER BY l.LoanId;
+	END
+
+	-- Exec CRIF_Operations '[{"BorrowerId":"1","LoanNumber":"100","AmountReceived":50,...}]','Save_ManualReceipt',''
+	ELSE IF (@Condition = 'Save_ManualReceipt')
+	BEGIN
+		DECLARE @mr TABLE (
+			BorrowerId VARCHAR(50), LoanNumber NVARCHAR(100), BranchId VARCHAR(50),
+			BorrowerFullName NVARCHAR(255), AmountReceived DECIMAL(18,2), Particulars NVARCHAR(500),
+			SourceChannel VARCHAR(20), EntryType VARCHAR(20), CollectedDate DATE,
+			ReceiptFileName NVARCHAR(260), ReceiptDocumentId VARCHAR(36), EnteredBy NVARCHAR(255)
+		);
+
+		INSERT INTO @mr
+		SELECT * FROM OPENJSON(@Json) WITH (
+			BorrowerId VARCHAR(50), LoanNumber NVARCHAR(100), BranchId VARCHAR(50),
+			BorrowerFullName NVARCHAR(255), AmountReceived DECIMAL(18,2), Particulars NVARCHAR(500),
+			SourceChannel VARCHAR(20), EntryType VARCHAR(20), CollectedDate DATE,
+			ReceiptFileName NVARCHAR(260), ReceiptDocumentId VARCHAR(36), EnteredBy NVARCHAR(255)
+		);
+
+		INSERT INTO dbo.Staging_ManualReceipts (
+			BorrowerId, LoanNumber, BranchId, BorrowerFullName, AmountReceived, Particulars,
+			SourceChannel, EntryType, CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy
+		)
+		SELECT
+			BorrowerId, LoanNumber, BranchId, BorrowerFullName, AmountReceived, Particulars,
+			SourceChannel, ISNULL(EntryType, 'manual'), CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy
+		FROM @mr;
+
+		IF COL_LENGTH('dbo.SILloanrepayments', 'ReceiptSource') IS NOT NULL
+		BEGIN
+			INSERT INTO dbo.SILloanrepayments (
+				LoanId, BranchId, RepaymentAmount, RepaymentCollectedDate,
+				RepaymentDescription, RepaymentMethodId, EntryType, ReceiptSource, Particulars, ReceiptFileName
+			)
+			SELECT
+				TRY_CAST(m.LoanNumber AS INT),
+				m.BranchId,
+				m.AmountReceived,
+				m.CollectedDate,
+				m.Particulars,
+				'manual',
+				ISNULL(m.EntryType, 'manual'),
+				m.SourceChannel,
+				m.Particulars,
+				m.ReceiptFileName
+			FROM @mr m
+			WHERE TRY_CAST(m.LoanNumber AS INT) IS NOT NULL;
+		END
+
+		SELECT 'True' AS Result, 'Saved' AS Message, (SELECT COUNT(*) FROM @mr) AS Inserted;
+	END
+
+	-- Exec CRIF_Operations '{}','Get_ManualReceipts',''
+	ELSE IF (@Condition = 'Get_ManualReceipts')
+	BEGIN
+		SELECT 'True' AS Result, 'Details found' AS Message,
+			Id, BorrowerId, LoanNumber, BranchId, BorrowerFullName, AmountReceived, Particulars,
+			SourceChannel, EntryType, CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy, CreatedAt
+		FROM dbo.Staging_ManualReceipts
+		ORDER BY CreatedAt DESC, Id DESC;
+	END

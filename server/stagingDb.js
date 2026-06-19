@@ -349,3 +349,128 @@ export async function deleteDocument(fileName) {
   const rows = await execCrif({ FileName: fileName }, 'Delete_Documents')
   return rows[0]?.Deleted ?? 0
 }
+
+const RECEIPT_SOURCES = new Set(['walkin', 'whatsapp', 'email', 'phone'])
+
+export function isValidReceiptSource(source) {
+  return RECEIPT_SOURCES.has(String(source || '').trim().toLowerCase())
+}
+
+function shapeLoanForReceipt(r) {
+  const emi = r.ExpectedEMIAmount != null ? Number(r.ExpectedEMIAmount) : null
+  const totalPaid = r.TotalPaid != null ? Number(r.TotalPaid) : 0
+  const installmentsPaid =
+    r.InstallmentsPaid != null
+      ? Number(r.InstallmentsPaid)
+      : emi && emi > 0
+        ? Math.floor(totalPaid / emi)
+        : 0
+
+  return {
+    loanNumber: String(r.LoanNumber ?? ''),
+    borrowerId: String(r.BorrowerId ?? ''),
+    borrowerName: r.BorrowerFullName ?? null,
+    principalAmount: r.PrincipalAmount != null ? Number(r.PrincipalAmount) : null,
+    disbursedAmount:
+      r.DisbursedAmount != null
+        ? Number(r.DisbursedAmount)
+        : r.TotalLoanAmount != null
+          ? Number(r.TotalLoanAmount)
+          : r.PrincipalAmount != null
+            ? Number(r.PrincipalAmount)
+            : null,
+    disbursedDate: r.DisbursedDate ?? r.ReleasedDate ?? null,
+    emiAmount: emi,
+    totalDue: r.TotalDue != null ? Number(r.TotalDue) : null,
+    totalPaid,
+    totalInstallments: r.TotalInstallments != null ? Number(r.TotalInstallments) : r.NumOfRepayments ?? null,
+    installmentsPaid,
+    lastEmiPaidDate: r.EMILastPaidDate ?? null,
+    loanBalance: r.LoanBalanceAmount != null ? Number(r.LoanBalanceAmount) : null,
+    branchId: r.BranchId ?? null,
+    branchName: r.BranchName ?? null,
+    loanStatus: r.LoanStatus ?? null,
+  }
+}
+
+function fallbackLoansByBorrowerId(borrowerId) {
+  return getActiveLoans({ search: borrowerId, limit: 500 }).then((rows) =>
+    rows
+      .filter((r) => String(r.BorrowerId ?? '') === String(borrowerId))
+      .map(shapeLoanForReceipt)
+  )
+}
+
+/** Active loans for a borrower (SILLoans via CRIF, staging fallback). */
+export async function getLoansByBorrowerId(borrowerId) {
+  const id = String(borrowerId || '').trim()
+  if (!id) return []
+
+  try {
+    const rows = await execCrif({ BorrowerId: id }, 'Get_LoansByBorrowerId')
+    if (rows?.length) return rows.map(shapeLoanForReceipt)
+  } catch {
+    /* fall through to staging */
+  }
+
+  return fallbackLoansByBorrowerId(id)
+}
+
+/** Persist a manual receipt to staging + SILloanrepayments. */
+export async function saveManualReceipt(payload) {
+  const source = String(payload.sourceChannel || '').trim().toLowerCase()
+  if (!isValidReceiptSource(source)) {
+    throw new Error('Source must be walkin, whatsapp, email, or phone')
+  }
+
+  const amount = Number(payload.amountReceived)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Amount received must be a positive number')
+  }
+
+  const row = {
+    BorrowerId: String(payload.borrowerId || '').trim(),
+    LoanNumber: String(payload.loanNumber || '').trim(),
+    BranchId: payload.branchId ?? null,
+    BorrowerFullName: payload.borrowerName ?? null,
+    AmountReceived: amount,
+    Particulars: String(payload.particulars || '').trim() || null,
+    SourceChannel: source,
+    EntryType: 'manual',
+    CollectedDate: payload.collectedDate || new Date().toISOString().slice(0, 10),
+    ReceiptFileName: payload.receiptFileName ?? null,
+    ReceiptDocumentId: payload.receiptDocumentId ?? null,
+    EnteredBy: payload.enteredBy ?? null,
+  }
+
+  if (!row.BorrowerId) throw new Error('Borrower ID is required')
+  if (!row.LoanNumber) throw new Error('Loan is required')
+
+  const result = await execCrif([row], 'Save_ManualReceipt')
+  return result[0] || { Inserted: 1 }
+}
+
+/** List manual receipts (newest first). */
+export async function getManualReceipts() {
+  try {
+    const rows = await execCrif('{}', 'Get_ManualReceipts')
+    return rows.map((r) => ({
+      id: r.Id,
+      borrowerId: r.BorrowerId,
+      loanNumber: r.LoanNumber,
+      branchId: r.BranchId,
+      borrowerName: r.BorrowerFullName,
+      amountReceived: r.AmountReceived != null ? Number(r.AmountReceived) : null,
+      particulars: r.Particulars,
+      sourceChannel: r.SourceChannel,
+      entryType: r.EntryType,
+      collectedDate: r.CollectedDate,
+      receiptFileName: r.ReceiptFileName,
+      receiptDocumentId: r.ReceiptDocumentId,
+      enteredBy: r.EnteredBy,
+      createdAt: r.CreatedAt,
+    }))
+  } catch {
+    return []
+  }
+}

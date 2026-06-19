@@ -33,6 +33,9 @@ import {
   getDocuments,
   deleteDocument,
   flagDuplicateRows,
+  getLoansByBorrowerId,
+  saveManualReceipt,
+  getManualReceipts,
 } from './stagingDb.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
@@ -325,6 +328,81 @@ app.get('/api/staging/summary', authMiddleware, async (_req, res) => {
     res.json(await getStagingCounts())
   } catch (e) {
     res.status(500).json({ error: `Could not load staging summary: ${e.message}` })
+  }
+})
+
+// --- Manual receipt upload (walk-in / WhatsApp / email / phone) ---
+app.get('/api/receipts/loans/:borrowerId', authMiddleware, async (req, res) => {
+  try {
+    const loans = await getLoansByBorrowerId(req.params.borrowerId)
+    res.json({ loans })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/receipts', authMiddleware, async (_req, res) => {
+  try {
+    const rows = await getManualReceipts()
+    res.json({ rows })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/api/receipts', authMiddleware, upload.single('receipt'), async (req, res) => {
+  try {
+    const borrowerId = String(req.body.borrowerId || '').trim()
+    const loanNumber = String(req.body.loanNumber || '').trim()
+    const amountReceived = req.body.amountReceived
+    const particulars = String(req.body.particulars || '').trim()
+    const sourceChannel = String(req.body.sourceChannel || '').trim().toLowerCase()
+    const collectedDate = req.body.collectedDate || new Date().toISOString().slice(0, 10)
+    const branchId = req.body.branchId || null
+    const borrowerName = req.body.borrowerName || null
+
+    if (!borrowerId) return res.status(400).json({ error: 'Borrower ID is required' })
+    if (!loanNumber) return res.status(400).json({ error: 'Select a loan' })
+
+    let receiptDocumentId = null
+    let receiptFileName = null
+    if (req.file) {
+      receiptDocumentId = saveUploadedDocument({
+        buffer: req.file.buffer,
+        filename: req.file.originalname,
+        mimeType: req.file.mimetype,
+        documentType: 'receipt',
+        uploadedBy: req.user.email,
+        rowCount: 1,
+      })
+      receiptFileName = req.file.originalname
+    }
+
+    const result = await saveManualReceipt({
+      borrowerId,
+      loanNumber,
+      branchId,
+      borrowerName,
+      amountReceived,
+      particulars,
+      sourceChannel,
+      collectedDate,
+      receiptFileName,
+      receiptDocumentId,
+      enteredBy: req.user.email,
+    })
+
+    audit('receipt', loanNumber, 'manual_receipt', req.user.email, null, {
+      borrowerId,
+      loanNumber,
+      amountReceived,
+      sourceChannel,
+      receiptDocumentId,
+    })
+
+    res.json({ ok: true, receiptDocumentId, ...result })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
   }
 })
 
