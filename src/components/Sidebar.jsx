@@ -2,10 +2,11 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard,
   Landmark,
-  BarChart3,
   SlidersHorizontal,
   Check,
   LogOut,
+  Receipt,
+  Wallet,
 } from 'lucide-react'
 import logo from '@/assets/simplfied_logo.webp'
 import { useAuth } from '@/context/AuthContext'
@@ -109,7 +110,9 @@ export function Sidebar() {
         <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-2 mb-1.5 px-2">
           Overview
         </p>
-        <NavItem to="/" label="Dashboard" icon={LayoutDashboard} end />
+        {/* Original dashboard page hidden for now — Loan Analytics is the dashboard. */}
+        {/* <NavItem to="/" label="Dashboard" icon={LayoutDashboard} end /> */}
+        <NavItem to="/active-loans/analytics" label="Dashboard" icon={LayoutDashboard} />
 
         <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-6 mb-1.5 px-2">
           Reconciliation workflow
@@ -122,7 +125,8 @@ export function Sidebar() {
           Records
         </p>
         <NavItem to="/active-loans" label="Active Loans" icon={Landmark} />
-        <NavItem to="/active-loans/analytics" label="Loan Analytics" icon={BarChart3} />
+        <NavItem to="/repayments" label="Repayments" icon={Wallet} />
+        <NavItem to="/receipts" label="Receipts Upload" icon={Receipt} />
 
         {showSettings && (
           <>

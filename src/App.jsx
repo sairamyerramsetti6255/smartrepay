@@ -13,6 +13,8 @@ import { Reconcile } from '@/pages/Reconcile'
 import { Audit } from '@/pages/Audit'
 import { Borrowers } from '@/pages/Borrowers'
 import { ActiveLoans } from '@/pages/ActiveLoans'
+import { ReceiptsUpload } from '@/pages/ReceiptsUpload'
+import { Repayments } from '@/pages/Repayments'
 import { LoanAnalytics } from '@/pages/LoanAnalytics'
 import { SettingsSla } from '@/pages/SettingsSla'
 import { SettingsRules } from '@/pages/SettingsRules'
@@ -42,13 +44,17 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-            <Route index element={<Dashboard />} />
+            {/* Old dashboard hidden — Loan Analytics now serves as the dashboard. */}
+            <Route index element={<Navigate to="/active-loans/analytics" replace />} />
+            <Route path="dashboard-old" element={<Dashboard />} />
             <Route path="ingest" element={<Ingest />} />
             <Route path="match" element={<Match />} />
             <Route path="exceptions" element={<Exceptions />} />
             <Route path="reconcile" element={<Reconcile />} />
             <Route path="audit" element={<Audit />} />
             <Route path="active-loans" element={<ActiveLoans />} />
+            <Route path="receipts" element={<ReceiptsUpload />} />
+            <Route path="repayments" element={<Repayments />} />
             <Route path="active-loans/analytics" element={<LoanAnalytics />} />
             <Route path="borrowers" element={<Borrowers />} />
             <Route path="settings/sla" element={<SettingsSla />} />

@@ -34,10 +34,11 @@ function percent(progress) {
 }
 
 export function MatchingProgressBar() {
-  const { running, progress } = useMatchingProgress()
+  const { running, progress, scope } = useMatchingProgress()
   if (!running) return null
 
   const pct = percent(progress)
+  const scopeLabel = scope?.fileCount ? `${scope.fileCount} file${scope.fileCount === 1 ? '' : 's'} · ` : ''
 
   return (
     <Link
@@ -48,6 +49,7 @@ export function MatchingProgressBar() {
       <div className="flex-1 min-w-0">
         <p className="text-[11px] text-[var(--text-primary)] truncate font-medium flex items-center gap-1">
           <Sparkles className="h-3 w-3 text-[var(--accent)]" />
+          {scopeLabel}
           {describe(progress)}
         </p>
         <div className="h-1.5 mt-1 rounded-full bg-[var(--bg-subtle)] overflow-hidden">

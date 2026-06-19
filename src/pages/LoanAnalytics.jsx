@@ -156,7 +156,7 @@ export function LoanAnalytics() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Loan Analytics"
+        title="Dashboard"
         subtitle="Detailed analysis of the active loan book (Staging_LoandiskDueRecords)."
         actions={
           <Button variant="secondary" onClick={load} disabled={loading}>

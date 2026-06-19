@@ -165,6 +165,10 @@ export const loans = {
 
   create: (body) => request('/loans', { method: 'POST', body: JSON.stringify(body) }),
 
+  repayments: (loanNumber) =>
+
+    request(`/loans/${encodeURIComponent(loanNumber)}/repayments`),
+
 }
 
 
@@ -479,11 +483,40 @@ export const sqlMatch = {
 
     request(`/sql/match-results/${bankTxId}`, { method: 'PATCH', body: JSON.stringify(body) }),
 
-  run: (useAi = true) =>
+  run: (useAi = true, fileNames = null) =>
 
-    request('/sql/match/run', { method: 'POST', body: JSON.stringify({ useAi }) }),
+    request('/sql/match/run', { method: 'POST', body: JSON.stringify({ useAi, fileNames }) }),
 
   status: () => request('/sql/match/status'),
 
+}
+
+
+
+export const receipts = {
+  searchBorrowers: (search) =>
+    request(`/receipts/borrowers?search=${encodeURIComponent(search)}`),
+
+  loans: (borrowerId) => request(`/receipts/loans/${encodeURIComponent(borrowerId)}`),
+
+  list: () => request('/receipts'),
+
+  create: async (payload, file) => {
+    const form = new FormData()
+    Object.entries(payload).forEach(([k, v]) => {
+      if (v != null && v !== '') form.append(k, String(v))
+    })
+    if (file) form.append('receipt', file)
+
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/receipts`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || res.statusText || 'Could not save receipt')
+    return data
+  },
 }
 
