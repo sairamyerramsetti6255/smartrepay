@@ -363,6 +363,7 @@ const sqlMatchJob = {
   startedAt: null,
   finishedAt: null,
   useAi: true,
+  scope: null, // { fileNames: string[], fileCount } | null (null = whole book)
   progress: null, // { phase, done, total, bankTx, loans, matched, unmatched }
   summary: null, // { autoMatched, unmatched, total, ai }
   error: null,
@@ -374,12 +375,17 @@ app.post('/api/sql/match/run', authMiddleware, (req, res) => {
   }
 
   const useAi = req.body?.useAi !== false
+  const fileNames = Array.isArray(req.body?.fileNames)
+    ? req.body.fileNames.map((f) => String(f)).filter(Boolean)
+    : null
+  const scope = fileNames && fileNames.length ? { fileNames, fileCount: fileNames.length } : null
   const runToken = new Date().toISOString()
   Object.assign(sqlMatchJob, {
     status: 'running',
     startedAt: runToken,
     finishedAt: null,
     useAi,
+    scope,
     progress: { phase: 'starting', done: 0, total: 0 },
     summary: null,
     error: null,
@@ -402,6 +408,7 @@ app.post('/api/sql/match/run', authMiddleware, (req, res) => {
   // Fire-and-forget: the client polls /api/sql/match/status for progress.
   runMatch({
     useAi,
+    fileNames,
     onProgress: (p) => {
       // Ignore progress from a superseded run.
       if (sqlMatchJob.startedAt !== runToken) return
@@ -435,6 +442,7 @@ app.get('/api/sql/match/status', authMiddleware, (_req, res) => {
   res.json({
     status: sqlMatchJob.status,
     useAi: sqlMatchJob.useAi,
+    scope: sqlMatchJob.scope,
     progress: sqlMatchJob.progress,
     summary: sqlMatchJob.summary,
     error: sqlMatchJob.error,

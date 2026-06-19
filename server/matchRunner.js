@@ -24,13 +24,18 @@ import {
  * uses OpenRouter only for the genuinely ambiguous name ties. Results upsert into
  * Staging_TransactionMatches via CRIF_Operations.
  *
- * @param {{ useAi?: boolean, onProgress?: (p: object) => void }} opts
+ * Scope: when `fileNames` is a non-empty list, ONLY the staged credits from
+ * those uploaded files are (re)classified. Every other file's existing match
+ * row is left untouched (Save_TransactionMatches is a per-row MERGE), so you can
+ * reconcile one upload at a time instead of re-running the whole book.
+ *
+ * @param {{ useAi?: boolean, fileNames?: string[]|null, onProgress?: (p: object) => void }} opts
  */
 export function isAiAvailable() {
   return isOpenRouterEnabled()
 }
 
-export async function runMatch({ useAi = true, onProgress } = {}) {
+export async function runMatch({ useAi = true, fileNames = null, onProgress } = {}) {
   const emit = (p) => {
     try {
       onProgress?.(p)
@@ -42,10 +47,16 @@ export async function runMatch({ useAi = true, onProgress } = {}) {
   const ai = useAi && isOpenRouterEnabled()
   emit({ phase: 'starting' })
 
-  const [bankTx, loans] = await Promise.all([getBankTransactions(), getLoanDiskDueRecords()])
+  const [allBankTx, loans] = await Promise.all([getBankTransactions(), getLoanDiskDueRecords()])
+
+  // Scope to the selected uploaded files, if any.
+  const scope =
+    Array.isArray(fileNames) && fileNames.length ? new Set(fileNames.map((f) => String(f))) : null
+  const bankTx = scope ? allBankTx.filter((t) => scope.has(String(t.FileName))) : allBankTx
+
   const groups = groupLoansByBorrower(loans)
   const index = buildBorrowerIndex(groups)
-  emit({ phase: 'loaded', bankTx: bankTx.length, loans: loans.length })
+  emit({ phase: 'loaded', bankTx: bankTx.length, loans: loans.length, scopedFiles: scope ? scope.size : 0 })
 
   // Stage 1 — deterministic classification for every transaction.
   const classified = bankTx.map((tx) => ({ tx, ...classify(tx, index) }))
