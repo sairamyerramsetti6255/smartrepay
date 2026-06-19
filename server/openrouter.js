@@ -25,14 +25,14 @@ Map the spreadsheet columns to this schema for EACH transaction row:
 - date: YYYY-MM-DD
 - payer: person or company who paid (use Beneficiary column if present)
 - description: transaction description
-- amount: numeric only (strip BSD, $, commas)
+- amount: numeric credit amount only — positive incoming payments (strip BSD, $, commas). Use Credit column when present; never use Debit column values.
 - reference: reference number or transaction id
 
 Headers: ${JSON.stringify(headers)}
 Sample rows: ${JSON.stringify(sampleRows.slice(0, 6))}
 
 Return ONLY a JSON array of objects with keys: date, payer, description, amount, reference.
-Skip header rows and empty rows. Credits only if Transaction Type column exists.`
+Skip header rows and empty rows. Include ONLY credit/incoming payment rows (amount > 0). Exclude debits, withdrawals, and negative amounts.`
 
   const res = await fetch(OPENROUTER_URL, {
     method: 'POST',

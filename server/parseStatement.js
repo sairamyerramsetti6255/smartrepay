@@ -7,14 +7,19 @@ const MAX_BYTES = 10 * 1024 * 1024
 const EXCEL_EXT = /\.(xlsx|xls|xlsm|csv)$/i
 
 const HEADER_ALIASES = {
-  date: ['date', 'transaction date', 'txn date', 'posting date', 'value date'],
+  date: ['date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date'],
   payer: [
     'payer', 'payor', 'name', 'customer', 'from', 'sender',
-    'beneficiary', 'remitter', 'originator', 'paid by', 'account name',
+    'beneficiary', 'remitter', 'originator', 'paid by', 'account name', 'employee',
   ],
   description: ['description', 'memo', 'narrative', 'details', 'particulars'],
-  amount: ['amount', 'value', 'debit', 'credit', 'payment'],
+  // Single amount column (signed or credits-only exports)
+  amount: ['amount', 'value', 'payment', 'transaction amount', 'txn amount'],
+  // Separate credit / debit columns (bank statements) — never treat debit as credit
+  credit: ['credit', 'credit amount', 'cr amount', 'deposit', 'deposits', 'money in'],
+  debit: ['debit', 'debit amount', 'dr amount', 'withdrawal', 'withdrawals', 'money out'],
   reference: ['reference', 'ref', 'reference no', 'reference number', 'transaction id', 'txn id'],
+  type: ['transaction type', 'type', 'txn type', 'dr/cr', 'cr/dr'],
 }
 
 function normalizeKey(key) {
@@ -56,8 +61,8 @@ function mapHeaders(rawRow) {
     normalized[normalizeKey(key)] = val
   }
   const mapped = {}
-  for (const col of ['date', 'payer', 'description', 'amount', 'reference']) {
-    const aliases = HEADER_ALIASES[col]
+  for (const col of ['date', 'payer', 'description', 'amount', 'credit', 'debit', 'reference', 'type']) {
+    const aliases = HEADER_ALIASES[col] || [col]
     const found = aliases.find((a) => normalized[a] !== undefined)
     if (found) mapped[col] = normalized[found]
     else if (normalized[col] !== undefined) mapped[col] = normalized[col]
@@ -65,19 +70,66 @@ function mapHeaders(rawRow) {
   return mapped
 }
 
+/** True = credit, false = debit, null = unknown / not specified. */
+function creditTypeVerdict(typeRaw) {
+  const type = String(typeRaw ?? '').trim().toLowerCase()
+  if (!type) return null
+  if (type === 'credit' || type === 'cr' || type === 'c' || /\bcredit\b/.test(type)) return true
+  if (type === 'debit' || type === 'dr' || type === 'd' || /\bdebit\b/.test(type)) return false
+  return null
+}
+
+/**
+ * Resolve the credited amount for one spreadsheet row.
+ * Returns a positive number for credits, or null to skip (debits / zero / invalid).
+ */
+function extractCreditAmount(mapped) {
+  const typeVerdict = creditTypeVerdict(mapped.type)
+  if (typeVerdict === false) return null
+
+  const creditAmt = parseAmount(mapped.credit)
+  if (!isNaN(creditAmt) && creditAmt > 0) return creditAmt
+
+  const debitAmt = parseAmount(mapped.debit)
+  const hasDebit = !isNaN(debitAmt) && Math.abs(debitAmt) > 0
+
+  const singleAmt = parseAmount(mapped.amount)
+  const hasSingle = !isNaN(singleAmt) && singleAmt !== 0
+
+  // Row has a debit column value but no credit — skip (withdrawal / payment out)
+  if (hasDebit && !hasSingle && (isNaN(creditAmt) || creditAmt <= 0)) return null
+
+  if (hasSingle) {
+    // Signed amount column: positive = credit, negative = debit
+    if (singleAmt > 0) {
+      if (typeVerdict === true || typeVerdict === null) return singleAmt
+      return null
+    }
+    return null
+  }
+
+  // Type explicitly says credit but amount missing
+  return null
+}
+
 function normalizeRows(rawRows) {
-  return rawRows
-    .filter((row) => !isEmptyRow(row))
-    .map(mapHeaders)
-    .filter((r) => r.date != null && r.date !== '' && r.amount != null && r.amount !== '')
-    .map((r) => ({
-      date: normalizeDate(r.date),
-      payer: String(r.payer ?? '').trim(),
-      description: String(r.description ?? r.payer ?? '').trim(),
-      amount: parseAmount(r.amount),
-      reference: String(r.reference ?? '').trim(),
-    }))
-    .filter((r) => !isNaN(r.amount) && r.amount !== 0)
+  const out = []
+  for (const rawRow of rawRows) {
+    if (isEmptyRow(rawRow)) continue
+    const m = mapHeaders(rawRow)
+    const amount = extractCreditAmount(m)
+    if (amount == null) continue
+    const date = normalizeDate(m.date)
+    if (!date) continue
+    out.push({
+      date,
+      payer: String(m.payer ?? '').trim(),
+      description: String(m.description ?? m.payer ?? '').trim(),
+      amount,
+      reference: String(m.reference ?? '').trim(),
+    })
+  }
+  return out
 }
 
 function getColumnKeys(rawRows) {
@@ -89,22 +141,20 @@ const REQUIRED_COLUMNS = ['date', 'payer', 'amount']
 
 function missingColumns(keys) {
   return REQUIRED_COLUMNS.filter((col) => {
+    if (col === 'amount') {
+      const amountOrCredit = [...HEADER_ALIASES.amount, ...HEADER_ALIASES.credit]
+      return !amountOrCredit.some((a) => keys.includes(a)) && !keys.includes('amount') && !keys.includes('credit')
+    }
     const aliases = HEADER_ALIASES[col]
     return !aliases.some((a) => keys.includes(a)) && !keys.includes(col)
   })
 }
 
 function filterCreditRows(rawRows) {
-  const keys = getColumnKeys(rawRows)
-  const typeKey = keys.find((k) => ['transaction type', 'type', 'txn type', 'dr/cr'].includes(k))
-  if (!typeKey) return rawRows
   return rawRows.filter((row) => {
-    const normalized = {}
-    for (const [key, val] of Object.entries(row)) {
-      normalized[normalizeKey(key)] = val
-    }
-    const type = String(normalized[typeKey] || '').trim().toLowerCase()
-    return !type || type === 'credit' || type === 'cr'
+    if (isEmptyRow(row)) return false
+    const m = mapHeaders(row)
+    return extractCreditAmount(m) != null
   })
 }
 
@@ -176,7 +226,7 @@ export async function parseStatementBuffer(buffer, filename) {
     throw new Error(`Missing columns: ${missing.join(', ')}. Found: ${keys.join(', ')}`)
   }
 
-  if (!rows.length) throw new Error('No valid transactions found in file')
+  if (!rows.length) throw new Error('No credit transactions found in file (debits are excluded)')
 
   return {
     method,

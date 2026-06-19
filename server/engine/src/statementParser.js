@@ -315,9 +315,11 @@ const HEADER_ALIASES = {
   date: ['date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date'],
   payer: ['payer', 'payor', 'name', 'customer', 'from', 'sender', 'beneficiary', 'remitter', 'originator', 'paid by', 'account name', 'employee'],
   description: ['description', 'memo', 'narrative', 'details', 'particulars'],
-  amount: ['amount', 'value', 'credit', 'payment', 'credit amount'],
+  amount: ['amount', 'value', 'payment', 'transaction amount', 'txn amount'],
+  credit: ['credit', 'credit amount', 'cr amount', 'deposit', 'deposits', 'money in'],
+  debit: ['debit', 'debit amount', 'dr amount', 'withdrawal', 'withdrawals', 'money out'],
   reference: ['reference', 'ref', 'reference no', 'reference number', 'transaction id', 'txn id'],
-  type: ['transaction type', 'type', 'txn type', 'dr/cr'],
+  type: ['transaction type', 'type', 'txn type', 'dr/cr', 'cr/dr'],
 }
 
 function normalizeKey(key) {
@@ -375,18 +377,47 @@ function parseDelimitedText(text) {
   })
 }
 
+function creditTypeVerdict(typeRaw) {
+  const type = String(typeRaw ?? '').trim().toLowerCase()
+  if (!type) return null
+  if (type === 'credit' || type === 'cr' || type === 'c' || /\bcredit\b/.test(type)) return true
+  if (type === 'debit' || type === 'dr' || type === 'd' || /\bdebit\b/.test(type)) return false
+  return null
+}
+
+function extractCreditAmount(mapped) {
+  const typeVerdict = creditTypeVerdict(mapped.type)
+  if (typeVerdict === false) return null
+
+  const creditAmt = parseAmount(mapped.credit)
+  if (!isNaN(creditAmt) && creditAmt > 0) return creditAmt
+
+  const debitAmt = parseAmount(mapped.debit)
+  const hasDebit = !isNaN(debitAmt) && Math.abs(debitAmt) > 0
+
+  const singleAmt = parseAmount(mapped.amount)
+  const hasSingle = !isNaN(singleAmt) && singleAmt !== 0
+
+  if (hasDebit && !hasSingle && (isNaN(creditAmt) || creditAmt <= 0)) return null
+
+  if (hasSingle) {
+    if (singleAmt > 0 && (typeVerdict === true || typeVerdict === null)) return singleAmt
+    return null
+  }
+
+  return null
+}
+
 function parseColumnar(rawRows, fileName) {
   const cleaned = rawRows.filter((r) => !isEmptyRow(r)).map((r) => ({ raw: r, m: mapHeaders(r) }))
   const isBankish = cleaned.some(({ m }) =>
-    /BSD|Direct Credit|Cash Deposit/i.test(`${m.amount ?? ''} ${m.description ?? ''}`))
+    /BSD|Direct Credit|Cash Deposit/i.test(`${m.amount ?? ''} ${m.description ?? ''} ${m.credit ?? ''}`))
   const employerOrBank = isBankish ? 'Bank of The Bahamas' : (employerFromFilename(fileName) || 'Bank Statement')
 
   const out = []
   for (const { m } of cleaned) {
-    const type = String(m.type ?? '').trim().toLowerCase()
-    if (type && type !== 'credit' && type !== 'cr') continue // credits only
-    const amount = parseAmount(m.amount)
-    if (isNaN(amount) || amount === 0) continue
+    const amount = extractCreditAmount(m)
+    if (amount == null) continue
     const date = excelDate(m.date)
     if (!date) continue
     const description = String(m.description ?? '').trim()
