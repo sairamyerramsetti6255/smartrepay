@@ -374,9 +374,10 @@ app.post('/api/sql/match/run', authMiddleware, (req, res) => {
   }
 
   const useAi = req.body?.useAi !== false
+  const runToken = new Date().toISOString()
   Object.assign(sqlMatchJob, {
     status: 'running',
-    startedAt: new Date().toISOString(),
+    startedAt: runToken,
     finishedAt: null,
     useAi,
     progress: { phase: 'starting', done: 0, total: 0 },
@@ -384,24 +385,44 @@ app.post('/api/sql/match/run', authMiddleware, (req, res) => {
     error: null,
   })
 
+  // Watchdog: guarantee the job always reaches a terminal state so the UI loader
+  // can never spin forever (e.g. if a DB / OpenRouter call hangs). Only trips if
+  // THIS run is still in flight (startedAt unchanged).
+  const MATCH_TIMEOUT_MS = Number(process.env.MATCH_JOB_TIMEOUT_MS) || 8 * 60 * 1000
+  const watchdog = setTimeout(() => {
+    if (sqlMatchJob.status === 'running' && sqlMatchJob.startedAt === runToken) {
+      sqlMatchJob.status = 'error'
+      sqlMatchJob.error = 'Matching timed out — please try again'
+      sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), phase: 'done' }
+      sqlMatchJob.finishedAt = new Date().toISOString()
+    }
+  }, MATCH_TIMEOUT_MS)
+  if (typeof watchdog.unref === 'function') watchdog.unref()
+
   // Fire-and-forget: the client polls /api/sql/match/status for progress.
   runMatch({
     useAi,
     onProgress: (p) => {
+      // Ignore progress from a superseded run.
+      if (sqlMatchJob.startedAt !== runToken) return
       sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), ...p }
     },
   })
     .then((summary) => {
+      if (sqlMatchJob.startedAt !== runToken) return
       sqlMatchJob.summary = summary
       sqlMatchJob.status = 'done'
       sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), phase: 'done' }
       sqlMatchJob.finishedAt = new Date().toISOString()
     })
     .catch((e) => {
+      if (sqlMatchJob.startedAt !== runToken) return
       sqlMatchJob.status = 'error'
       sqlMatchJob.error = e.message
+      sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), phase: 'done' }
       sqlMatchJob.finishedAt = new Date().toISOString()
     })
+    .finally(() => clearTimeout(watchdog))
 
   res.json({
     status: 'started',

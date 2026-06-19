@@ -72,13 +72,27 @@ export async function runMatch({ useAi = true, onProgress } = {}) {
   let aiOk = 0
   let aiFail = 0
   if (aiTargets.length) {
+    // Cap the whole AI phase so a rate-limited free model can't keep the run
+    // (and the UI loader) alive for minutes. Once past the deadline, remaining
+    // ties keep their deterministic verdict.
+    const aiDeadline = Date.now() + config.openrouter.aiPhaseMaxMs
     await mapWithConcurrency(
       aiTargets,
       config.openrouter.concurrency,
       async (item) => {
+        if (Date.now() > aiDeadline) {
+          item.record.reasoning = `[AI skipped: time budget exhausted] ${item.record.reasoning || ''}`.slice(0, 1000)
+          aiFail++
+          return
+        }
         const { system, user } = buildMatchPrompt(item.tx, item.candidates)
         try {
-          const res = await chatJson({ system, user })
+          const res = await chatJson({
+            system,
+            user,
+            retries: config.openrouter.aiCallRetries,
+            timeoutMs: config.openrouter.aiCallTimeoutMs,
+          })
           item.record = applyAi(item.tx, item.candidates, res)
           aiOk++
         } catch (e) {

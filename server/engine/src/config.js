@@ -99,6 +99,14 @@ export const config = {
     // Token budget for the answer. Reasoning models spend tokens "thinking"
     // before the JSON, so keep enough headroom or responses get truncated.
     maxTokens: Math.max(256, optionalNumber('OPENROUTER_MAX_TOKENS', 800)),
+    // Per-AI-call budget during matching. Free models get rate-limited (429),
+    // so fail fast and fall back to the deterministic result instead of spinning
+    // for minutes — keeps the "Run Matching" loader from hanging.
+    aiCallRetries: Math.max(0, optionalNumber('OPENROUTER_AI_CALL_RETRIES', 1)),
+    aiCallTimeoutMs: Math.max(5_000, optionalNumber('OPENROUTER_AI_CALL_TIMEOUT_MS', 20_000)),
+    // Hard ceiling on the whole AI adjudication phase. Once exceeded, remaining
+    // ambiguous ties keep their deterministic verdict so the run finishes.
+    aiPhaseMaxMs: Math.max(10_000, optionalNumber('OPENROUTER_AI_PHASE_MAX_MS', 120_000)),
   },
   port: optionalNumber('PORT', 4000),
 }
