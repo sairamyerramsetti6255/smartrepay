@@ -1,5 +1,11 @@
 import * as XLSX from 'xlsx'
 import { PDFParse } from 'pdf-parse'
+import {
+  extractNameFromParticulars,
+  parsePipeParticulars,
+} from '../../particularsParse.js'
+
+export { extractNameFromParticulars, parsePipeParticulars } from '../../particularsParse.js'
 
 /**
  * Unified statement parser for client-uploaded transaction files.
@@ -70,13 +76,6 @@ function normalizeBankDate(val) {
     return padDate(parseInt(year, 10), parseInt(m, 10), parseInt(d, 10))
   }
   return parseSlashDate(val) || String(val).trim()
-}
-
-/** Borrower name is the text after the last `|` in the particulars. */
-export function extractNameFromParticulars(particulars) {
-  const idx = String(particulars || '').lastIndexOf('|')
-  if (idx < 0) return ''
-  return particulars.slice(idx + 1).trim().replace(/\s+/g, ' ')
 }
 
 // --------------------------------------------------------------- type detection

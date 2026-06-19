@@ -1,4 +1,5 @@
 import { nameTokens, scoreNameMatch, normalizeNameKey } from './nameMatch.js'
+import { resolveParticularsFields } from '../../particularsParse.js'
 
 /**
  * Reconciliation engine that matches a bank/payroll credit (a deposit) to the
@@ -81,6 +82,56 @@ export function findCandidateBorrowers(bankName, index, limit = 5) {
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
+}
+
+/** Parse staged transaction fields into description (before |) + borrower name (after |). */
+export function parseTxParticulars(tx) {
+  return resolveParticularsFields({
+    particulars: tx.Particulars,
+    borrowerName: tx.BorrowerName,
+  })
+}
+
+/**
+ * Merge name + description candidate lists. For each borrower group keep the
+ * best score from either field, and note which text matched.
+ */
+export function mergeNameDescriptionCandidates(nameCandidates, descCandidates, limit = 8) {
+  const map = new Map()
+  for (const c of nameCandidates) {
+    map.set(c.group.key, { ...c, matchedFrom: 'name' })
+  }
+  for (const c of descCandidates) {
+    const prev = map.get(c.group.key)
+    if (!prev || c.score > prev.score) {
+      map.set(c.group.key, { ...c, matchedFrom: 'description' })
+    } else if (prev && c.score === prev.score && prev.matchedFrom !== 'description') {
+      map.set(c.group.key, { ...prev, matchedFrom: 'both' })
+    }
+  }
+  return [...map.values()].sort((a, b) => b.score - a.score).slice(0, limit)
+}
+
+/** If the transaction description mentions a loan number, return that borrower's group. */
+export function findLoanNumberHints(description, groups, limit = 3) {
+  const desc = String(description || '').toLowerCase()
+  if (!desc.trim()) return []
+  const hints = []
+  for (const g of groups.values()) {
+    for (const loan of g.loans) {
+      const num = String(loan.loanNumber || '').trim()
+      if (num.length >= 4 && desc.includes(num.toLowerCase())) {
+        hints.push({
+          group: g,
+          score: 92,
+          nameKind: 'loan_in_description',
+          matchedFrom: 'loan_number',
+          hintedLoanNumber: loan.loanNumber,
+        })
+      }
+    }
+  }
+  return hints.sort((a, b) => b.score - a.score).slice(0, limit)
 }
 
 // --- amount reconciliation (subset-sum) -------------------------------------
@@ -216,10 +267,12 @@ function emiOfLoans(group, loanNumbers) {
 
 function unmatchedRecord(tx, candidates) {
   const top = candidates[0]
+  const { borrowerName, description } = parseTxParticulars(tx)
+  const label = description ? `description "${description}"` : `name "${borrowerName || tx.BorrowerName}"`
   return {
     bankTransactionId: tx.Id,
     fileName: tx.FileName,
-    bankBorrowerName: tx.BorrowerName,
+    bankBorrowerName: borrowerName || tx.BorrowerName,
     loanDiskBorrowerName: top ? top.group.borrowerName : null,
     borrowerId: top ? top.group.borrowerId : null,
     loanNumber: null,
@@ -235,7 +288,9 @@ function unmatchedRecord(tx, candidates) {
     confidenceScore: top ? Math.round(0.45 * top.score) : 0,
     matchMethod: 'deterministic',
     reviewStatus: 'unmatched',
-    reasoning: top ? `Closest name "${top.group.borrowerName}" scored ${top.score} (< ${NAME_MIN}).` : 'No borrower name candidate found.',
+    reasoning: top
+      ? `Closest match for ${label} → "${top.group.borrowerName}" scored ${top.score} (< ${NAME_MIN}).`
+      : `No borrower candidate found for ${label}.`,
   }
 }
 
@@ -258,10 +313,33 @@ function scoreCandidate(cand, recon) {
  * separated by which one's EMI the deposit actually pays, with no AI needed.
  */
 export function classify(tx, index) {
-  if (!tx.BorrowerName) {
+  const { borrowerName, description, full } = parseTxParticulars(tx)
+  if (!borrowerName && !description) {
     return { record: unmatchedRecord(tx, []), needsAi: false, candidates: [] }
   }
-  const candidates = findCandidateBorrowers(tx.BorrowerName, index)
+
+  const nameCandidates = borrowerName ? findCandidateBorrowers(borrowerName, index) : []
+  const descCandidates =
+    description && normalizeNameKey(description) !== normalizeNameKey(borrowerName)
+      ? findCandidateBorrowers(description, index)
+      : []
+
+  const groups = new Map()
+  for (const list of index.values()) {
+    for (const g of list) groups.set(g.key, g)
+  }
+  const loanHints = findLoanNumberHints(description, groups)
+
+  let candidates = mergeNameDescriptionCandidates(nameCandidates, descCandidates)
+  for (const hint of loanHints) {
+    const prev = candidates.find((c) => c.group.key === hint.group.key)
+    if (!prev || hint.score > prev.score) {
+      candidates = candidates.filter((c) => c.group.key !== hint.group.key)
+      candidates.push(hint)
+      candidates.sort((a, b) => b.score - a.score)
+    }
+  }
+
   const viable = candidates.filter((c) => c.score >= NAME_MIN)
 
   if (!viable.length) {
@@ -270,7 +348,12 @@ export function classify(tx, index) {
 
   // Score each viable borrower by name + their own amount reconciliation.
   const scored = viable
-    .map((cand) => scoreCandidate(cand, reconcileAmount(tx.EmiPaidAmount, cand.group.loans)))
+    .map((cand) => {
+      const loanScope = cand.hintedLoanNumber
+        ? cand.group.loans.filter((l) => String(l.loanNumber) === String(cand.hintedLoanNumber))
+        : cand.group.loans
+      return scoreCandidate(cand, reconcileAmount(tx.EmiPaidAmount, loanScope.length ? loanScope : cand.group.loans))
+    })
     .sort(
       (a, b) =>
         b.confidence - a.confidence || b.amtComp - a.amtComp || b.cand.score - a.cand.score
@@ -296,7 +379,7 @@ export function classify(tx, index) {
   const record = {
     bankTransactionId: tx.Id,
     fileName: tx.FileName,
-    bankBorrowerName: tx.BorrowerName,
+    bankBorrowerName: borrowerName || tx.BorrowerName,
     loanDiskBorrowerName: top.group.borrowerName,
     borrowerId: top.group.borrowerId,
     loanNumber: recon.loanNumbers[0] || null,
@@ -312,7 +395,7 @@ export function classify(tx, index) {
     confidenceScore: confidence,
     matchMethod: 'deterministic',
     reviewStatus: reviewStatusFor(confidence, true),
-    reasoning: buildDeterministicReason(top, recon, ambiguous),
+    reasoning: buildDeterministicReason(top, recon, ambiguous, { borrowerName, description }),
   }
 
   // Escalate to the LLM ONLY when the amount could NOT break a genuine name tie.
@@ -321,9 +404,22 @@ export function classify(tx, index) {
   return { record, needsAi, candidates }
 }
 
-function buildDeterministicReason(top, recon, ambiguousName) {
+function buildDeterministicReason(top, recon, ambiguousName, fields = {}) {
   const freq = recon.frequency && recon.frequency !== 'monthly' ? ` (${recon.frequency} installment)` : ''
-  const bits = [`name ${top.nameKind || 'match'} ~${top.score}% vs "${top.group.borrowerName}"`]
+  const matchedVia =
+    top.matchedFrom === 'description'
+      ? 'matched via transaction description'
+      : top.matchedFrom === 'loan_number'
+        ? `loan #${top.hintedLoanNumber} found in description`
+        : top.matchedFrom === 'both'
+          ? 'matched via name and description'
+          : 'matched via payer name'
+  const bits = [
+    `${matchedVia}; ${top.nameKind || 'name match'} ~${top.score}% vs "${top.group.borrowerName}"`,
+  ]
+  if (fields.description && top.matchedFrom !== 'name') {
+    bits.push(`description "${fields.description}"`)
+  }
   if (recon.kind === 'exact_single') bits.push(`amount matches one EMI${freq}`)
   else if (recon.kind === 'sum_all') bits.push(`amount = sum of all ${recon.loanNumbers.length} EMIs${freq}`)
   else if (recon.kind === 'subset') bits.push(`amount = sum of ${recon.loanNumbers.length} EMIs${freq}`)
@@ -341,6 +437,7 @@ export const MATCH_SYSTEM_PROMPT = [
   'You match ONE incoming bank/payroll CREDIT (money received from a borrower) to the correct borrower and loan(s) recorded in the lender\'s system (LoanDisk due records).',
   '',
   'NAME MATCHING:',
+  '- Bank particulars are often "transaction description | payer name". Match using BOTH the payer name (after |) AND the transaction description (before |).',
   '- Match on the borrower\'s FIRST and LAST name. Consider every combination: first+last (same order), last+first (reversed, e.g. "Russell, Calvin" == "Calvin Russell"), last name only, and first name only.',
   '- Allow minor typos / spelling mistakes, middle names or initials, abbreviations, case, punctuation and titles (Mr/Mrs).',
   '- The name must clearly identify ONE person. Each candidate includes "matchedBy" and "nameScore" from a pre-filter — use them as a guide but apply your own judgement.',
@@ -359,8 +456,10 @@ export const MATCH_SYSTEM_PROMPT = [
 
 /** Build the user prompt for one deposit + its candidate borrowers. */
 export function buildMatchPrompt(tx, candidates) {
+  const { borrowerName, description } = parseTxParticulars(tx)
   const deposit = {
-    name: tx.BorrowerName || '',
+    payerName: borrowerName || tx.BorrowerName || '',
+    transactionDescription: description || '',
     amount: tx.EmiPaidAmount ?? null,
     date: tx.TransDate ? new Date(tx.TransDate).toISOString().slice(0, 10) : null,
     particulars: tx.Particulars || '',
@@ -436,7 +535,7 @@ export function applyAi(tx, candidates, ai) {
   return {
     bankTransactionId: tx.Id,
     fileName: tx.FileName,
-    bankBorrowerName: tx.BorrowerName,
+    bankBorrowerName: parseTxParticulars(tx).borrowerName || tx.BorrowerName,
     loanDiskBorrowerName: chosen.group.borrowerName,
     borrowerId: chosen.group.borrowerId,
     loanNumber: finalLoans[0] || null,

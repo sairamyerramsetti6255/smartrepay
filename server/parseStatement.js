@@ -2,6 +2,7 @@ import * as XLSX from 'xlsx'
 import { createHash } from 'crypto'
 import { extractWithAI } from './openrouter.js'
 import { parsePdfBuffer } from './parsePdfStatement.js'
+import { parsePipeParticulars } from './particularsParse.js'
 
 const MAX_BYTES = 10 * 1024 * 1024
 const EXCEL_EXT = /\.(xlsx|xls|xlsm|csv)$/i
@@ -121,10 +122,14 @@ function normalizeRows(rawRows) {
     if (amount == null) continue
     const date = normalizeDate(m.date)
     if (!date) continue
+    const descriptionRaw = String(m.description ?? '').trim()
+    const parsed = parsePipeParticulars(descriptionRaw)
+    const payer = String(m.payer ?? parsed.borrowerName ?? '').trim()
     out.push({
       date,
-      payer: String(m.payer ?? '').trim(),
-      description: String(m.description ?? m.payer ?? '').trim(),
+      payer: payer || parsed.borrowerName,
+      description: parsed.full || descriptionRaw || payer,
+      transactionDescription: parsed.description || descriptionRaw,
       amount,
       reference: String(m.reference ?? '').trim(),
     })

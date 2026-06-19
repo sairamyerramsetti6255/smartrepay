@@ -1,4 +1,5 @@
 import { PDFParse } from 'pdf-parse'
+import { extractNameFromParticulars, parsePipeParticulars } from './particularsParse.js'
 
 const SKIP_PARTICULARS = /balance (brought|carried) forward/i
 const BANK_MARKERS = /Date Posted|Detailed Client Statement|Cheque No\.\s*\/\s*Reference/i
@@ -56,11 +57,6 @@ function normalizeBankDate(val) {
   return String(val).trim()
 }
 
-function extractNameFromParticulars(particulars) {
-  const idx = particulars.lastIndexOf('|')
-  if (idx < 0) return ''
-  return particulars.slice(idx + 1).trim().replace(/\s+/g, ' ')
-}
 
 function detectPdfType(text, filename) {
   if (BANK_MARKERS.test(text) || /^\d{1,2}\/\d{1,2}\/\d{2}\s+\d{1,2}\/\d{1,2}\/\d{2}/m.test(text)) {
@@ -340,18 +336,22 @@ function filterBankCredits(rows) {
 }
 
 function toBankImportRows(creditRows) {
-  return creditRows.map((r) => ({
-    datePosted: r.datePosted,
-    valueDate: r.valueDate,
-    reference: r.reference,
-    particulars: r.particulars,
-    creditAmount: r.creditAmount,
-    name: r.name,
-    date: r.valueDate,
-    payer: r.name || r.particulars.split('|').pop()?.trim() || r.particulars,
-    description: r.particulars,
-    amount: r.creditAmount,
-  }))
+  return creditRows.map((r) => {
+    const parsed = parsePipeParticulars(r.particulars)
+    return {
+      datePosted: r.datePosted,
+      valueDate: r.valueDate,
+      reference: r.reference,
+      particulars: r.particulars,
+      creditAmount: r.creditAmount,
+      name: r.name || parsed.borrowerName,
+      date: r.valueDate,
+      payer: r.name || parsed.borrowerName,
+      transactionDescription: parsed.description,
+      description: r.particulars,
+      amount: r.creditAmount,
+    }
+  })
 }
 
 export async function parsePdfBuffer(buffer, filename = 'statement.pdf') {

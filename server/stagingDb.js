@@ -1,5 +1,6 @@
 import path from 'path'
 import { crif } from './crifClient.js'
+import { resolveParticularsFields } from './particularsParse.js'
 
 /**
  * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations over HTTP
@@ -140,8 +141,12 @@ export async function insertBankTransactions(records, { fileName, uploadedDate }
 
   // Build prepared rows (proc JSON shape) + their dedup signatures.
   const prepared = rows.map((r) => {
-    const borrowerName = r.borrowerName || r.name || r.payer || null
     const particulars = (r.particulars || r.description || '') || null
+    const parsed = resolveParticularsFields({
+      particulars,
+      borrowerName: r.borrowerName || r.name || r.payer,
+    })
+    const borrowerName = parsed.borrowerName || null
     const sourceType = r.sourceType || r.documentType || (r.employer ? 'employer' : 'bank')
     const employerOrBank =
       r.employerOrBank || r.employer || (sourceType === 'bank' ? r.bank || null : null)
@@ -212,10 +217,21 @@ export async function getActiveLoans({ search = '', limit = 10000 } = {}) {
 /** Staged bank/payroll credit transactions (for the Upload Documents grid). */
 export async function getBankTransactions({ search = '' } = {}) {
   const rows = await execCrif('{}', 'Get_BankTransactions')
+  const shaped = rows.map((r) => {
+    const parsed = resolveParticularsFields({
+      particulars: r.Particulars,
+      borrowerName: r.BorrowerName,
+    })
+    return {
+      ...r,
+      TransactionDescription: parsed.description || null,
+      BorrowerName: parsed.borrowerName || r.BorrowerName || null,
+    }
+  })
   const q = String(search || '').trim().toLowerCase()
-  if (!q) return rows
-  return rows.filter((r) =>
-    [r.BorrowerName, r.FileName, r.EmployerOrBank, r.ReferenceNo]
+  if (!q) return shaped
+  return shaped.filter((r) =>
+    [r.BorrowerName, r.TransactionDescription, r.Particulars, r.FileName, r.EmployerOrBank, r.ReferenceNo]
       .some((v) => String(v ?? '').toLowerCase().includes(q))
   )
 }
@@ -229,11 +245,16 @@ function reviewStatusToUi(rs) {
 }
 
 function shapeMatchRow(r) {
+  const parsed = resolveParticularsFields({
+    particulars: r.Particulars,
+    borrowerName: r.BorrowerName,
+  })
   return {
     id: String(r.Id),
     bank_transaction_id: r.Id,
     date: r.TransDate,
-    payer: r.BorrowerName,
+    payer: parsed.borrowerName || r.BorrowerName || null,
+    transaction_description: parsed.description || null,
     amount: r.EmiPaidAmount != null ? Number(r.EmiPaidAmount) : null,
     reference: r.ReferenceNo,
     description: r.Particulars,
