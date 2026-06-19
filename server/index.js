@@ -36,6 +36,8 @@ import {
   getLoansByBorrowerId,
   saveManualReceipt,
   getManualReceipts,
+  searchBorrowersForReceipts,
+  getLoanRepayments,
 } from './stagingDb.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
@@ -332,6 +334,15 @@ app.get('/api/staging/summary', authMiddleware, async (_req, res) => {
 })
 
 // --- Manual receipt upload (walk-in / WhatsApp / email / phone) ---
+app.get('/api/receipts/borrowers', authMiddleware, async (req, res) => {
+  try {
+    const borrowers = await searchBorrowersForReceipts({ search: req.query.search || '' })
+    res.json({ borrowers })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 app.get('/api/receipts/loans/:borrowerId', authMiddleware, async (req, res) => {
   try {
     const loans = await getLoansByBorrowerId(req.params.borrowerId)
@@ -347,6 +358,16 @@ app.get('/api/receipts', authMiddleware, async (_req, res) => {
     res.json({ rows })
   } catch (e) {
     res.status(500).json({ error: e.message })
+  }
+})
+
+// --- Repayment ledger for a single loan (synced + manual receipts) ---
+app.get('/api/loans/:loanNumber/repayments', authMiddleware, async (req, res) => {
+  try {
+    const data = await getLoanRepayments(req.params.loanNumber)
+    res.json(data)
+  } catch (e) {
+    res.status(500).json({ error: `Could not load repayments: ${e.message}` })
   }
 })
 

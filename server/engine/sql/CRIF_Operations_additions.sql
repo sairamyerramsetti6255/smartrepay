@@ -262,34 +262,54 @@
 			ReceiptFileName NVARCHAR(260), ReceiptDocumentId VARCHAR(36), EnteredBy NVARCHAR(255)
 		);
 
+		-- Persist the receipt to staging (this is the source of truth for the repayment history UI)
+		DECLARE @insertedReceipts TABLE (
+			Id INT, LoanNumber NVARCHAR(100), BranchId VARCHAR(50),
+			AmountReceived DECIMAL(18,2), Particulars NVARCHAR(500), SourceChannel VARCHAR(20),
+			EntryType VARCHAR(20), CollectedDate DATE, ReceiptFileName NVARCHAR(260)
+		);
+
 		INSERT INTO dbo.Staging_ManualReceipts (
 			BorrowerId, LoanNumber, BranchId, BorrowerFullName, AmountReceived, Particulars,
 			SourceChannel, EntryType, CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy
 		)
+		OUTPUT inserted.Id, inserted.LoanNumber, inserted.BranchId, inserted.AmountReceived,
+			inserted.Particulars, inserted.SourceChannel, inserted.EntryType,
+			inserted.CollectedDate, inserted.ReceiptFileName
+			INTO @insertedReceipts (Id, LoanNumber, BranchId, AmountReceived, Particulars,
+				SourceChannel, EntryType, CollectedDate, ReceiptFileName)
 		SELECT
 			BorrowerId, LoanNumber, BranchId, BorrowerFullName, AmountReceived, Particulars,
 			SourceChannel, ISNULL(EntryType, 'manual'), CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy
 		FROM @mr;
 
+		-- Best-effort mirror into the loan repayment ledger. Wrapped so a schema
+		-- mismatch can never fail the receipt save (staging already holds the row).
 		IF COL_LENGTH('dbo.SILloanrepayments', 'ReceiptSource') IS NOT NULL
 		BEGIN
-			INSERT INTO dbo.SILloanrepayments (
-				LoanId, BranchId, RepaymentAmount, RepaymentCollectedDate,
-				RepaymentDescription, RepaymentMethodId, EntryType, ReceiptSource, Particulars, ReceiptFileName
-			)
-			SELECT
-				TRY_CAST(m.LoanNumber AS INT),
-				m.BranchId,
-				m.AmountReceived,
-				m.CollectedDate,
-				m.Particulars,
-				'manual',
-				ISNULL(m.EntryType, 'manual'),
-				m.SourceChannel,
-				m.Particulars,
-				m.ReceiptFileName
-			FROM @mr m
-			WHERE TRY_CAST(m.LoanNumber AS INT) IS NOT NULL;
+			BEGIN TRY
+				INSERT INTO dbo.SILloanrepayments (
+					RepaymentId, LoanId, BranchId, RepaymentAmount, RepaymentCollectedDate,
+					RepaymentDescription, RepaymentMethodId, EntryType, ReceiptSource, Particulars, ReceiptFileName
+				)
+				SELECT
+					900000000000000 + i.Id,                         -- synthetic, collision-safe id for manual entries
+					TRY_CAST(i.LoanNumber AS BIGINT),
+					i.BranchId,
+					i.AmountReceived,
+					CONVERT(NVARCHAR(20), i.CollectedDate, 23),      -- store ISO yyyy-mm-dd
+					i.Particulars,
+					'manual',
+					ISNULL(i.EntryType, 'manual'),
+					i.SourceChannel,
+					i.Particulars,
+					i.ReceiptFileName
+				FROM @insertedReceipts i
+				WHERE TRY_CAST(i.LoanNumber AS BIGINT) IS NOT NULL;
+			END TRY
+			BEGIN CATCH
+				-- ignore: Staging_ManualReceipts remains the source of truth for the UI
+			END CATCH
 		END
 
 		SELECT 'True' AS Result, 'Saved' AS Message, (SELECT COUNT(*) FROM @mr) AS Inserted;
@@ -303,4 +323,70 @@
 			SourceChannel, EntryType, CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy, CreatedAt
 		FROM dbo.Staging_ManualReceipts
 		ORDER BY CreatedAt DESC, Id DESC;
+	END
+
+	-- Exec CRIF_Operations '{"LoanNumber":"100"}','Get_LoanRepayments',''
+	-- Unified repayment ledger for one loan: synced LoanDisk repayments + manual
+	-- receipts entered in SmartRepay. Manual rows always come from staging so a
+	-- newly uploaded receipt shows up immediately, even if the SILloanrepayments
+	-- mirror was skipped. Synced rows tagged 'manual' are excluded to avoid dupes.
+	ELSE IF (@Condition = 'Get_LoanRepayments')
+	BEGIN
+		DECLARE @lr_loan NVARCHAR(100) = JSON_VALUE(@Json, '$.LoanNumber');
+		DECLARE @lr_loanInt BIGINT = TRY_CAST(@lr_loan AS BIGINT);
+
+		SELECT 'True' AS Result, 'Details found' AS Message, x.*
+		FROM (
+			SELECT
+				CAST(r.SILRepaymentId AS NVARCHAR(50)) AS EntryId,
+				'loandisk' AS Source,
+				CAST(r.LoanId AS NVARCHAR(100)) AS LoanNumber,
+				r.BranchId,
+				r.BranchName,
+				TRY_CAST(r.RepaymentCollectedDate AS DATE) AS RepaymentDate,
+				r.RepaymentCollectedDate AS RepaymentDateRaw,
+				r.RepaymentAmount AS Amount,
+				r.PrincipalRepaymentAmount AS PrincipalAmount,
+				r.InterestRepaymentAmount AS InterestAmount,
+				r.FeesRepaymentAmount AS FeesAmount,
+				r.PenaltyRepaymentAmount AS PenaltyAmount,
+				r.RepaymentMethodId AS Method,
+				r.RepaymentDescription AS Description,
+				CAST(NULL AS VARCHAR(20)) AS SourceChannel,
+				CAST(NULL AS NVARCHAR(500)) AS Particulars,
+				CAST(NULL AS NVARCHAR(260)) AS ReceiptFileName,
+				CAST(NULL AS VARCHAR(36)) AS ReceiptDocumentId,
+				CAST(NULL AS NVARCHAR(255)) AS EnteredBy,
+				r.SyncedAt AS CreatedAt
+			FROM dbo.SILloanrepayments r
+			WHERE r.LoanId = @lr_loanInt
+			  AND (r.EntryType IS NULL OR r.EntryType <> 'manual')
+
+			UNION ALL
+
+			SELECT
+				CAST(mr.Id AS NVARCHAR(50)) AS EntryId,
+				'manual' AS Source,
+				mr.LoanNumber,
+				mr.BranchId,
+				CAST(NULL AS NVARCHAR(300)) AS BranchName,
+				TRY_CAST(mr.CollectedDate AS DATE) AS RepaymentDate,
+				CONVERT(NVARCHAR(20), mr.CollectedDate, 23) AS RepaymentDateRaw,
+				mr.AmountReceived AS Amount,
+				CAST(NULL AS DECIMAL(18,2)) AS PrincipalAmount,
+				CAST(NULL AS DECIMAL(18,2)) AS InterestAmount,
+				CAST(NULL AS DECIMAL(18,2)) AS FeesAmount,
+				CAST(NULL AS DECIMAL(18,2)) AS PenaltyAmount,
+				'manual' AS Method,
+				mr.Particulars AS Description,
+				mr.SourceChannel,
+				mr.Particulars,
+				mr.ReceiptFileName,
+				mr.ReceiptDocumentId,
+				mr.EnteredBy,
+				mr.CreatedAt
+			FROM dbo.Staging_ManualReceipts mr
+			WHERE mr.LoanNumber = @lr_loan
+		) x
+		ORDER BY x.RepaymentDate DESC, x.CreatedAt DESC;
 	END

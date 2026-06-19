@@ -7,10 +7,13 @@ import { closePool } from '../src/dataAccess.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-/** Run every .sql file in the sql/ folder (creates all staging tables). */
+/** Run staging DDL .sql files (excludes CRIF fragments — use apply-crif / apply-receipts-schema). */
 async function main() {
   const sqlDir = join(__dirname, '..', 'sql')
-  const files = readdirSync(sqlDir).filter((f) => f.toLowerCase().endsWith('.sql')).sort()
+  const skip = new Set(['CRIF_Operations_additions.sql', 'SILloanrepayments_receipt_source.sql'])
+  const files = readdirSync(sqlDir)
+    .filter((f) => f.toLowerCase().endsWith('.sql') && !skip.has(f))
+    .sort()
 
   const pool = await new sql.ConnectionPool({
     server: config.db.server,

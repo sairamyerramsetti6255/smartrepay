@@ -401,6 +401,34 @@ function fallbackLoansByBorrowerId(borrowerId) {
   )
 }
 
+/** Search borrowers by name (or ID) from active-loan staging — one row per borrower. */
+export async function searchBorrowersForReceipts({ search = '', limit = 30 } = {}) {
+  const q = String(search || '').trim()
+  if (q.length < 2) return []
+
+  const rows = await getActiveLoans({ search: q, limit: 10000 })
+  const map = new Map()
+
+  for (const r of rows) {
+    const id = String(r.BorrowerId ?? '').trim()
+    if (!id) continue
+    const name = String(r.BorrowerFullName || '').trim() || `Borrower ${id}`
+    if (!map.has(id)) {
+      map.set(id, {
+        borrowerId: id,
+        borrowerName: name,
+        branchName: r.BranchName ?? null,
+        loanCount: 0,
+      })
+    }
+    map.get(id).loanCount += 1
+  }
+
+  return [...map.values()]
+    .sort((a, b) => a.borrowerName.localeCompare(b.borrowerName))
+    .slice(0, Math.min(Number(limit) || 30, 50))
+}
+
 /** Active loans for a borrower (SILLoans via CRIF, staging fallback). */
 export async function getLoansByBorrowerId(borrowerId) {
   const id = String(borrowerId || '').trim()
@@ -448,6 +476,94 @@ export async function saveManualReceipt(payload) {
 
   const result = await execCrif([row], 'Save_ManualReceipt')
   return result[0] || { Inserted: 1 }
+}
+
+/**
+ * Unified repayment ledger for one loan: synced LoanDisk repayments + manual
+ * receipts entered in SmartRepay (newest first). Returns rows plus an analysis
+ * summary so the UI can render detailed analytics without a second round-trip.
+ */
+export async function getLoanRepayments(loanNumber) {
+  const loan = String(loanNumber || '').trim()
+  if (!loan) return { rows: [], summary: emptyRepaymentSummary() }
+
+  let raw = []
+  try {
+    raw = await execCrif({ LoanNumber: loan }, 'Get_LoanRepayments')
+  } catch {
+    raw = []
+  }
+
+  const rows = raw
+    .filter((r) => r.EntryId != null || r.Amount != null)
+    .map((r) => ({
+      entryId: r.EntryId != null ? String(r.EntryId) : null,
+      source: r.Source || 'loandisk',
+      loanNumber: r.LoanNumber != null ? String(r.LoanNumber) : loan,
+      branchId: r.BranchId ?? null,
+      branchName: r.BranchName ?? null,
+      date: r.RepaymentDate ?? r.RepaymentDateRaw ?? null,
+      amount: r.Amount != null ? Number(r.Amount) : null,
+      principalAmount: r.PrincipalAmount != null ? Number(r.PrincipalAmount) : null,
+      interestAmount: r.InterestAmount != null ? Number(r.InterestAmount) : null,
+      feesAmount: r.FeesAmount != null ? Number(r.FeesAmount) : null,
+      penaltyAmount: r.PenaltyAmount != null ? Number(r.PenaltyAmount) : null,
+      method: r.Method ?? null,
+      description: r.Description ?? null,
+      sourceChannel: r.SourceChannel ?? null,
+      particulars: r.Particulars ?? null,
+      receiptFileName: r.ReceiptFileName ?? null,
+      receiptDocumentId: r.ReceiptDocumentId ?? null,
+      enteredBy: r.EnteredBy ?? null,
+      createdAt: r.CreatedAt ?? null,
+    }))
+
+  return { rows, summary: summarizeRepayments(rows) }
+}
+
+function emptyRepaymentSummary() {
+  return {
+    totalPaid: 0,
+    paymentCount: 0,
+    manualCount: 0,
+    syncedCount: 0,
+    manualTotal: 0,
+    syncedTotal: 0,
+    principalPaid: 0,
+    interestPaid: 0,
+    feesPaid: 0,
+    penaltyPaid: 0,
+    firstPaymentDate: null,
+    lastPaymentDate: null,
+    averagePayment: 0,
+  }
+}
+
+function summarizeRepayments(rows) {
+  const s = emptyRepaymentSummary()
+  for (const r of rows) {
+    const amt = Number(r.amount) || 0
+    s.totalPaid += amt
+    s.paymentCount += 1
+    if (r.source === 'manual') {
+      s.manualCount += 1
+      s.manualTotal += amt
+    } else {
+      s.syncedCount += 1
+      s.syncedTotal += amt
+    }
+    s.principalPaid += Number(r.principalAmount) || 0
+    s.interestPaid += Number(r.interestAmount) || 0
+    s.feesPaid += Number(r.feesAmount) || 0
+    s.penaltyPaid += Number(r.penaltyAmount) || 0
+    const d = r.date ? String(r.date).slice(0, 10) : null
+    if (d) {
+      if (!s.firstPaymentDate || d < s.firstPaymentDate) s.firstPaymentDate = d
+      if (!s.lastPaymentDate || d > s.lastPaymentDate) s.lastPaymentDate = d
+    }
+  }
+  s.averagePayment = s.paymentCount ? Math.round((s.totalPaid / s.paymentCount) * 100) / 100 : 0
+  return s
 }
 
 /** List manual receipts (newest first). */
