@@ -1,11 +1,12 @@
 import * as XLSX from 'xlsx'
 import { createHash } from 'crypto'
-import { extractWithAI } from './openrouter.js'
+import { extractWithAI, extractFromImageWithAI } from './openrouter.js'
 import { parsePdfBuffer } from './parsePdfStatement.js'
 import { parsePipeParticulars } from './particularsParse.js'
 
 const MAX_BYTES = 10 * 1024 * 1024
 const EXCEL_EXT = /\.(xlsx|xls|xlsm|csv)$/i
+const IMAGE_EXT = /\.(png|jpe?g|webp)$/i
 
 const HEADER_ALIASES = {
   date: ['date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date'],
@@ -191,17 +192,62 @@ export function rowHash(row) {
   return createHash('sha256').update(`${row.date}|${row.payer}|${row.amount}|${row.reference}`).digest('hex')
 }
 
-export async function parseStatementBuffer(buffer, filename) {
+function enrichParsedRows(rows, { documentType, fileParticulars } = {}) {
+  const sourceType =
+    documentType === 'employer' ? 'employer' : documentType === 'bank' ? 'bank' : documentType || 'spreadsheet'
+  const employerLabel = fileParticulars?.trim() || null
+  return rows.map((r) => ({
+    ...r,
+    documentType: documentType || r.documentType || sourceType,
+    sourceType: r.sourceType || sourceType,
+    employerOrBank: r.employerOrBank || r.employer || employerLabel,
+    employer: r.employer || employerLabel,
+    fileParticulars: fileParticulars || null,
+  }))
+}
+
+export async function parseStatementBuffer(buffer, filename, options = {}) {
   if (buffer.length > MAX_BYTES) throw new Error('File exceeds 10MB limit')
 
+  const { documentType, fileParticulars } = options
+  const isImage = documentType === 'image' || IMAGE_EXT.test(filename)
+
+  if (isImage) {
+    const mimeType =
+      filename.toLowerCase().endsWith('.png')
+        ? 'image/png'
+        : filename.toLowerCase().endsWith('.webp')
+          ? 'image/webp'
+          : 'image/jpeg'
+    const aiRows = await extractFromImageWithAI(buffer, mimeType, { documentType, fileParticulars })
+    if (!aiRows.length) throw new Error('No repayment rows found in image')
+    const rows = enrichParsedRows(
+      aiRows.map((r) => ({ ...r, import_hash: rowHash(r) })),
+      { documentType: documentType || 'image', fileParticulars }
+    )
+    return {
+      method: 'ai',
+      source: documentType === 'employer' ? 'employer' : documentType || 'image',
+      documentType: documentType || 'image',
+      rawRows: aiRows.slice(0, 12),
+      creditRows: aiRows,
+      rows,
+    }
+  }
+
   if (/\.pdf$/i.test(filename)) {
-    const pdf = await parsePdfBuffer(buffer, filename)
+    const pdf = await parsePdfBuffer(buffer, filename, { documentType, fileParticulars })
+    const rows = enrichParsedRows(
+      pdf.rows.map((r) => ({ ...r, import_hash: rowHash(r) })),
+      { documentType: pdf.documentType || documentType, fileParticulars }
+    )
     return {
       method: pdf.method,
       source: pdf.source,
+      documentType: pdf.documentType || documentType,
       rawRows: pdf.creditRows.slice(0, 12),
       creditRows: pdf.creditRows,
-      rows: pdf.rows.map((r) => ({ ...r, import_hash: rowHash(r) })),
+      rows,
     }
   }
 
@@ -224,7 +270,7 @@ export async function parseStatementBuffer(buffer, filename) {
       .slice(1, 8)
       .map((r) => (Array.isArray(r) ? r : []))
 
-    rows = await extractWithAI(headerRow, dataSamples)
+    rows = await extractWithAI(headerRow, dataSamples, { documentType, fileParticulars })
     method = 'ai'
     cleaned = rows
   } else if (missing.length) {
@@ -233,9 +279,16 @@ export async function parseStatementBuffer(buffer, filename) {
 
   if (!rows.length) throw new Error('No credit transactions found in file (debits are excluded)')
 
+  const enriched = enrichParsedRows(
+    rows.map((r) => ({ ...r, import_hash: rowHash(r) })),
+    { documentType: documentType || 'spreadsheet', fileParticulars }
+  )
+
   return {
     method,
+    source: documentType === 'employer' ? 'employer' : 'spreadsheet',
+    documentType: documentType || 'spreadsheet',
     rawRows: cleaned.slice(0, 8),
-    rows: rows.map((r) => ({ ...r, import_hash: rowHash(r) })),
+    rows: enriched,
   }
 }

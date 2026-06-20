@@ -145,29 +145,42 @@ function isRemarkContinuation(line) {
 
 function parseEmployerAmountLine(line) {
   const parts = line.split('\t').map((s) => s.trim()).filter((s) => s !== '' && s !== '$')
-  if (parts.length < 2) return null
-
-  let amount = null
-  let amountIdx = -1
-  for (let i = 0; i < parts.length; i++) {
-    const n = parseAmount(parts[i])
-    if (!isNaN(n) && n > 0 && /[\d,]+\.\d{2}/.test(parts[i])) {
-      amount = n
-      amountIdx = i
-      break
+  if (parts.length >= 2) {
+    let amount = null
+    let amountIdx = -1
+    for (let i = 0; i < parts.length; i++) {
+      const n = parseAmount(parts[i])
+      if (!isNaN(n) && n > 0 && /[\d,]+\.\d{2}/.test(parts[i])) {
+        amount = n
+        amountIdx = i
+        break
+      }
+    }
+    if (amount !== null && amountIdx >= 1) {
+      const name = parts.slice(0, amountIdx).join(' ').trim()
+      if (name && !/^(name|amount)$/i.test(name)) {
+        const comments = parts.slice(amountIdx + 1).join(' ').trim()
+        return { name, amount, comments }
+      }
     }
   }
-  if (amount === null || amountIdx < 1) return null
 
-  const name = parts.slice(0, amountIdx).join(' ').trim()
-  if (!name || /^(name|amount)$/i.test(name)) return null
+  // Space-separated: "Employee Name 450.00 optional remarks"
+  const space = line.match(/^(.+?)\s+([\d,]+\.\d{2})\s*\$?\s*(.*)$/)
+  if (space) {
+    const name = space[1].trim()
+    if (name && name.length > 2 && !/^(name|amount|total|employee)$/i.test(name)) {
+      return { name, amount: parseAmount(space[2]), comments: space[3].trim() }
+    }
+  }
 
-  const comments = parts.slice(amountIdx + 1).join(' ').trim()
-  return { name, amount, comments }
+  return null
 }
 
-function parseEmployerStatement(text, filename) {
-  const { employer, statementDate } = extractEmployerMeta(text, filename)
+function parseEmployerStatement(text, filename, fileParticulars = '') {
+  const meta = extractEmployerMeta(text, filename)
+  const employer = String(fileParticulars || '').trim() || meta.employer
+  const statementDate = meta.statementDate
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
 
   const rows = []
@@ -354,41 +367,68 @@ function toBankImportRows(creditRows) {
   })
 }
 
-export async function parsePdfBuffer(buffer, filename = 'statement.pdf') {
+export async function parsePdfBuffer(buffer, filename = 'statement.pdf', options = {}) {
+  const { documentType, fileParticulars } = options
+  const forceEmployer = documentType === 'employer'
+  const forceBank = documentType === 'bank'
+
   const parser = new PDFParse({ data: buffer })
   try {
     const result = await parser.getText()
-    const docType = detectPdfType(result.text, filename)
+    const detected = detectPdfType(result.text, filename)
+    const tryEmployer = forceEmployer || (!forceBank && detected === 'employer')
 
-    if (docType === 'employer') {
-      const employerRows = parseEmployerStatement(result.text, filename)
-      if (!employerRows.length) {
-        throw new Error('No employee deductions found in employer statement PDF')
+    if (tryEmployer) {
+      const employerRows = parseEmployerStatement(result.text, filename, fileParticulars)
+      if (employerRows.length) {
+        const creditRows = toEmployerCreditRows(employerRows)
+        return {
+          method: 'pdf',
+          source: 'employer',
+          documentType: 'employer',
+          creditRows,
+          rows: toEmployerImportRows(employerRows),
+        }
       }
+      if (forceEmployer) {
+        throw new Error(
+          'No employee repayment rows found in this PDF. Check the file format or add notes in File particulars (employer name, pay period).'
+        )
+      }
+    }
 
-      const creditRows = toEmployerCreditRows(employerRows)
+    if (forceBank || !forceEmployer) {
+      const parsed = groupBankBlocks(result.text).map(parseBankBlock).filter(Boolean)
+      const creditRows = filterBankCredits(parsed)
+      if (creditRows.length) {
+        return {
+          method: 'pdf',
+          source: 'bank',
+          documentType: 'bank',
+          creditRows,
+          rows: toBankImportRows(creditRows),
+        }
+      }
+    }
+
+    if (forceBank) {
+      throw new Error('No credit transactions found in bank statement PDF')
+    }
+
+    // Last resort: try employer parser even when auto-detect said bank
+    const fallbackEmployer = parseEmployerStatement(result.text, filename, fileParticulars)
+    if (fallbackEmployer.length) {
+      const creditRows = toEmployerCreditRows(fallbackEmployer)
       return {
         method: 'pdf',
         source: 'employer',
         documentType: 'employer',
         creditRows,
-        rows: toEmployerImportRows(employerRows),
+        rows: toEmployerImportRows(fallbackEmployer),
       }
     }
 
-    const parsed = groupBankBlocks(result.text).map(parseBankBlock).filter(Boolean)
-    const creditRows = filterBankCredits(parsed)
-    if (!creditRows.length) {
-      throw new Error('No credit transactions found in bank statement PDF')
-    }
-
-    return {
-      method: 'pdf',
-      source: 'bank',
-      documentType: 'bank',
-      creditRows,
-      rows: toBankImportRows(creditRows),
-    }
+    throw new Error('No credit or employee repayment rows found in PDF')
   } finally {
     await parser.destroy()
   }

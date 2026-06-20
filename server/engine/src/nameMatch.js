@@ -84,7 +84,8 @@ const TYPO_FLOOR = 0.7
  *
  * @returns {{ score: number, kind: string }}
  */
-export function scoreNameMatch(a, b) {
+export function scoreNameMatch(a, b, opts = {}) {
+  const typoFloor = opts.typoFloor ?? TYPO_FLOOR
   const ta = nameTokens(a)
   const tb = nameTokens(b)
   if (!ta.length || !tb.length) return { score: 0, kind: 'none' }
@@ -94,32 +95,27 @@ export function scoreNameMatch(a, b) {
   const fb = tb[0]
   const lb = tb[tb.length - 1]
 
-  const simFF = tokenSim(fa, fb) // first vs first
-  const simLL = tokenSim(la, lb) // last vs last
-  const simFL = tokenSim(fa, lb) // first vs last (reversed)
-  const simLF = tokenSim(la, fb) // last vs first (reversed)
+  const simFF = tokenSim(fa, fb)
+  const simLL = tokenSim(la, lb)
+  const simFL = tokenSim(fa, lb)
+  const simLF = tokenSim(la, fb)
 
   const cands = []
 
-  // First + Last in the same order.
-  if (simFF >= TYPO_FLOOR && simLL >= TYPO_FLOOR) {
+  if (simFF >= typoFloor && simLL >= typoFloor) {
     const exact = simFF === 1 && simLL === 1
     cands.push({ kind: exact ? 'first+last' : 'first+last~typo', score: Math.round(((simFF + simLL) / 2) * 100) })
   }
-  // Last + First (name order reversed, e.g. "Russell, Calvin" vs "Calvin Russell").
-  if (simFL >= TYPO_FLOOR && simLF >= TYPO_FLOOR) {
+  if (simFL >= typoFloor && simLF >= typoFloor) {
     const exact = simFL === 1 && simLF === 1
     cands.push({ kind: exact ? 'last+first' : 'last+first~typo', score: Math.round(((simFL + simLF) / 2) * 100) - 1 })
   }
-  // Last name only.
   if (simLL >= 0.8) {
     cands.push({ kind: simLL === 1 ? 'last_only' : 'last_only~typo', score: Math.round(simLL * 72) })
   }
-  // First name only.
   if (simFF >= 0.8) {
     cands.push({ kind: simFF === 1 ? 'first_only' : 'first_only~typo', score: Math.round(simFF * 60) })
   }
-  // Token-set overlap fallback (middle names, 3+ tokens).
   const setScore = nameScore(a, b)
   if (setScore > 0) cands.push({ kind: 'token_overlap', score: setScore })
 

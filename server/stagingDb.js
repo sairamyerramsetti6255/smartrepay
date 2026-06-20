@@ -347,6 +347,161 @@ export async function getStagingCounts() {
   }
 }
 
+function isoDay(d) {
+  return d.toISOString().slice(0, 10)
+}
+
+function bump(map, key, n = 1) {
+  const k = key || 'unknown'
+  map[k] = (map[k] || 0) + n
+}
+
+function mapToSortedList(map, labelKey = 'name') {
+  return Object.entries(map)
+    .map(([name, count]) => ({ [labelKey]: name, count }))
+    .sort((a, b) => b.count - a.count)
+}
+
+/**
+ * Reconciliation dashboard stats — matching + receipts + imports only.
+ * No active-loan book figures (balances, borrowers, EMI totals).
+ */
+export async function getDashboardStats() {
+  const [summaryRows, matchResult, documents, receipts] = await Promise.all([
+    execCrif('{}', 'Get_MatchSummary'),
+    getSqlMatchResults(),
+    getDocuments(),
+    getManualReceipts(),
+  ])
+
+  const s = summaryRows[0] || {}
+  const stagedCredits = s.TotalTransactions ?? 0
+  const matched = s.Matched ?? 0
+  const unmatched = s.Unmatched ?? 0
+  const pending = s.Pending ?? 0
+  const processed = matched + unmatched
+  const matchRate = processed ? Math.round((matched / processed) * 100) : 0
+
+  const byReviewStatus = {}
+  const bySourceType = {}
+  const byMatchMethod = {}
+  const byMatchType = {}
+  let autoMatched = 0
+  let confirmed = 0
+  let needsReview = 0
+
+  for (const t of matchResult.transactions) {
+    const rs = t.review_status || 'pending'
+    bump(byReviewStatus, rs)
+    bump(bySourceType, t.source_type)
+    if (t.match_method) bump(byMatchMethod, t.match_method)
+    if (t.match_type) bump(byMatchType, t.match_type)
+    if (rs === 'auto_matched') autoMatched += 1
+    if (rs === 'confirmed') confirmed += 1
+    if (rs === 'needs_review') needsReview += 1
+  }
+
+  const today = isoDay(new Date())
+  const weekStart = isoDay(new Date(Date.now() - 6 * 86400000))
+  const dailyMap = new Map()
+  for (let i = 6; i >= 0; i--) {
+    const d = isoDay(new Date(Date.now() - i * 86400000))
+    dailyMap.set(d, { date: d, staged: 0, matched: 0, unmatched: 0, receipts: 0 })
+  }
+
+  for (const t of matchResult.transactions) {
+    const day = t.date ? String(t.date).slice(0, 10) : null
+    if (!day || !dailyMap.has(day)) continue
+    const row = dailyMap.get(day)
+    row.staged += 1
+    if (t.status === 'matched') row.matched += 1
+    else if (t.status === 'exception') row.unmatched += 1
+  }
+
+  const byFileSource = {}
+  let filesWithUnmatched = 0
+  let filesFullyMatched = 0
+  let totalImportedRows = 0
+  for (const d of documents) {
+    bump(byFileSource, d.source_type || d.document_type)
+    totalImportedRows += d.total_rows ?? 0
+    if ((d.unmatched_count ?? 0) > 0) filesWithUnmatched += 1
+    if ((d.total_rows ?? 0) > 0 && (d.unmatched_count ?? 0) === 0 && (d.matched_count ?? 0) > 0) {
+      filesFullyMatched += 1
+    }
+  }
+
+  const byReceiptChannel = {}
+  let receiptsToday = 0
+  let receiptsThisWeek = 0
+  let receiptsWithAttachment = 0
+  for (const r of receipts) {
+    bump(byReceiptChannel, r.sourceChannel)
+    const day = (r.collectedDate || r.createdAt || '').slice(0, 10)
+    if (day === today) receiptsToday += 1
+    if (day && day >= weekStart) receiptsThisWeek += 1
+    if (r.receiptDocumentId || r.receiptFileName) receiptsWithAttachment += 1
+    if (day && dailyMap.has(day)) dailyMap.get(day).receipts += 1
+  }
+
+  const importFiles = documents
+    .map((d) => ({
+      filename: d.filename,
+      sourceType: d.source_type || d.document_type || 'unknown',
+      totalRows: d.total_rows ?? 0,
+      matchedCount: d.matched_count ?? 0,
+      unmatchedCount: d.unmatched_count ?? 0,
+      pendingCount: Math.max(0, (d.total_rows ?? 0) - (d.matched_count ?? 0) - (d.unmatched_count ?? 0)),
+    }))
+    .sort((a, b) => b.unmatchedCount - a.unmatchedCount || b.totalRows - a.totalRows)
+    .slice(0, 8)
+
+  return {
+    matching: {
+      stagedCredits,
+      matched,
+      unmatched,
+      pending,
+      processed,
+      matchRate,
+      autoMatched,
+      confirmed,
+      needsReview,
+      byReviewStatus: mapToSortedList(byReviewStatus, 'status'),
+      bySourceType: mapToSortedList(bySourceType, 'source'),
+      byMatchMethod: mapToSortedList(byMatchMethod, 'method'),
+      byMatchType: mapToSortedList(byMatchType, 'type'),
+    },
+    imports: {
+      totalFiles: documents.length,
+      totalRows: totalImportedRows,
+      filesWithUnmatched,
+      filesFullyMatched,
+      bySourceType: mapToSortedList(byFileSource, 'source'),
+      recentFiles: importFiles,
+    },
+    receipts: {
+      total: receipts.length,
+      today: receiptsToday,
+      thisWeek: receiptsThisWeek,
+      withAttachment: receiptsWithAttachment,
+      byChannel: mapToSortedList(byReceiptChannel, 'channel'),
+    },
+    pipeline: {
+      importedFiles: documents.length,
+      stagedCredits,
+      processed,
+      matched,
+      unmatched,
+      pending,
+      manualReceipts: receipts.length,
+    },
+    activity: {
+      daily: [...dailyMap.values()],
+    },
+  }
+}
+
 /** Uploaded-document list derived purely from staged credits in SQL Server. */
 export async function getDocuments() {
   const rows = await execCrif('{}', 'Get_Documents')

@@ -7,12 +7,25 @@ import {
   classify,
   buildMatchPrompt,
   applyAi,
+  setMatchingEngineConfig,
 } from './engine/src/matchingEngine.js'
 import {
   getBankTransactions,
   getLoanDiskDueRecords,
   saveTransactionMatches,
 } from './engine/src/dataAccess.js'
+import db from './db.js'
+import { buildEngineConfig } from './matchingRules.js'
+
+function loadMatchingEngineConfig() {
+  try {
+    const row = db.prepare('select value from app_settings where key = ?').get('global')
+    const settings = row ? JSON.parse(row.value) : {}
+    return buildEngineConfig(settings.matchingRules || settings)
+  } catch {
+    return buildEngineConfig()
+  }
+}
 
 /**
  * In-process reconciliation runner. This is the SAME engine that used to live in
@@ -44,7 +57,11 @@ export async function runMatch({ useAi = true, fileNames = null, onProgress } = 
     }
   }
 
-  const ai = useAi && isOpenRouterEnabled()
+  const engineCfg = loadMatchingEngineConfig()
+  setMatchingEngineConfig(engineCfg)
+
+  try {
+  const aiAllowed = useAi && isOpenRouterEnabled() && engineCfg.signals?.useAiAdjudication?.enabled !== false
   emit({ phase: 'starting' })
 
   const [allBankTx, loans] = await Promise.all([getBankTransactions(), getLoanDiskDueRecords()])
@@ -73,7 +90,7 @@ export async function runMatch({ useAi = true, fileNames = null, onProgress } = 
   // Persist deterministic results immediately so the grid/tiles fill in fast.
   await saveTransactionMatches(classified.map((c) => c.record))
 
-  const aiTargets = ai ? classified.filter((c) => c.candidates.length && c.needsAi) : []
+  const aiTargets = aiAllowed ? classified.filter((c) => c.candidates.length && c.needsAi) : []
   {
     const t = tally()
     emit({ phase: 'classified', bankTx: bankTx.length, loans: loans.length, total: aiTargets.length, done: 0, matched: t.matched, unmatched: t.unmatched })
@@ -133,4 +150,7 @@ export async function runMatch({ useAi = true, fileNames = null, onProgress } = 
   }
   emit({ phase: 'done', matched: t.matched, unmatched: t.unmatched })
   return summary
+  } finally {
+    setMatchingEngineConfig(buildEngineConfig())
+  }
 }

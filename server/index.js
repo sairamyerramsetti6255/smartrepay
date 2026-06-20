@@ -20,6 +20,13 @@ import {
   borrowerSearch,
   parseBorrowerSearchResults,
 } from './loandisk.js'
+import {
+  RULE_CATALOG,
+  DEFAULT_MATCHING_RULES,
+  resolveMatchingRules,
+  previewMatchSample,
+  testAliasPattern,
+} from './matchingRules.js'
 import { getBorrowerResponse } from './borrowerFetchService.js'
 import { runMatch } from './matchRunner.js'
 import {
@@ -28,6 +35,7 @@ import {
   getActiveLoans,
   getBankTransactions,
   getStagingCounts,
+  getDashboardStats,
   getSqlMatchResults,
   updateSqlMatchReview,
   getDocuments,
@@ -183,7 +191,16 @@ app.get('/api/health', (_req, res) =>
 app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
-    const result = await parseStatementBuffer(req.file.buffer, req.file.originalname)
+    const documentType = String(req.body.documentType || '').trim().toLowerCase() || null
+    const fileParticulars = String(req.body.fileParticulars || '').trim() || null
+    if (!documentType) {
+      return res.status(400).json({ error: 'Select a document type before uploading' })
+    }
+
+    const result = await parseStatementBuffer(req.file.buffer, req.file.originalname, {
+      documentType,
+      fileParticulars,
+    })
     // Duplicate detection now runs purely against SQL Server (Staging_BankTransactions),
     // so an empty SQL table means zero duplicates regardless of old SQLite history.
     const dupFlags = await flagDuplicateRows(result.rows)
@@ -200,6 +217,8 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
       file: req.file.originalname,
       count: rows.length,
       method: result.method,
+      documentType,
+      fileParticulars,
     })
     const creditCount = result.creditRows?.length ?? rows.length
     const duplicateCount = rows.filter((r) => r._duplicate).length
@@ -213,14 +232,16 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
       filename: req.file.originalname,
       buffer: req.file.buffer,
       mimeType: req.file.mimetype,
-      documentType: result.documentType || result.source || null,
+      documentType: result.documentType || documentType,
+      fileParticulars,
     })
 
     res.json({
       parseId,
       method: result.method,
-      source: result.source || result.documentType || (result.method === 'pdf' ? 'bank' : 'spreadsheet'),
-      documentType: result.documentType || result.source || null,
+      source: result.source || result.documentType || documentType,
+      documentType: result.documentType || documentType,
+      fileParticulars,
       rawRows: result.rawRows,
       creditRows: result.creditRows?.slice(0, 25) || null,
       creditCount,
@@ -268,6 +289,15 @@ app.post('/api/ingest/import', authMiddleware, async (req, res) => {
       const stagingRows = (cached.richRows || []).map((r) => ({
         ...r,
         documentType: r.documentType || cached.documentType,
+        employerOrBank:
+          r.employerOrBank ||
+          r.employer ||
+          (cached.documentType === 'employer' ? cached.fileParticulars : null) ||
+          cached.fileParticulars ||
+          null,
+        particulars: cached.fileParticulars
+          ? [cached.fileParticulars, r.particulars || r.description].filter(Boolean).join(' — ')
+          : r.particulars || r.description,
       }))
       const stagingResult = await insertBankTransactions(stagingRows, {
         fileName: stagedFileName,
@@ -330,6 +360,14 @@ app.get('/api/staging/summary', authMiddleware, async (_req, res) => {
     res.json(await getStagingCounts())
   } catch (e) {
     res.status(500).json({ error: `Could not load staging summary: ${e.message}` })
+  }
+})
+
+app.get('/api/dashboard/stats', authMiddleware, async (_req, res) => {
+  try {
+    res.json(await getDashboardStats())
+  } catch (e) {
+    res.status(500).json({ error: `Could not load dashboard stats: ${e.message}` })
   }
 })
 
@@ -581,6 +619,46 @@ app.get('/api/settings', authMiddleware, (_req, res) => res.json(getSettings()))
 app.put('/api/settings', authMiddleware, (req, res) => {
   if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
   res.json(saveSettings(req.body, req.user.email))
+})
+
+app.get('/api/settings/matching-rules', authMiddleware, (req, res) => {
+  if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
+  const settings = getSettings()
+  res.json({
+    rules: resolveMatchingRules(settings.matchingRules),
+    catalog: RULE_CATALOG,
+    defaults: DEFAULT_MATCHING_RULES,
+  })
+})
+
+app.put('/api/settings/matching-rules', authMiddleware, (req, res) => {
+  if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
+  const rules = resolveMatchingRules(req.body?.rules || req.body)
+  const next = saveSettings(
+    {
+      matchingRules: rules,
+      autoApproveThreshold: rules.thresholds.autoMatchConfidence,
+    },
+    req.user.email
+  )
+  res.json({ rules: resolveMatchingRules(next.matchingRules), ok: true })
+})
+
+app.post('/api/settings/matching-rules/preview', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
+  try {
+    const rules = req.body?.rules ? resolveMatchingRules(req.body.rules) : resolveMatchingRules(getSettings().matchingRules)
+    const preview = await previewMatchSample(req.body?.sample || {}, rules)
+    res.json(preview)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/settings/matching-rules/test-pattern', authMiddleware, (req, res) => {
+  if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
+  const { pattern, flags, testString } = req.body || {}
+  res.json(testAliasPattern(pattern, flags, testString))
 })
 
 // --- Borrowers ---

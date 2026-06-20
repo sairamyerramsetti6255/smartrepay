@@ -152,11 +152,7 @@ export function initDb() {
       autoApproveThreshold: 80,
       autoEscalateOnBreach: true,
       slaHours: { unmatched: 24, duplicate: 4, partial: 24, suspicious: 72 },
-      matchingRules: [
-        { id: '1', field: 'full_name', weight: 40, active: true },
-        { id: '2', field: 'aliases', weight: 35, active: true },
-        { id: '3', field: 'employer', weight: 25, active: true },
-      ],
+      matchingRules: null,
     }
     db.prepare('insert into app_settings (key, value) values (?, ?)').run('global', JSON.stringify(defaults))
   }
