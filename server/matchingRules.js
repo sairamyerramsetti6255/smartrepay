@@ -67,7 +67,14 @@ function clampNum(v, lo, hi, fallback) {
 }
 
 /** Merge partial saved rules with defaults and clamp numeric ranges. */
-export function resolveMatchingRules(partial = {}) {
+export function resolveMatchingRules(partial) {
+  // DB default is null; legacy UI stored an array of { field, weight, active }
+  if (partial == null || typeof partial !== 'object') {
+    partial = {}
+  } else if (Array.isArray(partial)) {
+    partial = migrateLegacyRuleList(partial)
+  }
+
   const thresholds = { ...DEFAULT_MATCHING_RULES.thresholds }
   for (const t of RULE_CATALOG.thresholds) {
     if (partial.thresholds?.[t.key] != null) {
@@ -105,6 +112,32 @@ export function resolveMatchingRules(partial = {}) {
     : [...DEFAULT_MATCHING_RULES.aliasPatterns]
 
   return { version: 1, thresholds, signals, amountComponents, aliasPatterns }
+}
+
+/** Old settings stored matchingRules as [{ field, weight, active }, ...]. */
+function migrateLegacyRuleList(list) {
+  const out = {
+    thresholds: { ...DEFAULT_MATCHING_RULES.thresholds },
+    signals: { ...DEFAULT_MATCHING_RULES.signals },
+    amountComponents: { ...DEFAULT_MATCHING_RULES.amountComponents },
+    aliasPatterns: [...DEFAULT_MATCHING_RULES.aliasPatterns],
+  }
+  for (const row of list) {
+    if (!row || typeof row !== 'object') continue
+    const field = String(row.field || '').toLowerCase()
+    const weight = Number(row.weight)
+    const active = row.active !== false
+    if (field === 'full_name' && Number.isFinite(weight)) {
+      out.thresholds.nameConfidenceWeight = Math.min(1, Math.max(0, weight / 100))
+    }
+    if (field === 'aliases') {
+      out.signals.useTypoTolerance = { enabled: active, weight: 1 }
+    }
+    if (field === 'employer') {
+      out.signals.useDescription = { enabled: active, weight: 1 }
+    }
+  }
+  return out
 }
 
 /** Engine runtime config derived from saved rules. */

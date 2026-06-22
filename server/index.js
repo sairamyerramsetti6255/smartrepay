@@ -96,8 +96,13 @@ function audit(entity, entityId, action, actor, priorValue, newValue) {
 }
 
 function getSettings() {
-  const row = db.prepare('select value from app_settings where key = ?').get('global')
-  return row ? JSON.parse(row.value) : {}
+  try {
+    const row = db.prepare('select value from app_settings where key = ?').get('global')
+    if (!row?.value) return {}
+    return JSON.parse(row.value)
+  } catch {
+    return {}
+  }
 }
 
 function saveSettings(partial, actor) {
@@ -622,26 +627,36 @@ app.put('/api/settings', authMiddleware, (req, res) => {
 })
 
 app.get('/api/settings/matching-rules', authMiddleware, (req, res) => {
-  if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
-  const settings = getSettings()
-  res.json({
-    rules: resolveMatchingRules(settings.matchingRules),
-    catalog: RULE_CATALOG,
-    defaults: DEFAULT_MATCHING_RULES,
-  })
+  try {
+    if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
+    const settings = getSettings()
+    res.json({
+      rules: resolveMatchingRules(settings.matchingRules),
+      catalog: RULE_CATALOG,
+      defaults: DEFAULT_MATCHING_RULES,
+    })
+  } catch (e) {
+    console.error('GET /api/settings/matching-rules:', e)
+    res.status(500).json({ error: e.message || 'Could not load matching rules' })
+  }
 })
 
 app.put('/api/settings/matching-rules', authMiddleware, (req, res) => {
-  if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
-  const rules = resolveMatchingRules(req.body?.rules || req.body)
-  const next = saveSettings(
-    {
-      matchingRules: rules,
-      autoApproveThreshold: rules.thresholds.autoMatchConfidence,
-    },
-    req.user.email
-  )
-  res.json({ rules: resolveMatchingRules(next.matchingRules), ok: true })
+  try {
+    if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
+    const rules = resolveMatchingRules(req.body?.rules || req.body)
+    const next = saveSettings(
+      {
+        matchingRules: rules,
+        autoApproveThreshold: rules.thresholds.autoMatchConfidence,
+      },
+      req.user.email
+    )
+    res.json({ rules: resolveMatchingRules(next.matchingRules), ok: true })
+  } catch (e) {
+    console.error('PUT /api/settings/matching-rules:', e)
+    res.status(500).json({ error: e.message || 'Could not save matching rules' })
+  }
 })
 
 app.post('/api/settings/matching-rules/preview', authMiddleware, async (req, res) => {
