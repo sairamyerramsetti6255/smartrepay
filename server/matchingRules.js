@@ -17,15 +17,22 @@ export const DEPRECATED_SIGNAL_KEYS = [
 export const AMOUNT_TOLERANCE_MIN_DEFAULT = 1.5
 
 export const RULE_CATALOG = {
-  thresholds: [
-    { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate.', min: 0, max: 100, step: 1, default: 55 },
-    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Required for name + amount match type at high confidence.', min: 0, max: 100, step: 1, default: 85 },
-    { key: 'autoMatchConfidence', label: 'Auto-match confidence', hint: 'At or above this, a match is auto-approved.', min: 0, max: 100, step: 1, default: 70 },
-    { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 1, max: 30, step: 1, default: 8 },
-    { key: 'nameConfidenceWeight', label: 'Name weight', hint: 'Share of confidence from name score. Adjusting this updates amount weight so the pair always totals 100%.', min: 0, max: 1, step: 0.05, default: 0.6 },
-    { key: 'amountConfidenceWeight', label: 'Amount weight', hint: 'Share of confidence from amount reconciliation. Adjusting this updates name weight so the pair always totals 100%.', min: 0, max: 1, step: 0.05, default: 0.4 },
-    { key: 'amountTolerancePercent', label: 'Amount tolerance %', hint: 'Allowed variance vs expected EMI (e.g. 0.02 = 2%).', min: 0, max: 0.1, step: 0.005, default: 0.02 },
-    { key: 'typoToleranceFloor', label: 'Typo tolerance', hint: 'Token similarity floor for typo-tolerant name matching (0–1).', min: 0.5, max: 1, step: 0.05, default: 0.7 },
+  /** Score cutoffs — independent limits (0–100 points), not part of the weight mix. */
+  scoreLimits: [
+    { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate.', min: 0, max: 100, step: 1, default: 55, unit: 'points' },
+    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Required for name + amount match type at high confidence.', min: 0, max: 100, step: 1, default: 85, unit: 'points' },
+    { key: 'autoMatchConfidence', label: 'Auto-match confidence', hint: 'At or above this, a match is auto-approved.', min: 0, max: 100, step: 1, default: 70, unit: 'points' },
+    { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 1, max: 30, step: 1, default: 8, unit: 'points' },
+  ],
+  /** Only these two must sum to 100% — they blend name vs amount into the final confidence score. */
+  confidenceWeights: [
+    { key: 'nameConfidenceWeight', label: 'Name share', hint: 'Portion of the final match score from name similarity.', min: 0, max: 1, step: 0.05, default: 0.6, unit: 'weight' },
+    { key: 'amountConfidenceWeight', label: 'Amount share', hint: 'Portion of the final match score from amount reconciliation.', min: 0, max: 1, step: 0.05, default: 0.4, unit: 'weight' },
+  ],
+  /** Tuning knobs — separate from the 100% weight mix. */
+  tuning: [
+    { key: 'amountTolerancePercent', label: 'Amount tolerance', hint: 'Allowed variance vs expected EMI (e.g. 0.02 = ±2%).', min: 0, max: 0.1, step: 0.005, default: 0.02, unit: 'percent' },
+    { key: 'typoToleranceFloor', label: 'Typo similarity floor', hint: 'How similar name tokens must be to count as a typo match (not a weight).', min: 0.5, max: 1, step: 0.05, default: 0.7, unit: 'similarity' },
   ],
   signals: [
     { key: 'useBorrowerName', label: 'Borrower name field', hint: 'Match using payer / borrower name from particulars.', default: true },
@@ -43,7 +50,9 @@ export const RULE_CATALOG = {
 
 export const DEFAULT_MATCHING_RULES = {
   version: 2,
-  thresholds: Object.fromEntries(RULE_CATALOG.thresholds.map((t) => [t.key, t.default])),
+  thresholds: Object.fromEntries(
+    [...RULE_CATALOG.scoreLimits, ...RULE_CATALOG.confidenceWeights, ...RULE_CATALOG.tuning].map((t) => [t.key, t.default])
+  ),
   signals: Object.fromEntries(RULE_CATALOG.signals.map((s) => [s.key, { enabled: s.default, weight: 1 }])),
   amountComponents: Object.fromEntries(RULE_CATALOG.amountComponents.map((a) => [a.key, a.default])),
 }
@@ -95,7 +104,12 @@ export function resolveMatchingRules(partial) {
   }
 
   const thresholds = { ...DEFAULT_MATCHING_RULES.thresholds }
-  for (const t of RULE_CATALOG.thresholds) {
+  const allThresholdMeta = [
+    ...RULE_CATALOG.scoreLimits,
+    ...RULE_CATALOG.confidenceWeights,
+    ...RULE_CATALOG.tuning,
+  ]
+  for (const t of allThresholdMeta) {
     if (partial.thresholds?.[t.key] != null) {
       thresholds[t.key] = clampNum(partial.thresholds[t.key], t.min, t.max, t.default)
     }
