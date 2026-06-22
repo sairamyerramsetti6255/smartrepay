@@ -3,27 +3,33 @@
  * by the reconciliation engine (see matchingEngine.setMatchingEngineConfig).
  */
 
+/** Signals removed from UI — always off at runtime regardless of saved settings. */
+export const DEPRECATED_SIGNAL_KEYS = [
+  'useLoanNumberHint',
+  'useSubsetSum',
+  'useBiWeekly',
+  'useWeekly',
+  'useAiAdjudication',
+  'useTypoTolerance',
+]
+
+/** Fixed floor for small-payment amount tolerance (no longer configurable in UI). */
+export const AMOUNT_TOLERANCE_MIN_DEFAULT = 1.5
+
 export const RULE_CATALOG = {
   thresholds: [
     { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate.', min: 0, max: 100, step: 1, default: 55 },
     { key: 'nameStrongScore', label: 'Strong name score', hint: 'Required for name + amount match type at high confidence.', min: 0, max: 100, step: 1, default: 85 },
     { key: 'autoMatchConfidence', label: 'Auto-match confidence', hint: 'At or above this, a match is auto-approved.', min: 0, max: 100, step: 1, default: 70 },
     { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 1, max: 30, step: 1, default: 8 },
-    { key: 'nameConfidenceWeight', label: 'Name weight', hint: 'Share of confidence from name score (0–1).', min: 0, max: 1, step: 0.05, default: 0.6 },
-    { key: 'amountConfidenceWeight', label: 'Amount weight', hint: 'Share of confidence from amount reconciliation (0–1).', min: 0, max: 1, step: 0.05, default: 0.4 },
+    { key: 'nameConfidenceWeight', label: 'Name weight', hint: 'Share of confidence from name score. Adjusting this updates amount weight so the pair always totals 100%.', min: 0, max: 1, step: 0.05, default: 0.6 },
+    { key: 'amountConfidenceWeight', label: 'Amount weight', hint: 'Share of confidence from amount reconciliation. Adjusting this updates name weight so the pair always totals 100%.', min: 0, max: 1, step: 0.05, default: 0.4 },
     { key: 'amountTolerancePercent', label: 'Amount tolerance %', hint: 'Allowed variance vs expected EMI (e.g. 0.02 = 2%).', min: 0, max: 0.1, step: 0.005, default: 0.02 },
-    { key: 'amountToleranceMin', label: 'Amount tolerance floor ($)', hint: 'Minimum dollar tolerance for small payments.', min: 0, max: 10, step: 0.5, default: 1.5 },
     { key: 'typoToleranceFloor', label: 'Typo tolerance', hint: 'Token similarity floor for typo-tolerant name matching (0–1).', min: 0.5, max: 1, step: 0.05, default: 0.7 },
   ],
   signals: [
     { key: 'useBorrowerName', label: 'Borrower name field', hint: 'Match using payer / borrower name from particulars.', default: true },
     { key: 'useDescription', label: 'Transaction description', hint: 'Also match text before the | in particulars.', default: true },
-    { key: 'useLoanNumberHint', label: 'Loan number in text', hint: 'Boost borrower when loan # appears in description.', default: true },
-    { key: 'useSubsetSum', label: 'Multi-loan subset sum', hint: 'Allow one deposit to settle several loans (EMI sum).', default: true },
-    { key: 'useBiWeekly', label: 'Bi-weekly installments', hint: 'Treat deposit as half of monthly EMI.', default: true },
-    { key: 'useWeekly', label: 'Weekly installments', hint: 'Treat deposit as quarter of monthly EMI.', default: true },
-    { key: 'useAiAdjudication', label: 'AI adjudication', hint: 'Use AI for ambiguous name ties (when enabled on run).', default: true },
-    { key: 'useTypoTolerance', label: 'Typo tolerance', hint: 'Allow minor spelling differences in names.', default: true },
   ],
   amountComponents: [
     { key: 'exact_single', label: 'Single EMI exact', default: 100 },
@@ -36,28 +42,10 @@ export const RULE_CATALOG = {
 }
 
 export const DEFAULT_MATCHING_RULES = {
-  version: 1,
+  version: 2,
   thresholds: Object.fromEntries(RULE_CATALOG.thresholds.map((t) => [t.key, t.default])),
   signals: Object.fromEntries(RULE_CATALOG.signals.map((s) => [s.key, { enabled: s.default, weight: 1 }])),
   amountComponents: Object.fromEntries(RULE_CATALOG.amountComponents.map((a) => [a.key, a.default])),
-  aliasPatterns: [
-    {
-      id: 'borrower-id-numeric',
-      label: 'Numeric borrower ID',
-      pattern: '\\b(\\d{5,10})\\b',
-      field: 'reference',
-      flags: 'i',
-      active: true,
-    },
-    {
-      id: 'loan-prefix',
-      label: 'Loan prefix (LD/BRW/LN)',
-      pattern: '\\b(?:LD|BRW|LN)[-\\s#]?(\\d+)\\b',
-      field: 'reference',
-      flags: 'i',
-      active: true,
-    },
-  ],
 }
 
 function clampNum(v, lo, hi, fallback) {
@@ -66,9 +54,40 @@ function clampNum(v, lo, hi, fallback) {
   return Math.max(lo, Math.min(hi, n))
 }
 
+/** Name + amount confidence weights must sum to 1 (100%). */
+export function normalizeConfidenceWeights(thresholds) {
+  const out = { ...thresholds }
+  let name = Number(out.nameConfidenceWeight)
+  let amount = Number(out.amountConfidenceWeight)
+  if (!Number.isFinite(name)) name = 0.6
+  if (!Number.isFinite(amount)) amount = 0.4
+  const sum = name + amount
+  if (sum <= 0) {
+    out.nameConfidenceWeight = 0.6
+    out.amountConfidenceWeight = 0.4
+    return out
+  }
+  if (Math.abs(sum - 1) > 0.0001) {
+    out.nameConfidenceWeight = Math.round((name / sum) * 1000) / 1000
+    out.amountConfidenceWeight = Math.round((amount / sum) * 1000) / 1000
+    // Fix rounding drift so pair is exactly 1
+    const drift = 1 - (out.nameConfidenceWeight + out.amountConfidenceWeight)
+    out.amountConfidenceWeight = Math.round((out.amountConfidenceWeight + drift) * 1000) / 1000
+  } else {
+    out.nameConfidenceWeight = name
+    out.amountConfidenceWeight = amount
+  }
+  return out
+}
+
+export function confidenceWeightSum(thresholds) {
+  const name = Number(thresholds?.nameConfidenceWeight) || 0
+  const amount = Number(thresholds?.amountConfidenceWeight) || 0
+  return name + amount
+}
+
 /** Merge partial saved rules with defaults and clamp numeric ranges. */
 export function resolveMatchingRules(partial) {
-  // DB default is null; legacy UI stored an array of { field, weight, active }
   if (partial == null || typeof partial !== 'object') {
     partial = {}
   } else if (Array.isArray(partial)) {
@@ -81,6 +100,7 @@ export function resolveMatchingRules(partial) {
       thresholds[t.key] = clampNum(partial.thresholds[t.key], t.min, t.max, t.default)
     }
   }
+  Object.assign(thresholds, normalizeConfidenceWeights(thresholds))
 
   const signals = { ...DEFAULT_MATCHING_RULES.signals }
   for (const s of RULE_CATALOG.signals) {
@@ -98,20 +118,7 @@ export function resolveMatchingRules(partial) {
     }
   }
 
-  const aliasPatterns = Array.isArray(partial.aliasPatterns)
-    ? partial.aliasPatterns
-        .filter((p) => p && p.pattern)
-        .map((p, i) => ({
-          id: String(p.id || `pattern-${i + 1}`),
-          label: String(p.label || `Pattern ${i + 1}`),
-          pattern: String(p.pattern),
-          field: ['reference', 'description', 'particulars', 'borrowerName'].includes(p.field) ? p.field : 'reference',
-          flags: String(p.flags || 'i').replace(/[^gimsuy]/g, '') || 'i',
-          active: p.active !== false,
-        }))
-    : [...DEFAULT_MATCHING_RULES.aliasPatterns]
-
-  return { version: 1, thresholds, signals, amountComponents, aliasPatterns }
+  return { version: 2, thresholds, signals, amountComponents }
 }
 
 /** Old settings stored matchingRules as [{ field, weight, active }, ...]. */
@@ -120,7 +127,6 @@ function migrateLegacyRuleList(list) {
     thresholds: { ...DEFAULT_MATCHING_RULES.thresholds },
     signals: { ...DEFAULT_MATCHING_RULES.signals },
     amountComponents: { ...DEFAULT_MATCHING_RULES.amountComponents },
-    aliasPatterns: [...DEFAULT_MATCHING_RULES.aliasPatterns],
   }
   for (const row of list) {
     if (!row || typeof row !== 'object') continue
@@ -129,14 +135,13 @@ function migrateLegacyRuleList(list) {
     const active = row.active !== false
     if (field === 'full_name' && Number.isFinite(weight)) {
       out.thresholds.nameConfidenceWeight = Math.min(1, Math.max(0, weight / 100))
-    }
-    if (field === 'aliases') {
-      out.signals.useTypoTolerance = { enabled: active, weight: 1 }
+      out.thresholds.amountConfidenceWeight = 1 - out.thresholds.nameConfidenceWeight
     }
     if (field === 'employer') {
       out.signals.useDescription = { enabled: active, weight: 1 }
     }
   }
+  out.thresholds = normalizeConfidenceWeights(out.thresholds)
   return out
 }
 
@@ -144,10 +149,6 @@ function migrateLegacyRuleList(list) {
 export function buildEngineConfig(rules = DEFAULT_MATCHING_RULES) {
   const r = resolveMatchingRules(rules)
   const t = r.thresholds
-  const scales = []
-  if (r.signals.useBiWeekly?.enabled !== false) scales.push({ scale: 0.5, freq: 'bi-weekly' })
-  if (r.signals.useWeekly?.enabled !== false) scales.push({ scale: 0.25, freq: 'weekly' })
-  scales.unshift({ scale: 1, freq: 'monthly' })
 
   return {
     NAME_MIN: t.nameMinScore,
@@ -157,13 +158,22 @@ export function buildEngineConfig(rules = DEFAULT_MATCHING_RULES) {
     NAME_WEIGHT: t.nameConfidenceWeight,
     AMOUNT_WEIGHT: t.amountConfidenceWeight,
     AMOUNT_TOL_PCT: t.amountTolerancePercent,
-    AMOUNT_TOL_MIN: t.amountToleranceMin,
-    TYPO_FLOOR: r.signals.useTypoTolerance?.enabled === false ? 1 : t.typoToleranceFloor,
-    signals: r.signals,
+    AMOUNT_TOL_MIN: AMOUNT_TOLERANCE_MIN_DEFAULT,
+    TYPO_FLOOR: t.typoToleranceFloor,
+    signals: {
+      useBorrowerName: r.signals.useBorrowerName ?? { enabled: true },
+      useDescription: r.signals.useDescription ?? { enabled: true },
+      useLoanNumberHint: { enabled: false },
+      useSubsetSum: { enabled: false },
+      useBiWeekly: { enabled: false },
+      useWeekly: { enabled: false },
+      useAiAdjudication: { enabled: false },
+      useTypoTolerance: { enabled: true },
+    },
     amountComponents: r.amountComponents,
-    installmentScales: scales,
-    useSubsetSum: r.signals.useSubsetSum?.enabled !== false,
-    aliasPatterns: r.aliasPatterns.filter((p) => p.active),
+    installmentScales: [{ scale: 1, freq: 'monthly' }],
+    useSubsetSum: false,
+    aliasPatterns: [],
     rules: r,
   }
 }
@@ -251,20 +261,6 @@ export async function previewMatchSample(input, rulesPartial = {}) {
   const group = [...groups.values()][0]
   const amountRecon = reconcileAmount(amount, group?.loans || [])
 
-  const patternHits = []
-  for (const p of engineCfg.aliasPatterns) {
-    const fieldText =
-      p.field === 'reference'
-        ? reference
-        : p.field === 'description'
-          ? description
-          : p.field === 'borrowerName'
-            ? payerName
-            : particulars
-    const test = testAliasPattern(p.pattern, p.flags, fieldText)
-    if (test.matches) patternHits.push({ id: p.id, label: p.label, field: p.field, groups: test.groups })
-  }
-
   setMatchingEngineConfig(buildEngineConfig())
 
   return {
@@ -277,11 +273,12 @@ export async function previewMatchSample(input, rulesPartial = {}) {
     wouldAutoMatch: record.reviewStatus === 'auto_matched',
     needsAi,
     reasoning: record.reasoning,
-    patternHits,
     rulesApplied: {
       autoMatchThreshold: engineCfg.AUTO_CONFIDENCE,
       nameMin: engineCfg.NAME_MIN,
       nameStrong: engineCfg.NAME_STRONG,
+      nameWeight: engineCfg.NAME_WEIGHT,
+      amountWeight: engineCfg.AMOUNT_WEIGHT,
     },
   }
 }

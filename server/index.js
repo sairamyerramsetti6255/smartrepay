@@ -24,6 +24,8 @@ import {
   RULE_CATALOG,
   DEFAULT_MATCHING_RULES,
   resolveMatchingRules,
+  normalizeConfidenceWeights,
+  confidenceWeightSum,
   previewMatchSample,
   testAliasPattern,
 } from './matchingRules.js'
@@ -646,7 +648,15 @@ app.get('/api/settings/matching-rules', authMiddleware, (req, res) => {
 app.put('/api/settings/matching-rules', authMiddleware, (req, res) => {
   try {
     if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
-    const rules = resolveMatchingRules(req.body?.rules || req.body)
+    const raw = req.body?.rules || req.body
+    const thresholds = normalizeConfidenceWeights({
+      ...DEFAULT_MATCHING_RULES.thresholds,
+      ...(raw?.thresholds || {}),
+    })
+    if (Math.abs(confidenceWeightSum(thresholds) - 1) > 0.01) {
+      return res.status(400).json({ error: 'Name weight and amount weight must total 100%' })
+    }
+    const rules = resolveMatchingRules({ ...raw, thresholds })
     const next = saveSettings(
       {
         matchingRules: rules,
