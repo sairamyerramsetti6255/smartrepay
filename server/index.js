@@ -488,6 +488,8 @@ app.patch('/api/sql/match-results/:bankTxId', authMiddleware, async (req, res) =
       borrowerName: req.body.borrowerName ?? null,
       loanNumber: req.body.loanNumber ?? null,
       confidence: req.body.confidence ?? null,
+      emiPaidAmount: req.body.emiPaidAmount ?? null,
+      expectedEmiAmount: req.body.expectedEmiAmount ?? null,
     })
     res.json({ ok: true })
   } catch (e) {

@@ -172,6 +172,15 @@
 		DECLARE @rv_bname NVARCHAR(255)= JSON_VALUE(@Json,'$.BorrowerName');
 		DECLARE @rv_loan VARCHAR(100) = JSON_VALUE(@Json,'$.LoanNumber');
 		DECLARE @rv_conf DECIMAL(5,2) = TRY_CAST(JSON_VALUE(@Json,'$.Confidence') AS DECIMAL(5,2));
+		DECLARE @rv_amt DECIMAL(18,2) = TRY_CAST(JSON_VALUE(@Json,'$.EmiPaidAmount') AS DECIMAL(18,2));
+		DECLARE @rv_expected DECIMAL(18,2) = TRY_CAST(JSON_VALUE(@Json,'$.ExpectedEMIAmount') AS DECIMAL(18,2));
+
+		IF @rv_amt IS NOT NULL AND @rv_amt > 0
+		BEGIN
+			UPDATE dbo.Staging_BankTransactions
+			SET EmiPaidAmount = @rv_amt
+			WHERE Id = @rv_btid;
+		END
 
 		MERGE dbo.Staging_TransactionMatches AS T
 		USING (SELECT @rv_btid AS BankTransactionId) AS S
@@ -182,10 +191,23 @@
 			LoanDiskBorrowerName = COALESCE(@rv_bname, T.LoanDiskBorrowerName),
 			LoanNumber = COALESCE(@rv_loan, T.LoanNumber),
 			ConfidenceScore = COALESCE(@rv_conf, T.ConfidenceScore),
+			EmiPaidAmount = COALESCE(@rv_amt, T.EmiPaidAmount),
+			ExpectedEMIAmount = COALESCE(@rv_expected, T.ExpectedEMIAmount),
+			SummedExpectedEMI = COALESCE(@rv_expected, T.SummedExpectedEMI),
+			AmountDiff = CASE
+				WHEN @rv_amt IS NOT NULL AND @rv_expected IS NOT NULL THEN @rv_amt - @rv_expected
+				ELSE T.AmountDiff
+			END,
 			MatchMethod = 'manual', MatchedAt = GETUTCDATE()
 		WHEN NOT MATCHED BY TARGET THEN INSERT
-			(BankTransactionId, ReviewStatus, BorrowerId, LoanDiskBorrowerName, LoanNumber, ConfidenceScore, MatchMethod)
-			VALUES (@rv_btid, @rv_status, @rv_bid, @rv_bname, @rv_loan, @rv_conf, 'manual');
+			(BankTransactionId, ReviewStatus, BorrowerId, LoanDiskBorrowerName, LoanNumber,
+			 ConfidenceScore, EmiPaidAmount, ExpectedEMIAmount, SummedExpectedEMI, AmountDiff, MatchMethod)
+			VALUES (
+				@rv_btid, @rv_status, @rv_bid, @rv_bname, @rv_loan, @rv_conf,
+				@rv_amt, @rv_expected, @rv_expected,
+				CASE WHEN @rv_amt IS NOT NULL AND @rv_expected IS NOT NULL THEN @rv_amt - @rv_expected ELSE NULL END,
+				'manual'
+			);
 
 		SELECT 'True' AS Result, 'Updated' AS Message;
 	END

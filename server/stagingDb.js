@@ -319,18 +319,24 @@ export async function updateSqlMatchReview({
   borrowerName = null,
   loanNumber = null,
   confidence = null,
+  emiPaidAmount = null,
+  expectedEmiAmount = null,
 }) {
-  await execCrif(
-    {
-      BankTransactionId: Number(bankTransactionId),
-      ReviewStatus: reviewStatus,
-      BorrowerId: borrowerId,
-      BorrowerName: borrowerName,
-      LoanNumber: loanNumber,
-      Confidence: confidence,
-    },
-    'Update_MatchReview'
-  )
+  const payload = {
+    BankTransactionId: Number(bankTransactionId),
+    ReviewStatus: reviewStatus,
+    BorrowerId: borrowerId,
+    BorrowerName: borrowerName,
+    LoanNumber: loanNumber,
+    Confidence: confidence,
+  }
+  if (emiPaidAmount != null && !Number.isNaN(Number(emiPaidAmount))) {
+    payload.EmiPaidAmount = Number(emiPaidAmount)
+  }
+  if (expectedEmiAmount != null && !Number.isNaN(Number(expectedEmiAmount))) {
+    payload.ExpectedEMIAmount = Number(expectedEmiAmount)
+  }
+  await execCrif(payload, 'Update_MatchReview')
   return true
 }
 
