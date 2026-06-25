@@ -15,7 +15,8 @@
     "apply-crif": "node engine/scripts/_applyCrifAdditions.js",
     "apply-receipts-schema": "node scripts/apply-receipts-schema.mjs",
     "refresh-staging": "node scripts/refresh-staging-from-sil.mjs",
-    "refresh-staging-loandisk": "node scripts/refresh-staging-from-loandisk.mjs"
+    "refresh-staging-loandisk": "node scripts/refresh-staging-from-loandisk.mjs",
+    "test:name-match": "node engine/scripts/testNameMatch.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -26,6 +27,7 @@
     "jsonwebtoken": "^9.0.2",
     "mssql": "^12.5.5",
     "multer": "^1.4.5-lts.1",
+    "node-cron": "^3.0.3",
     "pdf-parse": "^2.4.5",
     "xlsx": "^0.18.5"
   }

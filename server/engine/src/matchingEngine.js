@@ -1,4 +1,4 @@
-import { nameTokens, scoreNameMatch, normalizeNameKey } from './nameMatch.js'
+import { nameTokens, scoreNameMatch, normalizeNameKey, nameKindRank } from './nameMatch.js'
 import { resolveParticularsFields } from '../../particularsParse.js'
 import { buildEngineConfig, extractIdsWithPatterns } from '../../matchingRules.js'
 
@@ -415,7 +415,10 @@ export function classify(tx, index) {
     })
     .sort(
       (a, b) =>
-        b.confidence - a.confidence || b.amtComp - a.amtComp || b.cand.score - a.cand.score
+        b.confidence - a.confidence ||
+        nameKindRank(b.cand.nameKind) - nameKindRank(a.cand.nameKind) ||
+        b.amtComp - a.amtComp ||
+        b.cand.score - a.cand.score
     )
 
   const best = scored[0]

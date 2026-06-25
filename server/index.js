@@ -26,11 +26,14 @@ import {
   resolveMatchingRules,
   normalizeConfidenceWeights,
   confidenceWeightSum,
+  getRuleCatalog,
   previewMatchSample,
   testAliasPattern,
 } from './matchingRules.js'
 import { getBorrowerResponse } from './borrowerFetchService.js'
 import { runMatch } from './matchRunner.js'
+import { runSqlBorrowerLoanSync } from './borrowerLoanSyncService.js'
+import { getLastScheduledSyncRun } from './syncScheduler.js'
 import {
   insertBankTransactions,
   uniqueFileName,
@@ -194,6 +197,136 @@ app.get('/api/health', (_req, res) =>
   })
 )
 
+// --- Ingest helpers ---
+
+async function buildParseResponse(file, documentType, fileParticulars, userSub) {
+  const result = await parseStatementBuffer(file.buffer, file.originalname, {
+    documentType,
+    fileParticulars,
+  })
+  const dupFlags = await flagDuplicateRows(result.rows)
+  const rows = result.rows.map((r, i) => ({
+    date: r.date,
+    payer: r.payer,
+    description: r.description,
+    amount: r.amount,
+    reference: r.reference,
+    import_hash: r.import_hash,
+    _duplicate: dupFlags[i] || false,
+  }))
+  audit('ingest', null, 'parse_statement', userSub, null, {
+    file: file.originalname,
+    count: rows.length,
+    method: result.method,
+    documentType,
+    fileParticulars,
+  })
+  const creditCount = result.creditRows?.length ?? rows.length
+  const duplicateCount = rows.filter((r) => r._duplicate).length
+  const readyCount = rows.length - duplicateCount
+  const parseId = randomUUID()
+
+  cacheParse(parseId, {
+    rows,
+    richRows: result.rows,
+    userId: userSub,
+    filename: file.originalname,
+    buffer: file.buffer,
+    mimeType: file.mimetype,
+    documentType: result.documentType || documentType,
+    fileParticulars,
+  })
+
+  return {
+    parseId,
+    method: result.method,
+    source: result.source || result.documentType || documentType,
+    documentType: result.documentType || documentType,
+    fileParticulars,
+    rawRows: result.rawRows,
+    creditRows: result.creditRows?.slice(0, 25) || null,
+    creditCount,
+    rowCount: rows.length,
+    duplicateCount,
+    readyCount,
+    rows: rows.slice(0, 25),
+    filename: file.originalname,
+    diagnostics: result.diagnostics || null,
+  }
+}
+
+async function importParsedSession(parseId, user) {
+  const cached = getCachedParse(parseId)
+  if (!cached) throw new Error('Parse session expired — re-upload the file')
+  if (cached.userId !== user.sub) {
+    throw new Error('Unauthorized')
+  }
+
+  const toInsert = cached.rows.filter((r) => !r._duplicate)
+  if (!toInsert.length) throw new Error('No new rows to import')
+
+  const documentId = saveUploadedDocument({
+    buffer: cached.buffer,
+    filename: cached.filename,
+    mimeType: cached.mimeType,
+    documentType: cached.documentType,
+    uploadedBy: user.email,
+    rowCount: toInsert.length,
+  })
+
+  const inserted = bulkInsertRows(toInsert, user.email, documentId)
+  const stagedFileName = uniqueFileName(cached.filename)
+  let staged = 0
+  let stagedDuplicates = 0
+  let stagingError = null
+  try {
+    const stagingRows = (cached.richRows || []).map((r) => ({
+      ...r,
+      documentType: r.documentType || cached.documentType,
+      employerOrBank:
+        r.employerOrBank ||
+        r.employer ||
+        (cached.documentType === 'employer' ? cached.fileParticulars : null) ||
+        cached.fileParticulars ||
+        null,
+      particulars: cached.fileParticulars
+        ? [cached.fileParticulars, r.particulars || r.description].filter(Boolean).join(' — ')
+        : r.particulars || r.description,
+    }))
+    const stagingResult = await insertBankTransactions(stagingRows, {
+      fileName: stagedFileName,
+      uploadedDate: new Date(),
+    })
+    staged = stagingResult.inserted
+    stagedDuplicates = stagingResult.skipped
+  } catch (e) {
+    stagingError = e.message
+    console.error('Staging_BankTransactions insert failed:', e.message)
+  }
+
+  parseCache.delete(parseId)
+
+  audit('ingest', null, 'import_statement', user.email, null, {
+    file: cached.filename,
+    stagedFile: stagedFileName,
+    count: inserted.length,
+    staged,
+    stagedDuplicates,
+    documentId,
+  })
+
+  return {
+    parseId,
+    filename: cached.filename,
+    inserted: inserted.length,
+    documentId,
+    staged,
+    stagedDuplicates,
+    stagedFileName,
+    stagingError,
+  }
+}
+
 // --- Ingest ---
 app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req, res) => {
   try {
@@ -204,59 +337,37 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
       return res.status(400).json({ error: 'Select a document type before uploading' })
     }
 
-    const result = await parseStatementBuffer(req.file.buffer, req.file.originalname, {
-      documentType,
-      fileParticulars,
-    })
-    // Duplicate detection now runs purely against SQL Server (Staging_BankTransactions),
-    // so an empty SQL table means zero duplicates regardless of old SQLite history.
-    const dupFlags = await flagDuplicateRows(result.rows)
-    const rows = result.rows.map((r, i) => ({
-      date: r.date,
-      payer: r.payer,
-      description: r.description,
-      amount: r.amount,
-      reference: r.reference,
-      import_hash: r.import_hash,
-      _duplicate: dupFlags[i] || false,
-    }))
-    audit('ingest', null, 'parse_statement', req.user.email, null, {
-      file: req.file.originalname,
-      count: rows.length,
-      method: result.method,
-      documentType,
-      fileParticulars,
-    })
-    const creditCount = result.creditRows?.length ?? rows.length
-    const duplicateCount = rows.filter((r) => r._duplicate).length
-    const readyCount = rows.length - duplicateCount
-    const parseId = randomUUID()
+    const payload = await buildParseResponse(req.file, documentType, fileParticulars, req.user.sub)
+    res.json(payload)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
 
-    cacheParse(parseId, {
-      rows,
-      richRows: result.rows,
-      userId: req.user.sub,
-      filename: req.file.originalname,
-      buffer: req.file.buffer,
-      mimeType: req.file.mimetype,
-      documentType: result.documentType || documentType,
-      fileParticulars,
-    })
+app.post('/api/ingest/parse-batch', authMiddleware, upload.array('files', 10), async (req, res) => {
+  try {
+    const files = req.files || []
+    if (!files.length) return res.status(400).json({ error: 'No files uploaded' })
+    const documentType = String(req.body.documentType || '').trim().toLowerCase() || null
+    const fileParticulars = String(req.body.fileParticulars || '').trim() || null
+    if (!documentType) {
+      return res.status(400).json({ error: 'Select a document type before uploading' })
+    }
+
+    const results = []
+    for (const file of files) {
+      try {
+        const payload = await buildParseResponse(file, documentType, fileParticulars, req.user.sub)
+        results.push({ ok: true, ...payload })
+      } catch (e) {
+        results.push({ ok: false, filename: file.originalname, error: e.message })
+      }
+    }
 
     res.json({
-      parseId,
-      method: result.method,
-      source: result.source || result.documentType || documentType,
-      documentType: result.documentType || documentType,
-      fileParticulars,
-      rawRows: result.rawRows,
-      creditRows: result.creditRows?.slice(0, 25) || null,
-      creditCount,
-      rowCount: rows.length,
-      duplicateCount,
-      readyCount,
-      rows: rows.slice(0, 25),
-      filename: req.file.originalname,
+      results,
+      successCount: results.filter((r) => r.ok).length,
+      failCount: results.filter((r) => !r.ok).length,
     })
   } catch (e) {
     res.status(400).json({ error: e.message })
@@ -265,76 +376,37 @@ app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req,
 
 app.post('/api/ingest/import', authMiddleware, async (req, res) => {
   try {
-    const { parseId } = req.body
-    if (!parseId) return res.status(400).json({ error: 'Missing parseId — re-upload the file' })
+    const parseIds = Array.isArray(req.body.parseIds)
+      ? req.body.parseIds
+      : req.body.parseId
+        ? [req.body.parseId]
+        : []
+    if (!parseIds.length) return res.status(400).json({ error: 'Missing parseId — re-upload the file' })
 
-    const cached = getCachedParse(parseId)
-    if (!cached) return res.status(400).json({ error: 'Parse session expired — re-upload the file' })
-    if (cached.userId !== req.user.sub) return res.status(403).json({ error: 'Unauthorized' })
-
-    const toInsert = cached.rows.filter((r) => !r._duplicate)
-    if (!toInsert.length) return res.status(400).json({ error: 'No new rows to import' })
-
-    const documentId = saveUploadedDocument({
-      buffer: cached.buffer,
-      filename: cached.filename,
-      mimeType: cached.mimeType,
-      documentType: cached.documentType,
-      uploadedBy: req.user.email,
-      rowCount: toInsert.length,
-    })
-
-    const inserted = bulkInsertRows(toInsert, req.user.email, documentId)
-
-    // Stage the parsed credits into SQL Server (Staging_BankTransactions) under a
-    // unique, timestamped file name so they can be matched against LoanDisk.
-    const stagedFileName = uniqueFileName(cached.filename)
-    let staged = 0
-    let stagedDuplicates = 0
-    let stagingError = null
-    try {
-      const stagingRows = (cached.richRows || []).map((r) => ({
-        ...r,
-        documentType: r.documentType || cached.documentType,
-        employerOrBank:
-          r.employerOrBank ||
-          r.employer ||
-          (cached.documentType === 'employer' ? cached.fileParticulars : null) ||
-          cached.fileParticulars ||
-          null,
-        particulars: cached.fileParticulars
-          ? [cached.fileParticulars, r.particulars || r.description].filter(Boolean).join(' — ')
-          : r.particulars || r.description,
-      }))
-      const stagingResult = await insertBankTransactions(stagingRows, {
-        fileName: stagedFileName,
-        uploadedDate: new Date(),
-      })
-      staged = stagingResult.inserted
-      stagedDuplicates = stagingResult.skipped
-    } catch (e) {
-      stagingError = e.message
-      console.error('Staging_BankTransactions insert failed:', e.message)
+    const outcomes = []
+    for (const id of parseIds) {
+      try {
+        outcomes.push(await importParsedSession(id, req.user))
+      } catch (e) {
+        outcomes.push({ parseId: id, error: e.message })
+      }
     }
 
-    parseCache.delete(parseId)
-
-    audit('ingest', null, 'import_statement', req.user.email, null, {
-      file: cached.filename,
-      stagedFile: stagedFileName,
-      count: inserted.length,
-      staged,
-      stagedDuplicates,
-      documentId,
-    })
+    const ok = outcomes.filter((o) => !o.error)
+    const failed = outcomes.filter((o) => o.error)
+    if (!ok.length && failed.length) {
+      return res.status(400).json({ error: failed[0].error, outcomes })
+    }
 
     res.json({
-      inserted: inserted.length,
-      documentId,
-      staged,
-      stagedDuplicates,
-      stagedFileName,
-      stagingError,
+      inserted: ok.reduce((s, o) => s + o.inserted, 0),
+      staged: ok.reduce((s, o) => s + o.staged, 0),
+      stagedDuplicates: ok.reduce((s, o) => s + o.stagedDuplicates, 0),
+      filesImported: ok.length,
+      stagedFileName: ok[0]?.stagedFileName,
+      stagingError: ok.find((o) => o.stagingError)?.stagingError || null,
+      outcomes,
+      errors: failed,
     })
   } catch (e) {
     res.status(400).json({ error: e.message })
@@ -636,7 +708,7 @@ app.get('/api/settings/matching-rules', authMiddleware, (req, res) => {
     const settings = getSettings()
     res.json({
       rules: resolveMatchingRules(settings.matchingRules),
-      catalog: RULE_CATALOG,
+      catalog: getRuleCatalog(RULE_CATALOG),
       defaults: DEFAULT_MATCHING_RULES,
     })
   } catch (e) {
@@ -891,6 +963,15 @@ const syncJob = {
   progress: null,
 }
 
+const sqlSyncJob = {
+  status: 'idle',
+  startedAt: null,
+  finishedAt: null,
+  result: null,
+  error: null,
+  progress: null,
+}
+
 const matchingJob = {
   status: 'idle',
   startedAt: null,
@@ -990,6 +1071,57 @@ app.post('/api/loandisk/sync', authMiddleware, (req, res) => {
 
     res.json({ status: 'started', message: 'Borrower sync started in background worker' })
   } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/loandisk/sync-sql/status', authMiddleware, (_req, res) => {
+  res.json({
+    status: sqlSyncJob.status,
+    result: sqlSyncJob.result,
+    error: sqlSyncJob.error,
+    startedAt: sqlSyncJob.startedAt,
+    finishedAt: sqlSyncJob.finishedAt,
+    progress: sqlSyncJob.progress,
+    lastScheduledRun: getLastScheduledSyncRun(),
+  })
+})
+
+app.post('/api/loandisk/sync-sql', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'system_owner' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' })
+    }
+    if (sqlSyncJob.status === 'running') {
+      return res.json({ status: 'running', message: 'SQL sync already in progress' })
+    }
+
+    sqlSyncJob.status = 'running'
+    sqlSyncJob.startedAt = new Date().toISOString()
+    sqlSyncJob.finishedAt = null
+    sqlSyncJob.result = null
+    sqlSyncJob.error = null
+    sqlSyncJob.progress = { phase: 'starting' }
+
+    res.json({ status: 'started', message: 'SQL Server sync started' })
+
+    runSqlBorrowerLoanSync((p) => {
+      sqlSyncJob.progress = { ...sqlSyncJob.progress, ...p }
+    })
+      .then((result) => {
+        sqlSyncJob.status = 'completed'
+        sqlSyncJob.finishedAt = new Date().toISOString()
+        sqlSyncJob.result = result
+        audit('loandisk', null, 'sync_sql', req.user.email, null, result)
+      })
+      .catch((e) => {
+        sqlSyncJob.status = 'failed'
+        sqlSyncJob.finishedAt = new Date().toISOString()
+        sqlSyncJob.error = e.message
+        console.error('SQL sync failed:', e)
+      })
+  } catch (e) {
+    sqlSyncJob.status = 'failed'
     res.status(400).json({ error: e.message })
   }
 })

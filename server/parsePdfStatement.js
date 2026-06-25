@@ -345,7 +345,10 @@ function filterBankCredits(rows) {
     prevBalance = row.balance
   }
 
-  return credits
+  if (credits.length) return credits
+
+  // Fallback: positive txn amounts when balance-delta classification fails
+  return rows.filter((r) => r.creditAmount > 0)
 }
 
 function toBankImportRows(creditRows) {

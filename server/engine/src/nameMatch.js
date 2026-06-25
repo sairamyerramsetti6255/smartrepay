@@ -9,7 +9,7 @@ const STOP_TOKENS = new Set(['mr', 'mrs', 'ms', 'miss', 'dr', 'the', 'jr', 'sr',
 export function nameTokens(name) {
   return String(name || '')
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ') // drop commas, parens, apostrophes, etc.
+    .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
@@ -21,25 +21,53 @@ export function normalizeNameKey(name) {
   return [...nameTokens(name)].sort().join(' ')
 }
 
+/** Rank match kinds for tie-breaking (higher = stronger). */
+export function nameKindRank(kind) {
+  const k = String(kind || '')
+  if (k.startsWith('first+last')) return 100
+  if (k.startsWith('last+first')) return 90
+  if (k === 'token_overlap') return 70
+  if (k.startsWith('last_only')) return 40
+  if (k.startsWith('first_only')) return 30
+  return 0
+}
+
 /**
- * 0-100 similarity. 100 when the smaller name (>=2 tokens) is fully contained
- * in the larger (handles middle names), otherwise Jaccard token overlap.
+ * 0-100 similarity. Subset containment when first tokens agree (bank first+last
+ * must match borrower first token — avoids "Jamaal Moss" → "Clifford Jamaal Moss").
  */
-export function nameScore(a, b) {
-  const ta = new Set(nameTokens(a))
-  const tb = new Set(nameTokens(b))
-  if (!ta.size || !tb.size) return 0
-  const inter = [...ta].filter((t) => tb.has(t)).length
+export function nameScore(a, b, opts = {}) {
+  const typoFloor = opts.typoFloor ?? 0.7
+  const ta = nameTokens(a)
+  const tb = nameTokens(b)
+  const taSet = new Set(ta)
+  const tbSet = new Set(tb)
+  if (!taSet.size || !tbSet.size) return 0
+
+  const inter = [...taSet].filter((t) => tbSet.has(t)).length
   if (inter === 0) return 0
-  const minSize = Math.min(ta.size, tb.size)
+
+  const minSize = Math.min(taSet.size, tbSet.size)
   const coverage = inter / minSize
-  if (coverage === 1 && minSize >= 2) return 100
-  if (coverage === 1 && minSize === 1) return 70 // single shared token (first name only)
-  const jaccard = inter / (ta.size + tb.size - inter)
+
+  if (coverage === 1 && minSize >= 2) {
+    // Bank has first+last: require borrower's first token to match bank's first token.
+    if (ta.length >= 2 && tb.length >= 2) {
+      const simFirst = tokenSim(ta[0], tb[0])
+      if (simFirst < typoFloor) {
+        const jaccard = inter / (taSet.size + tbSet.size - inter)
+        return Math.round(jaccard * 85)
+      }
+    }
+    return 100
+  }
+
+  if (coverage === 1 && minSize === 1) return 70
+
+  const jaccard = inter / (taSet.size + tbSet.size - inter)
   return Math.round(jaccard * 100)
 }
 
-/** Levenshtein edit distance (for typo / spelling-mistake tolerance). */
 export function levenshtein(a, b) {
   a = String(a || '')
   b = String(b || '')
@@ -60,7 +88,6 @@ export function levenshtein(a, b) {
   return dp[n]
 }
 
-/** 0..1 similarity between two single tokens, typo-tolerant. */
 export function tokenSim(a, b) {
   if (!a || !b) return 0
   if (a === b) return 1
@@ -68,20 +95,9 @@ export function tokenSim(a, b) {
   return maxLen ? 1 - levenshtein(a, b) / maxLen : 0
 }
 
-// Per-token similarity floor for a token to count as a (typo-tolerant) match.
 const TYPO_FLOOR = 0.7
 
 /**
- * Score a name pair by trying several real-world combinations and returning the
- * BEST one with a confidence (0-100) that reflects WHICH combination matched:
- *
- *   first+last (same order)  -> up to 100
- *   last+first (reversed)    -> up to  99
- *   ...both with typos       -> scaled by edit-distance similarity
- *   last name only           -> up to  72
- *   first name only          -> up to  60
- *   token_overlap (fallback) -> Jaccard, handles middle names / 3+ tokens
- *
  * @returns {{ score: number, kind: string }}
  */
 export function scoreNameMatch(a, b, opts = {}) {
@@ -89,6 +105,8 @@ export function scoreNameMatch(a, b, opts = {}) {
   const ta = nameTokens(a)
   const tb = nameTokens(b)
   if (!ta.length || !tb.length) return { score: 0, kind: 'none' }
+
+  const bankHasFullName = ta.length >= 2
 
   const fa = ta[0]
   const la = ta[ta.length - 1]
@@ -110,16 +128,21 @@ export function scoreNameMatch(a, b, opts = {}) {
     const exact = simFL === 1 && simLF === 1
     cands.push({ kind: exact ? 'last+first' : 'last+first~typo', score: Math.round(((simFL + simLF) / 2) * 100) - 1 })
   }
-  if (simLL >= 0.8) {
-    cands.push({ kind: simLL === 1 ? 'last_only' : 'last_only~typo', score: Math.round(simLL * 72) })
+
+  // Last/first-only only when bank name is a single token (e.g. surname-only listings).
+  if (!bankHasFullName) {
+    if (simLL >= 0.8) {
+      cands.push({ kind: simLL === 1 ? 'last_only' : 'last_only~typo', score: Math.round(simLL * 72) })
+    }
+    if (simFF >= 0.8) {
+      cands.push({ kind: simFF === 1 ? 'first_only' : 'first_only~typo', score: Math.round(simFF * 60) })
+    }
   }
-  if (simFF >= 0.8) {
-    cands.push({ kind: simFF === 1 ? 'first_only' : 'first_only~typo', score: Math.round(simFF * 60) })
-  }
-  const setScore = nameScore(a, b)
+
+  const setScore = nameScore(a, b, { typoFloor })
   if (setScore > 0) cands.push({ kind: 'token_overlap', score: setScore })
 
   if (!cands.length) return { score: 0, kind: 'none' }
-  cands.sort((x, y) => y.score - x.score)
+  cands.sort((x, y) => y.score - x.score || nameKindRank(y.kind) - nameKindRank(x.kind))
   return cands[0]
 }

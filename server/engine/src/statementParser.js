@@ -311,13 +311,13 @@ function parseEmployerPdf(text, filename) {
 // --------------------------------------------------------------- excel / csv
 
 const HEADER_ALIASES = {
-  date: ['date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date'],
-  payer: ['payer', 'payor', 'name', 'customer', 'from', 'sender', 'beneficiary', 'remitter', 'originator', 'paid by', 'account name', 'employee'],
+  date: ['date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date', 'date posted'],
+  payer: ['payer', 'payor', 'name', 'borrower', 'employer', 'customer', 'from', 'sender', 'beneficiary', 'remitter', 'originator', 'paid by', 'account name', 'employee', 'payee'],
   description: ['description', 'memo', 'narrative', 'details', 'particulars'],
-  amount: ['amount', 'value', 'payment', 'transaction amount', 'txn amount'],
-  credit: ['credit', 'credit amount', 'cr amount', 'deposit', 'deposits', 'money in'],
+  amount: ['amount', 'value', 'payment', 'transaction amount', 'txn amount', 'trans amount'],
+  credit: ['credit', 'credit amount', 'cr amount', 'cr', 'deposit', 'deposits', 'money in'],
   debit: ['debit', 'debit amount', 'dr amount', 'withdrawal', 'withdrawals', 'money out'],
-  reference: ['reference', 'ref', 'reference no', 'reference number', 'transaction id', 'txn id'],
+  reference: ['reference', 'ref', 'reference no', 'reference number', 'transaction id', 'txn id', 'cheque no'],
   type: ['transaction type', 'type', 'txn type', 'dr/cr', 'cr/dr'],
 }
 

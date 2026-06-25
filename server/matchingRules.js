@@ -48,6 +48,60 @@ export const RULE_CATALOG = {
   ],
 }
 
+const SCORE_LIMIT_KEYS = new Set(['nameMinScore', 'nameStrongScore', 'autoMatchConfidence', 'ambiguityConfidenceGap'])
+const CONFIDENCE_WEIGHT_KEYS = new Set(['nameConfidenceWeight', 'amountConfidenceWeight'])
+const TUNING_KEYS = new Set(['amountTolerancePercent', 'typoToleranceFloor'])
+
+function inferThresholdUnit(key, item = {}) {
+  if (item.unit) return item.unit
+  if (CONFIDENCE_WEIGHT_KEYS.has(key)) return 'weight'
+  if (key === 'typoToleranceFloor') return 'similarity'
+  if (key === 'amountTolerancePercent') return 'percent'
+  return 'points'
+}
+
+/** API catalog shape — supports legacy `thresholds` flat array from older server builds. */
+export function getRuleCatalog(catalog = RULE_CATALOG) {
+  if (catalog?.scoreLimits?.length) {
+    return {
+      scoreLimits: catalog.scoreLimits,
+      confidenceWeights: catalog.confidenceWeights || [],
+      tuning: catalog.tuning || [],
+      signals: catalog.signals || RULE_CATALOG.signals,
+      amountComponents: catalog.amountComponents || RULE_CATALOG.amountComponents,
+      thresholds: [
+        ...(catalog.scoreLimits || []),
+        ...(catalog.confidenceWeights || []),
+        ...(catalog.tuning || []),
+      ],
+    }
+  }
+
+  const flat = Array.isArray(catalog?.thresholds) ? catalog.thresholds : []
+  const scoreLimits = []
+  const confidenceWeights = []
+  const tuning = []
+
+  for (const item of flat) {
+    if (!item?.key || item.key === 'amountToleranceMin') continue
+    const meta = { ...item, unit: inferThresholdUnit(item.key, item) }
+    if (SCORE_LIMIT_KEYS.has(item.key)) scoreLimits.push(meta)
+    else if (CONFIDENCE_WEIGHT_KEYS.has(item.key)) confidenceWeights.push(meta)
+    else if (TUNING_KEYS.has(item.key)) tuning.push(meta)
+  }
+
+  return {
+    scoreLimits: scoreLimits.length ? scoreLimits : RULE_CATALOG.scoreLimits,
+    confidenceWeights: confidenceWeights.length ? confidenceWeights : RULE_CATALOG.confidenceWeights,
+    tuning: tuning.length ? tuning : RULE_CATALOG.tuning,
+    signals: catalog?.signals || RULE_CATALOG.signals,
+    amountComponents: catalog?.amountComponents || RULE_CATALOG.amountComponents,
+    thresholds: flat.length
+      ? flat
+      : [...RULE_CATALOG.scoreLimits, ...RULE_CATALOG.confidenceWeights, ...RULE_CATALOG.tuning],
+  }
+}
+
 export const DEFAULT_MATCHING_RULES = {
   version: 2,
   thresholds: Object.fromEntries(
