@@ -239,6 +239,7 @@
 			l.NumOfRepayments AS TotalInstallments,
 			ISNULL(rc.Cnt, 0) AS InstallmentsPaid,
 			lr.LastRepaymentDate AS EMILastPaidDate,
+			lr.LastRepaymentAmount AS EMILastPaidAmount,
 			l.BranchId,
 			l.BranchName,
 			CASE
@@ -254,9 +255,12 @@
 			WHERE r.LoanId = l.LoanId AND r.BranchId = l.BranchId
 		) rc
 		OUTER APPLY (
-			SELECT MAX(r.RepaymentCollectedDate) AS LastRepaymentDate
+			SELECT TOP 1
+				r.RepaymentCollectedDate AS LastRepaymentDate,
+				r.RepaymentAmount AS LastRepaymentAmount
 			FROM dbo.SILloanrepayments r
 			WHERE r.LoanId = l.LoanId AND r.BranchId = l.BranchId
+			ORDER BY r.RepaymentCollectedDate DESC, r.RepaymentId DESC
 		) lr
 		WHERE CAST(l.BorrowerId AS VARCHAR(50)) = @rc_bid
 		  AND (
@@ -345,6 +349,95 @@
 			SourceChannel, EntryType, CollectedDate, ReceiptFileName, ReceiptDocumentId, EnteredBy, CreatedAt
 		FROM dbo.Staging_ManualReceipts
 		ORDER BY CreatedAt DESC, Id DESC;
+	END
+
+	-- Exec CRIF_Operations '[{"Id":1,"BorrowerId":"1",...}]','Update_ManualReceipt',''
+	ELSE IF (@Condition = 'Update_ManualReceipt')
+	BEGIN
+		DECLARE @ur TABLE (
+			Id INT, BorrowerId VARCHAR(50), LoanNumber NVARCHAR(100), BranchId VARCHAR(50),
+			BorrowerFullName NVARCHAR(255), AmountReceived DECIMAL(18,2), Particulars NVARCHAR(500),
+			SourceChannel VARCHAR(20), EntryType VARCHAR(20), CollectedDate DATE,
+			ReceiptFileName NVARCHAR(260), ReceiptDocumentId VARCHAR(36), EnteredBy NVARCHAR(255)
+		);
+
+		INSERT INTO @ur
+		SELECT * FROM OPENJSON(@Json) WITH (
+			Id INT, BorrowerId VARCHAR(50), LoanNumber NVARCHAR(100), BranchId VARCHAR(50),
+			BorrowerFullName NVARCHAR(255), AmountReceived DECIMAL(18,2), Particulars NVARCHAR(500),
+			SourceChannel VARCHAR(20), EntryType VARCHAR(20), CollectedDate DATE,
+			ReceiptFileName NVARCHAR(260), ReceiptDocumentId VARCHAR(36), EnteredBy NVARCHAR(255)
+		);
+
+		IF NOT EXISTS (SELECT 1 FROM @ur)
+		BEGIN SELECT 'False' AS Result, 'No data' AS Message; RETURN; END
+
+		IF NOT EXISTS (
+			SELECT 1 FROM @ur u INNER JOIN dbo.Staging_ManualReceipts s ON s.Id = u.Id
+		)
+		BEGIN SELECT 'False' AS Result, 'Receipt not found' AS Message; RETURN; END
+
+		UPDATE s SET
+			BorrowerId = u.BorrowerId,
+			LoanNumber = u.LoanNumber,
+			BranchId = u.BranchId,
+			BorrowerFullName = u.BorrowerFullName,
+			AmountReceived = u.AmountReceived,
+			Particulars = u.Particulars,
+			SourceChannel = u.SourceChannel,
+			EntryType = ISNULL(u.EntryType, 'manual'),
+			CollectedDate = u.CollectedDate,
+			ReceiptFileName = COALESCE(u.ReceiptFileName, s.ReceiptFileName),
+			ReceiptDocumentId = COALESCE(u.ReceiptDocumentId, s.ReceiptDocumentId),
+			EnteredBy = COALESCE(u.EnteredBy, s.EnteredBy)
+		FROM dbo.Staging_ManualReceipts s
+		INNER JOIN @ur u ON s.Id = u.Id;
+
+		IF COL_LENGTH('dbo.SILloanrepayments', 'ReceiptSource') IS NOT NULL
+		BEGIN
+			BEGIN TRY
+				UPDATE r SET
+					LoanId = TRY_CAST(u.LoanNumber AS BIGINT),
+					BranchId = u.BranchId,
+					RepaymentAmount = u.AmountReceived,
+					RepaymentCollectedDate = CONVERT(NVARCHAR(20), u.CollectedDate, 23),
+					RepaymentDescription = u.Particulars,
+					ReceiptSource = u.SourceChannel,
+					Particulars = u.Particulars,
+					ReceiptFileName = COALESCE(u.ReceiptFileName, r.ReceiptFileName)
+				FROM dbo.SILloanrepayments r
+				INNER JOIN @ur u ON r.RepaymentId = 900000000000000 + u.Id
+				WHERE TRY_CAST(u.LoanNumber AS BIGINT) IS NOT NULL;
+			END TRY
+			BEGIN CATCH
+			END CATCH
+		END
+
+		SELECT 'True' AS Result, 'Updated' AS Message, (SELECT COUNT(*) FROM @ur) AS Updated;
+	END
+
+	-- Exec CRIF_Operations '{"Id":1}','Delete_ManualReceipt',''
+	ELSE IF (@Condition = 'Delete_ManualReceipt')
+	BEGIN
+		DECLARE @did INT = TRY_CAST(JSON_VALUE(@Json, '$.Id') AS INT);
+		IF @did IS NULL
+		BEGIN SELECT 'False' AS Result, 'Missing Id' AS Message; RETURN; END
+
+		IF NOT EXISTS (SELECT 1 FROM dbo.Staging_ManualReceipts WHERE Id = @did)
+		BEGIN SELECT 'False' AS Result, 'Receipt not found' AS Message; RETURN; END
+
+		IF COL_LENGTH('dbo.SILloanrepayments', 'ReceiptSource') IS NOT NULL
+		BEGIN
+			BEGIN TRY
+				DELETE FROM dbo.SILloanrepayments WHERE RepaymentId = 900000000000000 + @did;
+			END TRY
+			BEGIN CATCH
+			END CATCH
+		END
+
+		DELETE FROM dbo.Staging_ManualReceipts WHERE Id = @did;
+
+		SELECT 'True' AS Result, 'Deleted' AS Message, @did AS Id;
 	END
 
 	-- Exec CRIF_Operations '{"LoanNumber":"100"}','Get_LoanRepayments',''

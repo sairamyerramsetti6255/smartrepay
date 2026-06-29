@@ -38,6 +38,7 @@ import {
   insertBankTransactions,
   uniqueFileName,
   getActiveLoans,
+  getActiveLoanByNumber,
   getBankTransactions,
   getStagingCounts,
   getDashboardStats,
@@ -48,6 +49,8 @@ import {
   flagDuplicateRows,
   getLoansByBorrowerId,
   saveManualReceipt,
+  updateManualReceipt,
+  deleteManualReceipt,
   getManualReceipts,
   searchBorrowersForReceipts,
   getLoanRepayments,
@@ -423,6 +426,16 @@ app.get('/api/active-loans', authMiddleware, async (req, res) => {
   }
 })
 
+app.get('/api/active-loans/:loanNumber', authMiddleware, async (req, res) => {
+  try {
+    const loan = await getActiveLoanByNumber(req.params.loanNumber)
+    if (!loan) return res.status(404).json({ error: 'Loan not found' })
+    res.json({ loan })
+  } catch (e) {
+    res.status(500).json({ error: `Could not load loan: ${e.message}` })
+  }
+})
+
 // --- Staged bank transactions (Staging_BankTransactions on SQL Server) ---
 app.get('/api/bank-transactions', authMiddleware, async (req, res) => {
   try {
@@ -539,6 +552,72 @@ app.post('/api/receipts', authMiddleware, upload.single('receipt'), async (req, 
     })
 
     res.json({ ok: true, receiptDocumentId, ...result })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.put('/api/receipts/:id', authMiddleware, upload.single('receipt'), async (req, res) => {
+  try {
+    const id = req.params.id
+    const borrowerId = String(req.body.borrowerId || '').trim()
+    const loanNumber = String(req.body.loanNumber || '').trim()
+    const amountReceived = req.body.amountReceived
+    const particulars = String(req.body.particulars || '').trim()
+    const sourceChannel = String(req.body.sourceChannel || '').trim().toLowerCase()
+    const collectedDate = req.body.collectedDate || new Date().toISOString().slice(0, 10)
+    const branchId = req.body.branchId || null
+    const borrowerName = req.body.borrowerName || null
+
+    if (!borrowerId) return res.status(400).json({ error: 'Borrower ID is required' })
+    if (!loanNumber) return res.status(400).json({ error: 'Select a loan' })
+
+    let receiptDocumentId = req.body.receiptDocumentId || null
+    let receiptFileName = req.body.receiptFileName || null
+    if (req.file) {
+      receiptDocumentId = saveUploadedDocument({
+        buffer: req.file.buffer,
+        filename: req.file.originalname,
+        mimeType: req.file.mimetype,
+        documentType: 'receipt',
+        uploadedBy: req.user.email,
+        rowCount: 1,
+      })
+      receiptFileName = req.file.originalname
+    }
+
+    const result = await updateManualReceipt(id, {
+      borrowerId,
+      loanNumber,
+      branchId,
+      borrowerName,
+      amountReceived,
+      particulars,
+      sourceChannel,
+      collectedDate,
+      receiptFileName,
+      receiptDocumentId,
+      enteredBy: req.user.email,
+    })
+
+    audit('receipt', String(id), 'update_manual_receipt', req.user.email, null, {
+      borrowerId,
+      loanNumber,
+      amountReceived,
+      sourceChannel,
+    })
+
+    res.json({ ok: true, ...result })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.delete('/api/receipts/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await deleteManualReceipt(req.params.id)
+    audit('receipt', String(req.params.id), 'delete_manual_receipt', req.user.email, null, null)
+    res.json({ ok: true, ...result })
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -721,12 +800,9 @@ app.put('/api/settings/matching-rules', authMiddleware, (req, res) => {
   try {
     if (req.user.role !== 'system_owner') return res.status(403).json({ error: 'Forbidden' })
     const raw = req.body?.rules || req.body
-    const thresholds = normalizeConfidenceWeights({
+    const thresholds = {
       ...DEFAULT_MATCHING_RULES.thresholds,
       ...(raw?.thresholds || {}),
-    })
-    if (Math.abs(confidenceWeightSum(thresholds) - 1) > 0.01) {
-      return res.status(400).json({ error: 'Name weight and amount weight must total 100%' })
     }
     const rules = resolveMatchingRules({ ...raw, thresholds })
     const next = saveSettings(

@@ -1,6 +1,7 @@
 import path from 'path'
 import { crif } from './crifClient.js'
 import { resolveParticularsFields } from './particularsParse.js'
+import { parseBucketFromReasoning, confidenceBucket } from './engine/src/matchingEngine.js'
 
 /**
  * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations over HTTP
@@ -214,6 +215,14 @@ export async function getActiveLoans({ search = '', limit = 10000 } = {}) {
   return filtered.slice(0, max)
 }
 
+/** Single active loan row by loan number (exact match). */
+export async function getActiveLoanByNumber(loanNumber) {
+  const id = String(loanNumber || '').trim()
+  if (!id) return null
+  const rows = await getActiveLoans({ search: id, limit: 200 })
+  return rows.find((r) => String(r.LoanNumber ?? '') === id) || null
+}
+
 /** Staged bank/payroll credit transactions (for the Upload Documents grid). */
 export async function getBankTransactions({ search = '' } = {}) {
   const rows = await execCrif('{}', 'Get_BankTransactions')
@@ -249,6 +258,10 @@ function shapeMatchRow(r) {
     particulars: r.Particulars,
     borrowerName: r.BorrowerName,
   })
+  const reasoning = r.Reasoning || null
+  const confidence_score = r.ConfidenceScore != null ? Number(r.ConfidenceScore) : null
+  const confidence_bucket = parseBucketFromReasoning(reasoning) || confidenceBucket(confidence_score ?? 0)
+
   return {
     id: String(r.Id),
     bank_transaction_id: r.Id,
@@ -263,7 +276,8 @@ function shapeMatchRow(r) {
     employer_or_bank: r.EmployerOrBank,
     status: reviewStatusToUi(r.ReviewStatus),
     review_status: r.ReviewStatus || null,
-    confidence_score: r.ConfidenceScore != null ? Number(r.ConfidenceScore) : null,
+    confidence_score,
+    confidence_bucket,
     matched_borrower_id: r.BorrowerId || null,
     matched_borrower_name: r.LoanDiskBorrowerName || null,
     borrower_loandisk_id: r.BorrowerId || null,
@@ -368,16 +382,104 @@ function mapToSortedList(map, labelKey = 'name') {
     .sort((a, b) => b.count - a.count)
 }
 
+/** Hybrid name-match tier (70 / 90 / 100 gates). */
+function nameScoreTier(score) {
+  const s = Number(score) || 0
+  if (s >= 100) return 'full_match_amount'
+  if (s >= 90) return 'full_name'
+  if (s >= 70) return 'first_last'
+  return 'no_match'
+}
+
+function daysSinceDate(dateStr) {
+  if (!dateStr) return null
+  const d = new Date(dateStr)
+  if (Number.isNaN(d.getTime())) return null
+  return Math.floor((Date.now() - d.getTime()) / 86400000)
+}
+
+/** Why a credit line did not match (processed or pending). */
+function classifyMissingPattern(t) {
+  if (t.status === 'matched') return null
+  if (t.status === 'pending') return 'awaiting_match'
+  if (!t.name_score || t.name_score < 70) return 'name_mismatch'
+  if (t.amount_match_kind === 'mismatch' || t.amount_match_kind === 'none') return 'amount_mismatch'
+  if (t.amount_match_kind === 'partial') return 'partial_payment'
+  if (t.confidence_bucket === 'possible_review') return 'review_band_failed'
+  if (t.confidence_bucket === 'different_person') return 'low_name_confidence'
+  return 'no_match_found'
+}
+
+const REPAYMENT_BUCKET_SEVERITY = {
+  delinquent: 5,
+  overdue: 4,
+  at_risk: 3,
+  no_payments: 2,
+  on_track: 1,
+  excellent: 0,
+}
+
+function rateLoanRepayment(loan) {
+  const status = String(loan.LoanStatus || '').toLowerCase()
+  const totalPaid = Number(loan.TotalPaid) || 0
+  const balance = Number(loan.LoanBalanceAmount) || 0
+  const days = daysSinceDate(loan.EMILastPaidDate)
+
+  if (status.includes('arrear') || status.includes('default') || status.includes('overdue') || status.includes('past')) {
+    return 'delinquent'
+  }
+  if (totalPaid <= 0 && balance > 0) return 'no_payments'
+  if (days != null && days > 45) return 'overdue'
+  if (days != null && days > 35) return 'at_risk'
+  if (days != null && days <= 30 && totalPaid > 0) return 'excellent'
+  if (totalPaid > 0) return 'on_track'
+  return 'on_track'
+}
+
+function emptyFileAlgo(filename, sourceType) {
+  return {
+    filename,
+    sourceType: sourceType || 'unknown',
+    total: 0,
+    matched: 0,
+    unmatched: 0,
+    pending: 0,
+    byBucket: {},
+    byNameTier: {},
+    byAmountKind: {},
+    confSum: 0,
+    confCount: 0,
+  }
+}
+
+function shapeFileAlgoRow(raw) {
+  const matchRate = raw.total ? Math.round((raw.matched / raw.total) * 100) : 0
+  return {
+    filename: raw.filename,
+    sourceType: raw.sourceType,
+    total: raw.total,
+    matched: raw.matched,
+    unmatched: raw.unmatched,
+    pending: raw.pending,
+    matchRate,
+    avgConfidence: raw.confCount ? Math.round((raw.confSum / raw.confCount) * 10) / 10 : null,
+    byConfidenceBucket: mapToSortedList(raw.byBucket, 'bucket'),
+    byNameTier: mapToSortedList(raw.byNameTier, 'tier'),
+    byAmountMatchKind: mapToSortedList(raw.byAmountKind, 'kind'),
+  }
+}
+
 /**
- * Reconciliation dashboard stats — matching + receipts + imports only.
- * No active-loan book figures (balances, borrowers, EMI totals).
+ * Reconciliation dashboard stats — matching, imports, receipts, algorithm
+ * analytics, and borrower repayment health from the active loan book.
  */
 export async function getDashboardStats() {
-  const [summaryRows, matchResult, documents, receipts] = await Promise.all([
+  const [summaryRows, matchResult, documents, receipts, activeLoans] = await Promise.all([
     execCrif('{}', 'Get_MatchSummary'),
     getSqlMatchResults(),
     getDocuments(),
     getManualReceipts(),
+    getActiveLoans({ limit: 20000 }),
   ])
 
   const s = summaryRows[0] || {}
@@ -392,9 +494,19 @@ export async function getDashboardStats() {
   const bySourceType = {}
   const byMatchMethod = {}
   const byMatchType = {}
+  const byConfidenceBucket = {}
+  const byNameTier = {}
+  const byAmountMatchKind = {}
+  const bySourceConfidence = {}
+  const missingPatterns = {}
+  const fileAlgoMap = new Map()
   let autoMatched = 0
   let confirmed = 0
   let needsReview = 0
+  let nameScoreSum = 0
+  let nameScoreCount = 0
+  let confidenceSum = 0
+  let confidenceCount = 0
 
   for (const t of matchResult.transactions) {
     const rs = t.review_status || 'pending'
@@ -405,6 +517,43 @@ export async function getDashboardStats() {
     if (rs === 'auto_matched') autoMatched += 1
     if (rs === 'confirmed') confirmed += 1
     if (rs === 'needs_review') needsReview += 1
+
+    const bucket = t.confidence_bucket || confidenceBucket(t.confidence_score ?? 0)
+    bump(byConfidenceBucket, bucket)
+    bump(byNameTier, nameScoreTier(t.name_score))
+    if (t.amount_match_kind) bump(byAmountMatchKind, t.amount_match_kind)
+    if (t.name_score != null) {
+      nameScoreSum += Number(t.name_score) || 0
+      nameScoreCount += 1
+    }
+    if (t.confidence_score != null) {
+      confidenceSum += Number(t.confidence_score) || 0
+      confidenceCount += 1
+    }
+
+    const src = t.source_type || 'unknown'
+    if (!bySourceConfidence[src]) bySourceConfidence[src] = {}
+    bump(bySourceConfidence[src], bucket)
+
+    const pattern = classifyMissingPattern(t)
+    if (pattern) bump(missingPatterns, pattern)
+
+    const fn = t.source_filename || 'unknown'
+    if (!fileAlgoMap.has(fn)) {
+      fileAlgoMap.set(fn, emptyFileAlgo(fn, t.source_type))
+    }
+    const fa = fileAlgoMap.get(fn)
+    fa.total += 1
+    if (t.status === 'matched') fa.matched += 1
+    else if (t.status === 'exception') fa.unmatched += 1
+    else fa.pending += 1
+    bump(fa.byBucket, bucket)
+    bump(fa.byNameTier, nameScoreTier(t.name_score))
+    if (t.amount_match_kind) bump(fa.byAmountKind, t.amount_match_kind)
+    if (t.confidence_score != null) {
+      fa.confSum += Number(t.confidence_score) || 0
+      fa.confCount += 1
+    }
   }
 
   const today = isoDay(new Date())
@@ -462,6 +611,84 @@ export async function getDashboardStats() {
     .sort((a, b) => b.unmatchedCount - a.unmatchedCount || b.totalRows - a.totalRows)
     .slice(0, 8)
 
+  const fileAnalytics = documents
+    .map((d) => {
+      const raw = fileAlgoMap.get(d.filename) || emptyFileAlgo(d.filename, d.source_type || d.document_type)
+      return {
+        ...shapeFileAlgoRow(raw),
+        totalRows: d.total_rows ?? 0,
+        documentMatched: d.matched_count ?? 0,
+        documentUnmatched: d.unmatched_count ?? 0,
+      }
+    })
+    .sort((a, b) => b.unmatched - a.unmatched || b.total - a.total)
+    .slice(0, 12)
+
+  const algorithmBySource = Object.entries(bySourceConfidence).map(([source, buckets]) => ({
+    source,
+    buckets: mapToSortedList(buckets, 'bucket'),
+    total: Object.values(buckets).reduce((s, n) => s + n, 0),
+  })).sort((a, b) => b.total - a.total)
+
+  const byRepaymentBucket = {}
+  const borrowerMap = new Map()
+  let totalRepaid = 0
+  let totalOutstanding = 0
+  let overdueLoanCount = 0
+
+  for (const loan of activeLoans) {
+    const bucket = rateLoanRepayment(loan)
+    bump(byRepaymentBucket, bucket)
+    totalRepaid += Number(loan.TotalPaid) || 0
+    totalOutstanding += Number(loan.LoanBalanceAmount) || 0
+    if (bucket === 'overdue' || bucket === 'delinquent' || bucket === 'at_risk') overdueLoanCount += 1
+
+    const bid = String(loan.BorrowerId ?? '').trim()
+    if (!bid) continue
+    if (!borrowerMap.has(bid)) {
+      borrowerMap.set(bid, {
+        borrowerId: bid,
+        borrowerName: loan.BorrowerFullName || `Borrower ${bid}`,
+        loans: [],
+        worstBucket: 'excellent',
+        worstSeverity: 0,
+      })
+    }
+    const b = borrowerMap.get(bid)
+    b.loans.push(loan)
+    const sev = REPAYMENT_BUCKET_SEVERITY[bucket] ?? 0
+    if (sev > b.worstSeverity) {
+      b.worstSeverity = sev
+      b.worstBucket = bucket
+    }
+  }
+
+  const borrowerRatings = []
+  const borrowerBucketCounts = {}
+  for (const b of borrowerMap.values()) {
+    bump(borrowerBucketCounts, b.worstBucket)
+    const primary = b.loans[0]
+    const days = daysSinceDate(primary?.EMILastPaidDate)
+    borrowerRatings.push({
+      borrowerId: b.borrowerId,
+      borrowerName: b.borrowerName,
+      loanCount: b.loans.length,
+      rating: b.worstBucket,
+      totalPaid: b.loans.reduce((s, l) => s + (Number(l.TotalPaid) || 0), 0),
+      outstanding: b.loans.reduce((s, l) => s + (Number(l.LoanBalanceAmount) || 0), 0),
+      lastEmiPaidDate: primary?.EMILastPaidDate ?? null,
+      daysSinceLastPayment: days,
+      loanStatus: primary?.LoanStatus ?? null,
+    })
+  }
+
+  const atRiskBorrowers = borrowerRatings
+    .filter((b) => ['delinquent', 'overdue', 'at_risk', 'no_payments'].includes(b.rating))
+    .sort((a, b) => (b.daysSinceLastPayment ?? 0) - (a.daysSinceLastPayment ?? 0))
+    .slice(0, 10)
+
+  const manualReceiptTotal = receipts.reduce((s, r) => s + (Number(r.amountReceived) || 0), 0)
+
   return {
     matching: {
       stagedCredits,
@@ -504,6 +731,28 @@ export async function getDashboardStats() {
     },
     activity: {
       daily: [...dailyMap.values()],
+    },
+    algorithm: {
+      byConfidenceBucket: mapToSortedList(byConfidenceBucket, 'bucket'),
+      byNameTier: mapToSortedList(byNameTier, 'tier'),
+      byAmountMatchKind: mapToSortedList(byAmountMatchKind, 'kind'),
+      bySourceType: algorithmBySource,
+      missingPatterns: mapToSortedList(missingPatterns, 'pattern'),
+      avgNameScore: nameScoreCount ? Math.round((nameScoreSum / nameScoreCount) * 10) / 10 : null,
+      avgConfidence: confidenceCount ? Math.round((confidenceSum / confidenceCount) * 10) / 10 : null,
+      fileAnalytics,
+    },
+    repayments: {
+      activeLoans: activeLoans.length,
+      borrowers: borrowerMap.size,
+      totalRepaid: Math.round(totalRepaid * 100) / 100,
+      totalOutstanding: Math.round(totalOutstanding * 100) / 100,
+      overdueOrAtRiskLoans: overdueLoanCount,
+      manualReceiptCount: receipts.length,
+      manualReceiptTotal: Math.round(manualReceiptTotal * 100) / 100,
+      byLoanBucket: mapToSortedList(byRepaymentBucket, 'bucket'),
+      byBorrowerBucket: mapToSortedList(borrowerBucketCounts, 'bucket'),
+      atRiskBorrowers,
     },
   }
 }
@@ -568,6 +817,7 @@ function shapeLoanForReceipt(r) {
     totalInstallments: r.TotalInstallments != null ? Number(r.TotalInstallments) : r.NumOfRepayments ?? null,
     installmentsPaid,
     lastEmiPaidDate: r.EMILastPaidDate ?? null,
+    lastEmiPaidAmount: r.EMILastPaidAmount != null ? Number(r.EMILastPaidAmount) : null,
     loanBalance: r.LoanBalanceAmount != null ? Number(r.LoanBalanceAmount) : null,
     branchId: r.BranchId ?? null,
     branchName: r.BranchName ?? null,
@@ -658,6 +908,57 @@ export async function saveManualReceipt(payload) {
 
   const result = await execCrif([row], 'Save_ManualReceipt')
   return result[0] || { Inserted: 1 }
+}
+
+/** Update an existing manual receipt in staging (+ best-effort SIL mirror). */
+export async function updateManualReceipt(id, payload) {
+  const receiptId = Number(id)
+  if (!Number.isFinite(receiptId) || receiptId <= 0) throw new Error('Invalid receipt id')
+
+  const source = String(payload.sourceChannel || '').trim().toLowerCase()
+  if (!isValidReceiptSource(source)) {
+    throw new Error('Source must be walkin, whatsapp, email, or phone')
+  }
+
+  const amount = Number(payload.amountReceived)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Amount received must be a positive number')
+  }
+
+  const row = {
+    Id: receiptId,
+    BorrowerId: String(payload.borrowerId || '').trim(),
+    LoanNumber: String(payload.loanNumber || '').trim(),
+    BranchId: payload.branchId ?? null,
+    BorrowerFullName: payload.borrowerName ?? null,
+    AmountReceived: amount,
+    Particulars: String(payload.particulars || '').trim() || null,
+    SourceChannel: source,
+    EntryType: 'manual',
+    CollectedDate: payload.collectedDate || new Date().toISOString().slice(0, 10),
+    ReceiptFileName: payload.receiptFileName ?? null,
+    ReceiptDocumentId: payload.receiptDocumentId ?? null,
+    EnteredBy: payload.enteredBy ?? null,
+  }
+
+  if (!row.BorrowerId) throw new Error('Borrower ID is required')
+  if (!row.LoanNumber) throw new Error('Loan is required')
+
+  const result = await execCrif([row], 'Update_ManualReceipt')
+  return result[0] || { Updated: 1 }
+}
+
+/** Delete a manual receipt from staging (+ best-effort SIL mirror). */
+export async function deleteManualReceipt(id) {
+  const receiptId = Number(id)
+  if (!Number.isFinite(receiptId) || receiptId <= 0) throw new Error('Invalid receipt id')
+
+  const result = await execCrif({ Id: receiptId }, 'Delete_ManualReceipt')
+  const row = result[0]
+  if (row?.Result === 'False' || row?.Result === false) {
+    throw new Error(row?.Message || 'Could not delete receipt')
+  }
+  return row || { Deleted: 1 }
 }
 
 /**

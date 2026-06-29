@@ -19,9 +19,9 @@ export const AMOUNT_TOLERANCE_MIN_DEFAULT = 1.5
 export const RULE_CATALOG = {
   /** Score cutoffs — independent limits (0–100 points), not part of the weight mix. */
   scoreLimits: [
-    { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate.', min: 0, max: 100, step: 1, default: 55, unit: 'points' },
-    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Required for name + amount match type at high confidence.', min: 0, max: 100, step: 1, default: 85, unit: 'points' },
-    { key: 'autoMatchConfidence', label: 'Auto-match confidence', hint: 'At or above this, a match is auto-approved.', min: 0, max: 100, step: 1, default: 70, unit: 'points' },
+    { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate. First + last must match for at least 70.', min: 0, max: 100, step: 1, default: 70, unit: 'points' },
+    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Full name match tier (90+). With amount reconciliation, confidence becomes 100.', min: 0, max: 100, step: 1, default: 90, unit: 'points' },
+    { key: 'autoMatchConfidence', label: 'Auto-match confidence', hint: 'At or above this, a match is auto-approved (very likely / same person bands).', min: 0, max: 100, step: 1, default: 85, unit: 'points' },
     { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 1, max: 30, step: 1, default: 8, unit: 'points' },
   ],
   /** Only these two must sum to 100% — they blend name vs amount into the final confidence score. */
@@ -46,6 +46,30 @@ export const RULE_CATALOG = {
     { key: 'mismatch', label: 'Amount mismatch', default: 25 },
     { key: 'none', label: 'No amount data', default: 10 },
   ],
+  /** Read-only reference for the settings UI — hybrid name blend weights. */
+  nameAlgorithm: {
+    title: 'Per-token name blend',
+    description:
+      'Each first/last token is scored with a weighted blend. Both tokens must clear the typo floor or the name score is 0.',
+    blend: [
+      { key: 'jaro', label: 'Jaro-Winkler', weight: 0.45 },
+      { key: 'damerau', label: 'Damerau-Levenshtein', weight: 0.3 },
+      { key: 'phonetic', label: 'Double Metaphone', weight: 0.15 },
+      { key: 'levenshtein', label: 'Levenshtein similarity', weight: 0.1 },
+    ],
+    tiers: [
+      { range: '0', label: 'No match', description: 'First or last name failed the typo floor — different person.' },
+      { range: '70–89', label: 'First + last', description: 'Both first and last names match (typo-tolerant).' },
+      { range: '90–99', label: 'Full name', description: 'All bank name tokens found in the borrower name.' },
+      { range: '100', label: 'Full name + amount', description: 'Full name tier (≥ strong score) and EMI reconciles.' },
+    ],
+  },
+  confidenceBuckets: [
+    { key: 'same_person', min: 95, label: 'Same person', hint: 'Exact / same person — full name strong and amount usually reconciles.' },
+    { key: 'very_likely_match', min: 85, max: 94, label: 'Very likely', hint: 'Likely same person; may lack perfect amount or full confidence.' },
+    { key: 'possible_review', min: 70, max: 84, label: 'Review', hint: 'First + last passes — needs manual review.' },
+    { key: 'different_person', max: 69, label: 'Different person', hint: 'Not a valid match; name gate failed → confidence 0.' },
+  ],
 }
 
 const SCORE_LIMIT_KEYS = new Set(['nameMinScore', 'nameStrongScore', 'autoMatchConfidence', 'ambiguityConfidenceGap'])
@@ -69,6 +93,8 @@ export function getRuleCatalog(catalog = RULE_CATALOG) {
       tuning: catalog.tuning || [],
       signals: catalog.signals || RULE_CATALOG.signals,
       amountComponents: catalog.amountComponents || RULE_CATALOG.amountComponents,
+      nameAlgorithm: catalog.nameAlgorithm || RULE_CATALOG.nameAlgorithm,
+      confidenceBuckets: catalog.confidenceBuckets || RULE_CATALOG.confidenceBuckets,
       thresholds: [
         ...(catalog.scoreLimits || []),
         ...(catalog.confidenceWeights || []),
@@ -96,6 +122,8 @@ export function getRuleCatalog(catalog = RULE_CATALOG) {
     tuning: tuning.length ? tuning : RULE_CATALOG.tuning,
     signals: catalog?.signals || RULE_CATALOG.signals,
     amountComponents: catalog?.amountComponents || RULE_CATALOG.amountComponents,
+    nameAlgorithm: catalog?.nameAlgorithm || RULE_CATALOG.nameAlgorithm,
+    confidenceBuckets: catalog?.confidenceBuckets || RULE_CATALOG.confidenceBuckets,
     thresholds: flat.length
       ? flat
       : [...RULE_CATALOG.scoreLimits, ...RULE_CATALOG.confidenceWeights, ...RULE_CATALOG.tuning],
@@ -283,7 +311,7 @@ export async function previewMatchSample(input, rulesPartial = {}) {
     setMatchingEngineConfig,
   } = await import('./engine/src/matchingEngine.js')
   const { scoreNameMatch } = await import('./engine/src/nameMatch.js')
-  const { reconcileAmount } = await import('./engine/src/matchingEngine.js')
+  const { reconcileAmount, confidenceBucket } = await import('./engine/src/matchingEngine.js')
 
   const engineCfg = buildEngineConfig(rulesPartial)
   setMatchingEngineConfig(engineCfg)
@@ -336,6 +364,7 @@ export async function previewMatchSample(input, rulesPartial = {}) {
     nameKind: nameFromPayer.score >= nameFromDesc.score ? nameFromPayer.kind : nameFromDesc.kind,
     amountMatchKind: amountRecon.kind,
     confidence: record.confidenceScore,
+    confidenceBucket: confidenceBucket(record.confidenceScore),
     reviewStatus: record.reviewStatus,
     matchType: record.matchType,
     wouldAutoMatch: record.reviewStatus === 'auto_matched',

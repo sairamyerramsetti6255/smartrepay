@@ -1,4 +1,10 @@
-import { nameTokens, scoreNameMatch, normalizeNameKey, nameKindRank } from './nameMatch.js'
+import {
+  nameTokens,
+  scoreNameMatch,
+  normalizeNameKey,
+  nameKindRank,
+  formatBreakdownShort,
+} from './nameMatch.js'
 import { resolveParticularsFields } from '../../particularsParse.js'
 import { buildEngineConfig, extractIdsWithPatterns } from '../../matchingRules.js'
 
@@ -22,10 +28,36 @@ function cfg() {
 }
 
 // Legacy exports — reflect current runtime defaults
-export const NAME_MIN = 55
-export const NAME_STRONG = 85
-export const AUTO_CONFIDENCE = 70
-const GRAY_LO = 60
+export const NAME_MIN = 70
+export const NAME_STRONG = 90
+export const AUTO_CONFIDENCE = 85
+
+export const CONFIDENCE_BUCKET_LABELS = {
+  same_person: 'Same person',
+  very_likely_match: 'Very likely',
+  possible_review: 'Review',
+  different_person: 'Different person',
+}
+
+/** Map final confidence (0–100) to a bucket tag for each line item. */
+export function confidenceBucket(confidence) {
+  const c = Number(confidence) || 0
+  if (c >= 95) return 'same_person'
+  if (c >= 85) return 'very_likely_match'
+  if (c >= 70) return 'possible_review'
+  return 'different_person'
+}
+
+export function formatReasoningWithBucket(bucket, text) {
+  const tag = bucket || 'different_person'
+  const body = String(text || '').trim()
+  return body ? `[${tag}] ${body}` : `[${tag}]`
+}
+
+export function parseBucketFromReasoning(reasoning) {
+  const m = String(reasoning || '').match(/^\[([a-z_]+)\]\s*/)
+  return m ? m[1] : null
+}
 
 const round2 = (v) => Math.round((Number(v) || 0) * 100) / 100
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
@@ -86,7 +118,7 @@ export function findCandidateBorrowers(bankName, index, limit = 5) {
   return [...seen.values()]
     .map((group) => {
       const m = scoreNameMatch(bankName, group.borrowerName, { typoFloor: cfg().TYPO_FLOOR })
-      return { group, score: m.score, nameKind: m.kind }
+      return { group, score: m.score, nameKind: m.kind, nameBreakdown: m.breakdown }
     })
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score)
@@ -319,6 +351,12 @@ function unmatchedRecord(tx, candidates) {
   const { borrowerName, description } = parseTxParticulars(tx)
   const label = description ? `description "${description}"` : `name "${borrowerName || tx.BorrowerName}"`
   const nameMin = cfg().NAME_MIN
+  const confidenceScore = 0
+  const bucket = confidenceBucket(confidenceScore)
+  const reasonText = top
+    ? `Closest match for ${label} → "${top.group.borrowerName}" scored ${top.score} (< ${nameMin}).`
+    : `No borrower candidate found for ${label}.`
+
   return {
     bankTransactionId: tx.Id,
     fileName: tx.FileName,
@@ -335,12 +373,11 @@ function unmatchedRecord(tx, candidates) {
     matchType: 'unmatched',
     amountMatchKind: 'none',
     nameScore: top ? top.score : 0,
-    confidenceScore: top ? Math.round(0.45 * top.score) : 0,
+    confidenceScore,
+    confidenceBucket: bucket,
     matchMethod: 'deterministic',
     reviewStatus: 'unmatched',
-    reasoning: top
-      ? `Closest match for ${label} → "${top.group.borrowerName}" scored ${top.score} (< ${nameMin}).`
-      : `No borrower candidate found for ${label}.`,
+    reasoning: formatReasoningWithBucket(bucket, reasonText),
   }
 }
 
@@ -349,9 +386,18 @@ function scoreCandidate(cand, recon) {
   const c = cfg()
   const amtComp = amountComponent(recon.kind)
   const reconciled = recon.kind === 'exact_single' || recon.kind === 'sum_all' || recon.kind === 'subset'
-  let confidence = Math.round(c.NAME_WEIGHT * cand.score + c.AMOUNT_WEIGHT * amtComp)
-  if (cand.score >= c.NAME_STRONG && reconciled) confidence = Math.max(confidence, 90)
-  if (cand.score >= 95 && reconciled) confidence = Math.max(confidence, 97)
+  const ns = cand.score
+
+  if (!ns || ns <= 0) {
+    return { cand, recon, amtComp, reconciled, confidence: 0 }
+  }
+
+  // Tiered: first+last 70+, full name 90+, full name + amount → 100
+  let confidence = ns
+  if (ns >= c.NAME_STRONG && reconciled) {
+    confidence = 100
+  }
+
   if (recon.ambiguous) confidence = Math.min(confidence, 80)
   return { cand, recon, amtComp, reconciled, confidence: clamp(confidence, 0, 100) }
 }
@@ -438,6 +484,7 @@ export function classify(tx, index) {
   const { cand: top, recon } = best
   const matchType = best.reconciled && top.score >= cfg().NAME_STRONG ? 'name_and_amount' : 'name_only'
 
+  const bucket = confidenceBucket(confidence)
   const record = {
     bankTransactionId: tx.Id,
     fileName: tx.FileName,
@@ -455,9 +502,13 @@ export function classify(tx, index) {
     amountMatchKind: recon.kind,
     nameScore: top.score,
     confidenceScore: confidence,
+    confidenceBucket: bucket,
     matchMethod: 'deterministic',
     reviewStatus: reviewStatusFor(confidence, true),
-    reasoning: buildDeterministicReason(top, recon, ambiguous, { borrowerName, description }),
+    reasoning: formatReasoningWithBucket(
+      bucket,
+      buildDeterministicReason(top, recon, ambiguous, { borrowerName, description })
+    ),
   }
 
   // Escalate to the LLM ONLY when the amount could NOT break a genuine name tie.
@@ -482,6 +533,9 @@ function buildDeterministicReason(top, recon, ambiguousName, fields = {}) {
   const bits = [
     `${matchedVia}; ${top.nameKind || 'name match'} ~${top.score}% vs "${top.group.borrowerName}"`,
   ]
+  if (top.nameBreakdown) {
+    bits.push(formatBreakdownShort(top.nameBreakdown))
+  }
   if (fields.description && top.matchedFrom !== 'name') {
     bits.push(`description "${fields.description}"`)
   }
@@ -579,11 +633,13 @@ export function applyAi(tx, candidates, ai) {
 
   if (noMatch) {
     const base = unmatchedRecord(tx, candidates)
+    const bucket = confidenceBucket(confidence || base.confidenceScore)
     return {
       ...base,
       matchMethod: 'ai',
       confidenceScore: confidence || base.confidenceScore,
-      reasoning: (ai?.reasoning || base.reasoning || '').slice(0, 1000),
+      confidenceBucket: bucket,
+      reasoning: formatReasoningWithBucket(bucket, (ai?.reasoning || base.reasoning || '').replace(/^\[[a-z_]+\]\s*/, '')).slice(0, 1000),
       reviewStatus: 'unmatched',
     }
   }
@@ -596,6 +652,9 @@ export function applyAi(tx, candidates, ai) {
   const kind = ai.amountMatchKind || 'none'
   const amtComp = amountComponent(kind)
   const matchType = amtComp === 100 && chosen.score >= cfg().NAME_STRONG ? 'name_and_amount' : 'name_only'
+
+  const bucket = confidenceBucket(confidence)
+  const reasonBody = (ai.reasoning || '').replace(/^\[[a-z_]+\]\s*/, '')
 
   return {
     bankTransactionId: tx.Id,
@@ -614,8 +673,9 @@ export function applyAi(tx, candidates, ai) {
     amountMatchKind: kind,
     nameScore: chosen.score,
     confidenceScore: confidence,
+    confidenceBucket: bucket,
     matchMethod: 'ai',
     reviewStatus: reviewStatusFor(confidence, true),
-    reasoning: (ai.reasoning || '').slice(0, 1000),
+    reasoning: formatReasoningWithBucket(bucket, reasonBody).slice(0, 1000),
   }
 }
