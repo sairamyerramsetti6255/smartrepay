@@ -34,6 +34,8 @@ import { getBorrowerResponse } from './borrowerFetchService.js'
 import { runMatch } from './matchRunner.js'
 import { runSqlBorrowerLoanSync } from './borrowerLoanSyncService.js'
 import { getLastScheduledSyncRun } from './syncScheduler.js'
+import { pullBorrowerFromMonthlyBull, getMigrationLogs, getNodeCrifData, generateCrifFile } from './crifClient.js'
+import { parseBorrowerIdsFromBuffer } from './parseBorrowerIds.js'
 import {
   insertBankTransactions,
   uniqueFileName,
@@ -1056,6 +1058,112 @@ const matchingJob = {
   result: null,
   error: null,
 }
+
+// --- CRIF ---
+app.post('/api/crif/parse-borrower-ids', authMiddleware, upload.single('file'), (req, res) => {
+  try {
+    if (!req.file?.buffer?.length) return res.status(400).json({ error: 'No file uploaded' })
+    const parsed = parseBorrowerIdsFromBuffer(req.file.buffer, req.file.originalname)
+    res.json({
+      ...parsed,
+      fileName: req.file.originalname,
+    })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/crif/pull-borrower-from-monthly-bull', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    const branchIDs = String(req.body?.branchIDs ?? '').trim()
+    const performMigration = req.body?.performMigration !== 'false' && req.body?.performMigration !== false
+    let borrowerIDs = String(req.body?.borrowerIDs ?? '').trim()
+
+    if (req.file?.buffer?.length) {
+      const parsed = parseBorrowerIdsFromBuffer(req.file.buffer, req.file.originalname)
+      borrowerIDs = parsed.borrowerIDs
+    }
+
+    if (!branchIDs && !borrowerIDs) {
+      return res.status(400).json({ error: 'Select at least one branch or upload a borrower ID file' })
+    }
+
+    const result = await pullBorrowerFromMonthlyBull({ branchIDs, borrowerIDs, performMigration })
+    res.json({
+      ...result,
+      borrowerCount: borrowerIDs ? borrowerIDs.split(',').filter(Boolean).length : 0,
+      fileName: req.file?.originalname || null,
+    })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/crif/migration-logs', authMiddleware, async (req, res) => {
+  try {
+    const result = await getMigrationLogs({
+      pageIndex: req.query.pageIndex,
+      pageSize: req.query.pageSize,
+      viewType: req.query.viewType || req.query.type || 'Summary',
+      id: req.query.id,
+      borrowerId: req.query.borrowerId,
+      fromDate: req.query.fromDate,
+      toDate: req.query.toDate,
+    })
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/crif/node-data', authMiddleware, async (req, res) => {
+  try {
+    const typeRaw = req.query.type ?? req.query.Type ?? ''
+    const type =
+      String(typeRaw).toLowerCase() === 'all' || String(typeRaw).trim() === ''
+        ? ''
+        : String(typeRaw).trim()
+
+    const result = await getNodeCrifData({
+      pageIndex: req.query.pageIndex ?? req.query.PageIndex ?? 1,
+      pageSize: req.query.pageSize ?? req.query.PageSize ?? 20,
+      type,
+      accountingDate: req.query.accountingDate ?? req.query.AccountingDate,
+      branch: req.query.branch ?? req.query.Branch,
+      borrowerId: req.query.borrowerId ?? req.query.borrower_id,
+    })
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/crif/generate-file', authMiddleware, async (req, res) => {
+  try {
+    const {
+      category,
+      branchIds,
+      borrowerId,
+      asciiCode,
+      asciiCustom,
+      length,
+      lengthCustom,
+    } = req.body ?? {}
+
+    const result = await generateCrifFile({
+      category,
+      branchIds,
+      borrowerId,
+      asciiCode,
+      asciiCustom,
+      length,
+      lengthCustom,
+    })
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
 
 // --- LoanDisk ---
 app.get('/api/loandisk/token', authMiddleware, async (_req, res) => {

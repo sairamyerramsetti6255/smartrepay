@@ -1,8 +1,9 @@
 import { execSync } from 'child_process'
+import { platform } from 'os'
 
 const port = process.argv[2] || '3001'
 
-try {
+function freePortWindows() {
   const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8' })
   const pids = new Set()
   for (const line of out.split(/\r?\n/)) {
@@ -18,6 +19,24 @@ try {
       /* already gone */
     }
   }
+}
+
+function freePortUnix() {
+  const out = execSync(`lsof -ti tcp:${port}`, { encoding: 'utf8' })
+  const pids = [...new Set(out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean))]
+  for (const pid of pids) {
+    try {
+      execSync(`kill -9 ${pid}`, { stdio: 'ignore' })
+      console.log(`Freed port ${port} (stopped PID ${pid})`)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+try {
+  if (platform() === 'win32') freePortWindows()
+  else freePortUnix()
 } catch {
   /* port already free */
 }
