@@ -34,7 +34,8 @@ import { getBorrowerResponse } from './borrowerFetchService.js'
 import { runMatch } from './matchRunner.js'
 import { runSqlBorrowerLoanSync } from './borrowerLoanSyncService.js'
 import { getLastScheduledSyncRun } from './syncScheduler.js'
-import { pullBorrowerFromMonthlyBull, getMigrationLogs, getNodeCrifData, generateCrifFile } from './crifClient.js'
+import { pullBorrowerFromMonthlyBull, getMigrationLogs, getMigrationFailedRecords, getNodeCrifData, generateCrifFile, getCrifSyncStatus, runUniversalCrifSync } from './crifClient.js'
+import { pullBorrowersToNodeCrif } from './nodeCrifPull.js'
 import { parseBorrowerIdsFromBuffer } from './parseBorrowerIds.js'
 import {
   insertBankTransactions,
@@ -1078,22 +1079,96 @@ app.post('/api/crif/pull-borrower-from-monthly-bull', authMiddleware, upload.sin
     const branchIDs = String(req.body?.branchIDs ?? '').trim()
     const performMigration = req.body?.performMigration !== 'false' && req.body?.performMigration !== false
     let borrowerIDs = String(req.body?.borrowerIDs ?? '').trim()
+    let parsedFile = null
 
     if (req.file?.buffer?.length) {
-      const parsed = parseBorrowerIdsFromBuffer(req.file.buffer, req.file.originalname)
-      borrowerIDs = parsed.borrowerIDs
+      parsedFile = parseBorrowerIdsFromBuffer(req.file.buffer, req.file.originalname)
+      borrowerIDs = parsedFile.borrowerIDs
     }
 
     if (!branchIDs && !borrowerIDs) {
       return res.status(400).json({ error: 'Select at least one branch or upload a borrower ID file' })
     }
 
-    const result = await pullBorrowerFromMonthlyBull({ branchIDs, borrowerIDs, performMigration })
+    const result = await pullBorrowerFromMonthlyBull({
+      branchIDs,
+      borrowerIDs,
+      performMigration,
+      requestedIds: parsedFile?.ids ?? null,
+    })
     res.json({
       ...result,
-      borrowerCount: borrowerIDs ? borrowerIDs.split(',').filter(Boolean).length : 0,
+      borrowerCount: parsedFile?.count ?? (borrowerIDs ? borrowerIDs.split(',').filter(Boolean).length : 0),
+      requestedIds: parsedFile?.ids ?? [],
+      borrowers: parsedFile?.rows ?? [],
       fileName: req.file?.originalname || null,
+      targeted: Boolean(parsedFile?.count),
     })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+/**
+ * Excel / borrower-ID list → LoanDisk API → NodeCRIF_SubjectData + NodeCRIF_ContractData.
+ */
+app.post('/api/crif/sync-from-loandisk', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    let ids = []
+    let parsedFile = null
+
+    if (req.file?.buffer?.length) {
+      parsedFile = parseBorrowerIdsFromBuffer(req.file.buffer, req.file.originalname)
+      ids = parsedFile.ids
+    } else {
+      const raw = String(req.body?.borrowerIDs ?? '').trim()
+      ids = raw
+        ? raw.split(/[,\s]+/).map((id) => id.trim()).filter(Boolean)
+        : []
+    }
+
+    if (!ids.length) {
+      return res.status(400).json({ error: 'Upload an Excel file with borrower IDs or pass borrowerIDs' })
+    }
+
+    const branchIDs = String(req.body?.branchIDs ?? '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean)
+
+    const result = await pullBorrowersToNodeCrif({
+      borrowerIds: ids,
+      branchIds: branchIDs.length ? branchIDs : undefined,
+    })
+
+    res.json({
+      ...result,
+      borrowerCount: ids.length,
+      requestedIds: ids,
+      borrowers: parsedFile?.rows ?? ids.map((borrowerId) => ({ borrowerId, name: null })),
+      fileName: req.file?.originalname || null,
+      targeted: true,
+      source: 'loandisk→NodeCRIF',
+    })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/crif/sync-status', authMiddleware, async (_req, res) => {
+  try {
+    const result = await getCrifSyncStatus()
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/crif/sync', authMiddleware, async (req, res) => {
+  try {
+    const performMigration = req.body?.performMigration !== false && req.body?.performMigration !== 'false'
+    const result = await runUniversalCrifSync({ performMigration })
+    res.json(result)
   } catch (e) {
     res.status(400).json({ error: e.message })
   }
@@ -1109,6 +1184,17 @@ app.get('/api/crif/migration-logs', authMiddleware, async (req, res) => {
       borrowerId: req.query.borrowerId,
       fromDate: req.query.fromDate,
       toDate: req.query.toDate,
+    })
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/crif/migration-failed-records', authMiddleware, async (req, res) => {
+  try {
+    const result = await getMigrationFailedRecords({
+      type: req.query.type ?? req.query.Type ?? 'Subject',
     })
     res.json(result)
   } catch (e) {
@@ -1162,6 +1248,53 @@ app.post('/api/crif/generate-file', authMiddleware, async (req, res) => {
     res.json(result)
   } catch (e) {
     res.status(400).json({ error: e.message })
+  }
+})
+
+/** Proxy CRIF file download so the browser saves locally (attachment) instead of opening the remote URL. */
+app.get('/api/crif/download-file', authMiddleware, async (req, res) => {
+  try {
+    const fileUrl = String(req.query.url || '').trim()
+    if (!fileUrl) {
+      return res.status(400).json({ error: 'File URL is required' })
+    }
+
+    let parsed
+    try {
+      parsed = new URL(fileUrl)
+    } catch {
+      return res.status(400).json({ error: 'Invalid file URL' })
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return res.status(400).json({ error: 'Invalid file URL protocol' })
+    }
+
+    // Only allow downloads from the known CRIF upload host
+    const allowedHosts = new Set([
+      'simplifiedapi.meanhost.in',
+      'www.simplifiedapi.meanhost.in',
+    ])
+    if (!allowedHosts.has(parsed.hostname)) {
+      return res.status(400).json({ error: 'File host is not allowed' })
+    }
+
+    const upstream = await fetch(fileUrl, { signal: AbortSignal.timeout(120_000) })
+    if (!upstream.ok) {
+      return res.status(502).json({ error: `Could not fetch CRIF file (HTTP ${upstream.status})` })
+    }
+
+    const rawName = decodeURIComponent(parsed.pathname.split('/').pop() || '')
+    const safeName = (rawName.replace(/[^\w.\-]+/g, '_') || 'CRIF_File.txt').slice(0, 180)
+    const buffer = Buffer.from(await upstream.arrayBuffer())
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`)
+    res.setHeader('Content-Length', String(buffer.length))
+    res.setHeader('Cache-Control', 'no-store')
+    res.send(buffer)
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Failed to download CRIF file' })
   }
 })
 

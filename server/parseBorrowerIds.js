@@ -7,6 +7,24 @@ const BORROWER_HEADER_ALIASES = new Set([
   'borrowerids',
   'borrower ids',
   'id',
+  'borroweruniquenumber',
+  'borrower unique number',
+  'borrower_unique_number',
+  'uniquenumber',
+  'unique number',
+  'nibnumber',
+  'nib number',
+])
+
+const NAME_HEADER_ALIASES = new Set([
+  'borrowername',
+  'borrower name',
+  'borrower_name',
+  'name',
+  'fullname',
+  'full name',
+  'customername',
+  'customer name',
 ])
 
 function normalizeHeader(value) {
@@ -19,6 +37,12 @@ function normalizeHeader(value) {
 function isBorrowerHeader(value) {
   const key = normalizeHeader(value)
   return BORROWER_HEADER_ALIASES.has(key) || key === 'borrowerid'
+}
+
+function isNameHeader(value) {
+  const key = normalizeHeader(value)
+  if (BORROWER_HEADER_ALIASES.has(key)) return false
+  return NAME_HEADER_ALIASES.has(key) || key.includes('name')
 }
 
 function toIdString(value) {
@@ -41,33 +65,65 @@ function uniqueIds(ids) {
 }
 
 function extractFromObjectRows(rows) {
-  if (!rows.length) return []
+  if (!rows.length) return { ids: [], rows: [] }
 
   const sample = rows.find((row) => row && typeof row === 'object' && !Array.isArray(row))
-  if (!sample) return []
+  if (!sample) return { ids: [], rows: [] }
 
   const keys = Object.keys(sample)
   const matchKey =
     keys.find((key) => isBorrowerHeader(key)) ||
     keys.find((key) => normalizeHeader(key).includes('borrower')) ||
     keys[0]
+  const nameKey = keys.find((key) => isNameHeader(key))
 
-  if (!matchKey) return []
+  if (!matchKey) return { ids: [], rows: [] }
 
-  return uniqueIds(rows.map((row) => toIdString(row?.[matchKey])).filter(Boolean))
+  const parsedRows = []
+  for (const row of rows) {
+    const borrowerId = toIdString(row?.[matchKey])
+    if (!borrowerId) continue
+    const name = nameKey ? String(row?.[nameKey] ?? '').trim() : ''
+    parsedRows.push({ borrowerId, name: name || null })
+  }
+
+  const ids = uniqueIds(parsedRows.map((row) => row.borrowerId))
+  const byId = new Map(parsedRows.map((row) => [row.borrowerId, row]))
+  return {
+    ids,
+    rows: ids.map((borrowerId) => byId.get(borrowerId)),
+  }
 }
 
 function extractFromArrayRows(rows) {
-  if (!rows.length) return []
+  if (!rows.length) return { ids: [], rows: [] }
 
+  const headerRow = rows[0] || []
   let start = 0
-  const firstCell = rows[0]?.[0]
-  if (isBorrowerHeader(firstCell)) start = 1
+  let idCol = 0
+  let nameCol = -1
 
-  const colIndex = rows.some((row) => isBorrowerHeader(row?.[0])) ? 0 : 0
-  return uniqueIds(
-    rows.slice(start).map((row) => toIdString(row?.[colIndex])).filter(Boolean)
-  )
+  if (headerRow.some((cell) => isBorrowerHeader(cell) || isNameHeader(cell))) {
+    start = 1
+    idCol = headerRow.findIndex((cell) => isBorrowerHeader(cell))
+    if (idCol < 0) idCol = 0
+    nameCol = headerRow.findIndex((cell) => isNameHeader(cell))
+  }
+
+  const parsedRows = []
+  for (const row of rows.slice(start)) {
+    const borrowerId = toIdString(row?.[idCol])
+    if (!borrowerId) continue
+    const name = nameCol >= 0 ? String(row?.[nameCol] ?? '').trim() : ''
+    parsedRows.push({ borrowerId, name: name || null })
+  }
+
+  const ids = uniqueIds(parsedRows.map((row) => row.borrowerId))
+  const byId = new Map(parsedRows.map((row) => [row.borrowerId, row]))
+  return {
+    ids,
+    rows: ids.map((borrowerId) => byId.get(borrowerId)),
+  }
 }
 
 /**
@@ -88,20 +144,21 @@ export function parseBorrowerIdsFromBuffer(buffer, filename = '') {
 
   const sheet = workbook.Sheets[sheetName]
   const objectRows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false })
-  let ids = extractFromObjectRows(objectRows)
+  let extracted = extractFromObjectRows(objectRows)
 
-  if (!ids.length) {
+  if (!extracted.ids.length) {
     const arrayRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
-    ids = extractFromArrayRows(arrayRows)
+    extracted = extractFromArrayRows(arrayRows)
   }
 
-  if (!ids.length) {
+  if (!extracted.ids.length) {
     throw new Error('No borrower IDs found — use a BorrowerId column like the sample file')
   }
 
   return {
-    borrowerIDs: ids.join(','),
-    count: ids.length,
-    ids,
+    borrowerIDs: extracted.ids.join(','),
+    count: extracted.ids.length,
+    ids: extracted.ids,
+    rows: extracted.rows,
   }
 }

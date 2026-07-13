@@ -13,6 +13,7 @@
     "import": "node engine/scripts/importTransactions.js",
     "init-db": "node engine/scripts/initDb.js",
     "apply-crif": "node engine/scripts/_applyCrifAdditions.js",
+    "apply-monthly-bulk-unique": "node scripts/apply-monthly-bulk-unique-number.mjs",
     "apply-receipts-schema": "node scripts/apply-receipts-schema.mjs",
     "refresh-staging": "node scripts/refresh-staging-from-sil.mjs",
     "refresh-staging-loandisk": "node scripts/refresh-staging-from-loandisk.mjs",
