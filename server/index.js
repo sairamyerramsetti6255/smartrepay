@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url'
 import { randomUUID, createHash } from 'crypto'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
+import { verifyMicrosoftIdToken, getMicrosoftPublicConfig, isMicrosoftAuthConfigured } from './microsoftAuth.js'
 import { matchTransaction, detectExceptionType } from './matcher.js'
 import { runHeavyJob, isHeavyJobRunning, getActiveJobName } from './jobRunner.js'
 import { getMatchingPreview, getBranchTransactions } from './matchingService.js'
@@ -757,16 +758,50 @@ app.post('/api/auth/signup', (_req, res) => {
   res.status(403).json({ error: 'Account creation is disabled. Contact the administrator.' })
 })
 
-app.post('/api/auth/signin', (req, res) => {
-  const { email, password } = req.body
-  const user = db.prepare('select * from users where email = ?').get(email)
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Invalid email or password' })
+app.get('/api/auth/microsoft/config', (_req, res) => {
+  res.json(getMicrosoftPublicConfig())
+})
+
+app.post('/api/auth/microsoft', async (req, res) => {
+  try {
+    if (!isMicrosoftAuthConfigured()) {
+      return res.status(503).json({ error: 'Microsoft sign-in is not configured' })
+    }
+
+    const idToken = String(req.body?.idToken ?? '').trim()
+    if (!idToken) return res.status(400).json({ error: 'idToken is required' })
+
+    const claims = await verifyMicrosoftIdToken(idToken)
+    let user = db
+      .prepare('select * from users where lower(email) = lower(?)')
+      .get(claims.email)
+
+    if (!user) {
+      const defaultRole = String(process.env.AZURE_DEFAULT_ROLE || 'collections').trim() || 'collections'
+      const id = randomUUID()
+      const fullName = claims.name || claims.email.split('@')[0]
+      db.prepare(
+        'insert into users (id, email, password_hash, role, full_name) values (?, ?, ?, ?, ?)'
+      ).run(id, claims.email, bcrypt.hashSync(randomUUID(), 10), defaultRole, fullName)
+      user = db.prepare('select * from users where id = ?').get(id)
+    } else if (claims.name && !user.full_name) {
+      db.prepare('update users set full_name = ? where id = ?').run(claims.name, user.id)
+      user = db.prepare('select * from users where id = ?').get(user.id)
+    }
+
+    const token = signToken(user)
+    res.json({
+      token,
+      user: { id: user.id, email: user.email, role: user.role, full_name: user.full_name },
+    })
+  } catch (e) {
+    res.status(401).json({ error: e.message || 'Microsoft sign-in failed' })
   }
-  const token = signToken(user)
-  res.json({
-    token,
-    user: { id: user.id, email: user.email, role: user.role, full_name: user.full_name },
+})
+
+app.post('/api/auth/signin', (_req, res) => {
+  res.status(403).json({
+    error: 'Password sign-in is disabled. Use Sign in with Microsoft (@slendingbahamas.com).',
   })
 })
 
