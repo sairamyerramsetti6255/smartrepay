@@ -262,14 +262,19 @@ function toEmployerImportRows(rows) {
 
 function cleanBankText(text) {
   return text
-    .replace(/-- \d+ of \d+ --/g, '\n')
-    .replace(/ONE JFK WEST[\s\S]*?AC\. STATUS: NORM/g, '\n')
+    .replace(/Important Notice:[\s\S]*?(?=(?:-- \d+ of \d+ --|$))/gi, '\n')
+    .replace(/Conditions of Account Operation:[\s\S]*?(?=(?:-- \d+ of \d+ --|$))/gi, '\n')
+    .replace(/ONE JFK WEST[\s\S]*?(?:-- \d+ of \d+ --|\n(?=\d{1,2}\/\d{1,2}\/\d{2}))/gi, '\n')
+    .replace(/SIMPLIFIED LENDING LIMITED[\s\S]*?AC\.\s*STATUS:\s*NORM/gi, '\n')
+    .replace(/-- \d+ of \d+ --/gi, '\n')
+    .replace(/Page\.\s*\d+\s+of\s*\d+/gi, '\n')
     .replace(/Date Posted\s+Value[\s\S]*?Balance\n/gi, '\n')
     .replace(/Detailed Client Statement/gi, '\n')
     .replace(/Balance Brought Forward[^\n]*/gi, '\n')
     .replace(/Balance Carried Forward[^\n]*/gi, '\n')
     .replace(/Statement Message Items Amount[\s\S]*?Total Value Added Taxes[^\n]*/gi, '\n')
-    .replace(/Page\.\s*\d+\s+of\s*\d+/gi, '\n')
+    .replace(/Dr\s*=\s*Overdrawn Balance/gi, ' ')
+    .replace(/(?:Shirley Street|Village Road|John F\. Kennedy|Head Office|Carmichael Road|Freeport|Bimini|Eleuthera|San Salvador|Inagua|Customer Care|Mangrove Cay|Kemp's Bay|Cat Island)[^\n]*\(\d{3}\)\d{3}-\d{4}/gi, '\n')
 }
 
 function groupBankBlocks(text) {
@@ -313,7 +318,13 @@ function parseBankBlock(block) {
     }
   }
 
-  particulars = particulars.replace(/\s+/g, ' ').trim()
+  particulars = particulars
+    .replace(/Dr\s*=\s*Overdrawn Balance/gi, '')
+    .replace(/Important Notice:[\s\S]*$/gi, '')
+    .replace(/Conditions of Account[\s\S]*$/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
   if (!particulars.includes('|')) {
     particulars = particulars.replace(/\s+[A-Za-z]{1,12}$/, '').trim()
   }
@@ -354,18 +365,20 @@ function filterBankCredits(rows) {
 function toBankImportRows(creditRows) {
   return creditRows.map((r) => {
     const parsed = parsePipeParticulars(r.particulars)
+    const borrowerName = r.name || parsed.borrowerName || ''
     return {
       datePosted: r.datePosted,
       valueDate: r.valueDate,
       reference: r.reference,
       particulars: r.particulars,
       creditAmount: r.creditAmount,
-      name: r.name || parsed.borrowerName,
+      name: borrowerName,
       date: r.valueDate,
-      payer: r.name || parsed.borrowerName,
+      payer: borrowerName,
       transactionDescription: parsed.description,
       description: r.particulars,
       amount: r.creditAmount,
+      employerOrBank: parsed.companyAccount || 'Bank of The Bahamas',
     }
   })
 }

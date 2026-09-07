@@ -112,8 +112,20 @@ export function buildBorrowerIndex(groups) {
  */
 export function findCandidateBorrowers(bankName, index, limit = 5) {
   const seen = new Map()
-  for (const t of new Set(nameTokens(bankName))) {
-    for (const g of index.get(t) || []) if (!seen.has(g.key)) seen.set(g.key, g)
+  const bTokens = new Set(nameTokens(bankName))
+  for (const t of bTokens) {
+    for (const g of index.get(t) || []) {
+      if (!seen.has(g.key)) seen.set(g.key, g)
+    }
+    if (t.length >= 4) {
+      for (const [idxToken, groups] of index.entries()) {
+        if (idxToken.length >= 4 && (t.includes(idxToken) || idxToken.includes(t))) {
+          for (const g of groups) {
+            if (!seen.has(g.key)) seen.set(g.key, g)
+          }
+        }
+      }
+    }
   }
   return [...seen.values()]
     .map((group) => {

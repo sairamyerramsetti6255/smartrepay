@@ -445,6 +445,28 @@ export function nameScore(a, b, opts = {}) {
   return scoreNameMatch(a, b, opts).score
 }
 
+function splitFusedToken(token, borrowerTokens) {
+  if (!borrowerTokens || borrowerTokens.length < 2) return null
+  const t = String(token || '').toLowerCase()
+  if (t.length < 4) return null
+  const b0 = borrowerTokens[0].toLowerCase()
+  const b1 = borrowerTokens[borrowerTokens.length - 1].toLowerCase()
+
+  // Try first + last
+  if (t.startsWith(b0) || (b0.length >= 3 && t.startsWith(b0.slice(0, 4)))) {
+    const p1 = b0.length <= t.length && t.startsWith(b0) ? b0 : t.slice(0, Math.min(b0.length, t.length - 2))
+    const p2 = t.slice(p1.length)
+    if (p2.length >= 2) return [p1, p2]
+  }
+  // Try last + first
+  if (t.startsWith(b1) || (b1.length >= 3 && t.startsWith(b1.slice(0, 4)))) {
+    const p1 = b1.length <= t.length && t.startsWith(b1) ? b1 : t.slice(0, Math.min(b1.length, t.length - 2))
+    const p2 = t.slice(p1.length)
+    if (p2.length >= 2) return [p2, p1]
+  }
+  return null
+}
+
 /**
  * @returns {{ score: number, kind: string, breakdown: object|null }}
  */
@@ -454,12 +476,18 @@ export function scoreNameMatch(a, b, opts = {}) {
   const tb = nameTokens(b)
   if (!ta.length || !tb.length) return { score: 0, kind: 'none', breakdown: null }
 
-  if (ta.length < 2) return { score: 0, kind: 'none', breakdown: null }
+  let activeTa = ta
+  if (ta.length === 1 && tb.length >= 2) {
+    const split = splitFusedToken(ta[0], tb)
+    if (split) activeTa = split
+  }
 
-  const orient = orientationScore(ta, tb, typoFloor)
+  if (activeTa.length < 2) return { score: 0, kind: 'none', breakdown: null }
+
+  const orient = orientationScore(activeTa, tb, typoFloor)
   if (!orient) return { score: 0, kind: 'none', breakdown: null }
 
-  const fullName = isFullNameMatch(ta, tb, typoFloor)
+  const fullName = isFullNameMatch(activeTa, tb, typoFloor)
   const kind = fullName ? `${orient.kind}+full` : orient.kind
   const score = tieredNameScore(orient.quality, fullName)
 
