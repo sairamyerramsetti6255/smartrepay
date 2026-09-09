@@ -1,0 +1,10 @@
+node_modules
+data
+smartrepay.db*
+.env
+*.tmp
+*.zip
+uploads/
+.git
+.DS_Store
+*.log
