@@ -3,3 +3,7 @@ smartrepay.db
 smartrepay.db-wal
 smartrepay.db-shm
 data/
+.env
+*.tmp
+*.zip
+uploads/

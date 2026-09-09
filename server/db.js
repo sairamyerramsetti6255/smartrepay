@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto'
 import bcrypt from 'bcryptjs'
 import { ensureDataDirs } from './paths.js'
 import { openDatabase } from './dbFactory.js'
+import { qbMigrateDb } from './qb/qbMigrate.js'
 
 ensureDataDirs()
 
@@ -136,14 +137,21 @@ export function initDb() {
   `)
 
   migrateDb()
+  qbMigrateDb(db)
 
-  // Single admin login. The old demo account is removed so its credentials stop working.
-  db.prepare("delete from users where email = 'demo@smartrepay.local'").run()
-  const admin = db.prepare('select id from users where email = ?').get('admin@pbshope.com')
-  if (!admin) {
-    db.prepare(
-      'insert into users (id, email, password_hash, role, full_name) values (?, ?, ?, ?, ?)'
-    ).run(randomUUID(), 'admin@pbshope.com', bcrypt.hashSync('pbs2026', 10), 'system_owner', 'Admin')
+  // Seed standard login users if not existing
+  const seedUsers = [
+    { email: 'admin@pbshope.com', role: 'system_owner', name: 'System Administrator' },
+    { email: 'accounting@pbshope.com', role: 'accounting', name: 'Accounting Officer' },
+    { email: 'collections@pbshope.com', role: 'collections', name: 'Collections Officer' },
+  ]
+  for (const u of seedUsers) {
+    const existing = db.prepare('select id from users where lower(email) = lower(?)').get(u.email)
+    if (!existing) {
+      db.prepare(
+        'insert into users (id, email, password_hash, role, full_name) values (?, ?, ?, ?, ?)'
+      ).run(randomUUID(), u.email, bcrypt.hashSync('pbs2026', 10), u.role, u.name)
+    }
   }
 
   const settingsCount = db.prepare('select count(*) as c from app_settings').get().c

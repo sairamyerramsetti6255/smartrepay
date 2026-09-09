@@ -61,12 +61,15 @@ import {
 } from './stagingDb.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
+import quickbooksRouter from './routes/quickbooks.js'
+import { qbMigrateDb } from './qb/qbMigrate.js'
 
 ensureDataDirs()
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
 initDb()
+qbMigrateDb(db)
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -799,10 +802,32 @@ app.post('/api/auth/microsoft', async (req, res) => {
   }
 })
 
-app.post('/api/auth/signin', (_req, res) => {
-  res.status(403).json({
-    error: 'Password sign-in is disabled. Use Sign in with Microsoft (@slendingbahamas.com).',
-  })
+app.post('/api/auth/signin', (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase()
+    const password = String(req.body?.password || '')
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' })
+    }
+
+    const user = db.prepare('select * from users where lower(email) = lower(?)').get(email)
+    if (!user || !user.password_hash) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    const valid = bcrypt.compareSync(password, user.password_hash)
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    const token = signToken(user)
+    res.json({
+      token,
+      user: { id: user.id, email: user.email, role: user.role, full_name: user.full_name },
+    })
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Sign in failed' })
+  }
 })
 
 app.get('/api/auth/me', authMiddleware, (req, res) => {
@@ -1817,9 +1842,13 @@ if (fs.existsSync(distPath)) {
   console.log(`Serving frontend from ${distPath}`)
 }
 
+// QuickBooks Data module routes (additive — no existing routes affected)
+app.use('/api/quickbooks', authMiddleware, quickbooksRouter)
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`SmartRepay running on 0.0.0.0:${PORT}`)
   console.log(`Ingest: POST /api/ingest/parse · AI: ${process.env.OPENROUTER_API_KEY ? 'enabled' : 'disabled'}`)
+  console.log(`QuickBooks Data: GET /api/quickbooks/summary`)
   console.log('Login: admin@pbshope.com')
 })
 

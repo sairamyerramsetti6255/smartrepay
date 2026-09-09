@@ -27,6 +27,20 @@ export class SqliteDatabase {
       run: (...params) => stmt.run(...params),
     }
   }
+
+  transaction(fn) {
+    return (...args) => {
+      this._db.exec('BEGIN TRANSACTION')
+      try {
+        const result = fn(...args)
+        this._db.exec('COMMIT')
+        return result
+      } catch (err) {
+        this._db.exec('ROLLBACK')
+        throw err
+      }
+    }
+  }
 }
 
 export function openDatabase(filePath = DB_PATH) {
