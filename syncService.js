@@ -86,6 +86,21 @@ async function importBorrowerBatch(db, borrowers, actor, meta = {}, onProgress) 
 }
 
 export async function runBorrowerSync(db, actor, onProgress) {
-  const { borrowers, total, orgId, source, branches, totalReported, message } = await fetchAllBorrowers()
-  return importBorrowerBatch(db, borrowers, actor, { total, orgId, source, branches, totalReported, message }, onProgress)
+  try {
+    const { borrowers, total, orgId, source, branches, totalReported, message } = await fetchAllBorrowers()
+    return await importBorrowerBatch(db, borrowers, actor, { total, orgId, source, branches, totalReported, message }, onProgress)
+  } catch (err) {
+    const existingCount = db.prepare('select count(*) as c from borrowers').get()?.c || 0
+    if (existingCount > 0) {
+      return {
+        created: 0,
+        updated: 0,
+        synced: 0,
+        total: existingCount,
+        warning: `LoanDisk API sync warning: ${err.message}. Using ${existingCount} existing borrower records from database.`,
+        source: 'Database',
+      }
+    }
+    throw err
+  }
 }
