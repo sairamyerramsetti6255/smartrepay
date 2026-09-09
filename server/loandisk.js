@@ -36,11 +36,16 @@ export function parseBorrowerApiPayload(data) {
 
   const doc = data.document
   const rows = []
+  const branchErrors = []
   let branches = 0
   let totalReported = 0
 
   if (Array.isArray(doc)) {
     for (const item of doc) {
+      if (item?.data?.error?.message) {
+        branchErrors.push(`${item.branchName || item.branchId || 'Branch'}: ${item.data.error.message} (code ${item.data.error.code || 'unknown'})`)
+      }
+
       const branchResults = item?.data?.response?.Results
       if (branchResults) {
         branches++
@@ -73,7 +78,7 @@ export function parseBorrowerApiPayload(data) {
     totalReported = Number(doc.response.TotalResults) || rows.length
   }
 
-  return { rows, branches, totalReported, message: data.message || null }
+  return { rows, branches, totalReported, branchErrors, message: data.message || null }
 }
 
 export async function getLoanDiskToken() {
@@ -170,7 +175,7 @@ export function normalizeLoanDiskBorrower(row) {
 }
 
 export function normalizeBorrowersFromPayload(data) {
-  const { rows, branches, totalReported, message } = parseBorrowerApiPayload(data)
+  const { rows, branches, totalReported, branchErrors, message } = parseBorrowerApiPayload(data)
   const all = []
   const seen = new Set()
 
@@ -183,6 +188,9 @@ export function normalizeBorrowersFromPayload(data) {
   }
 
   if (!all.length) {
+    if (branchErrors?.length) {
+      throw new Error(`LoanDisk API error: ${branchErrors[0]}. Please verify upstream LoanDisk credentials.`)
+    }
     throw new Error('GetAllBorrowers returned no borrower records — check API response structure')
   }
 
