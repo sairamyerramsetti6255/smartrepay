@@ -6,7 +6,11 @@ import {
   Check,
   LogOut,
   Receipt,
-  Wallet,
+  Database,
+  Table2,
+  FileOutput,
+  AlertTriangle,
+  BookOpen,
 } from 'lucide-react'
 import logo from '@/assets/simplfied_logo.webp'
 import { useAuth } from '@/context/AuthContext'
@@ -110,9 +114,7 @@ export function Sidebar() {
         <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-2 mb-1.5 px-2">
           Overview
         </p>
-        {/* Original dashboard page hidden for now — Loan Analytics is the dashboard. */}
-        {/* <NavItem to="/" label="Dashboard" icon={LayoutDashboard} end /> */}
-        <NavItem to="/active-loans/analytics" label="Dashboard" icon={LayoutDashboard} />
+        <NavItem to="/dashboard" label="Dashboard" icon={LayoutDashboard} end />
 
         <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-6 mb-1.5 px-2">
           Reconciliation workflow
@@ -125,15 +127,26 @@ export function Sidebar() {
           Records
         </p>
         <NavItem to="/active-loans" label="Active Loans" icon={Landmark} />
-        <NavItem to="/repayments" label="Repayments" icon={Wallet} />
-        <NavItem to="/receipts" label="Receipts Upload" icon={Receipt} />
+        <NavItem to="/receipts" label="Manual Receipts" icon={Receipt} />
+
+        <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-6 mb-1.5 px-2">
+          CRIF
+        </p>
+        <NavItem to="/crif" label="Borrower" icon={Database} />
+        <NavItem to="/crif/node-data" label="Node Data" icon={Table2} />
+        <NavItem to="/crif/generate-file" label="Generate File" icon={FileOutput} />
+        <NavItem to="/crif/failed-data" label="Failed Data" icon={AlertTriangle} />
+
+        <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-6 mb-1.5 px-2">
+          QuickBooks
+        </p>
+        <NavItem to="/quickbooks" label="QuickBooks Data" icon={BookOpen} />
 
         {showSettings && (
           <>
             <p className="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--text-tertiary)] mt-6 mb-1.5 px-2">
               Configuration
             </p>
-            <NavItem to="/settings/sla" label="SLA Targets" icon={SlidersHorizontal} />
             <NavItem to="/settings/rules" label="Matching Rules" icon={SlidersHorizontal} />
           </>
         )}

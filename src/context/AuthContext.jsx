@@ -36,6 +36,16 @@ export function AuthProvider({ children }) {
     loadSettingsFromApi()
   }
 
+  const signInWithMicrosoft = async () => {
+    const { acquireMicrosoftIdToken } = await import('@/lib/msal')
+    const idToken = await acquireMicrosoftIdToken()
+    const { token, user: u } = await api.auth.signInWithMicrosoft(idToken)
+    api.setToken(token)
+    setUser({ id: u.id, email: u.email })
+    setProfile({ full_name: u.full_name, role: u.role })
+    loadSettingsFromApi()
+  }
+
   const signUp = async (email, password, role = 'collections') => {
     const { token, user: u } = await api.auth.signUp(email, password, role)
     api.setToken(token)
@@ -45,6 +55,12 @@ export function AuthProvider({ children }) {
   }
 
   const signOut = async () => {
+    try {
+      const { clearMicrosoftSession } = await import('@/lib/msal')
+      await clearMicrosoftSession()
+    } catch {
+      /* ignore MSAL clear errors */
+    }
     api.setToken(null)
     setUser(null)
     setProfile(null)
@@ -52,7 +68,7 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, profile, role, loading, signIn, signUp, signOut }}>
+    <AuthContext.Provider value={{ user, profile, role, loading, signIn, signInWithMicrosoft, signUp, signOut }}>
       {children}
     </AuthContext.Provider>
   )

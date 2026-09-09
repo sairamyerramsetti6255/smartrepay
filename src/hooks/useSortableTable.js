@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 
-export function useSortableTable(data, pageSize = 20) {
+export function useSortableTable(data, pageSize = 20, getSortValue) {
   const [sortKey, setSortKey] = useState(null)
   const [sortDir, setSortDir] = useState('asc')
   const [page, setPage] = useState(1)
@@ -8,8 +8,9 @@ export function useSortableTable(data, pageSize = 20) {
   const sorted = useMemo(() => {
     if (!sortKey) return [...data]
     return [...data].sort((a, b) => {
-      const av = a[sortKey]
-      const bv = b[sortKey]
+      const av = getSortValue ? getSortValue(sortKey, a) : a[sortKey]
+      const bv = getSortValue ? getSortValue(sortKey, b) : b[sortKey]
+      if (av == null && bv == null) return 0
       if (av == null) return 1
       if (bv == null) return -1
       if (typeof av === 'number' && typeof bv === 'number') {
@@ -18,7 +19,7 @@ export function useSortableTable(data, pageSize = 20) {
       const cmp = String(av).localeCompare(String(bv))
       return sortDir === 'asc' ? cmp : -cmp
     })
-  }, [data, sortKey, sortDir])
+  }, [data, sortKey, sortDir, getSortValue])
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize))
   const currentPage = Math.min(page, totalPages)

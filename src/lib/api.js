@@ -131,6 +131,11 @@ export const auth = {
 
   signIn: (email, password) => request('/auth/signin', { method: 'POST', body: JSON.stringify({ email, password }) }),
 
+  signInWithMicrosoft: (idToken) =>
+    request('/auth/microsoft', { method: 'POST', body: JSON.stringify({ idToken }) }),
+
+  microsoftConfig: () => request('/auth/microsoft/config'),
+
   signUp: (email, password, role) =>
 
     request('/auth/signup', { method: 'POST', body: JSON.stringify({ email, password, role }) }),
@@ -325,6 +330,10 @@ export const loandisk = {
 
   syncStatus: () => request('/loandisk/sync/status', { timeout: 30000 }),
 
+  syncSql: () => request('/loandisk/sync-sql', { method: 'POST', body: '{}', timeout: 30000 }),
+
+  syncSqlStatus: () => request('/loandisk/sync-sql/status', { timeout: 30000 }),
+
   search: (searchCriteria) =>
 
     request('/loandisk/search', { method: 'POST', body: JSON.stringify({ searchCriteria }), timeout: 120000 }),
@@ -379,6 +388,12 @@ export const settings = {
 
   save: (body) => request('/settings', { method: 'PUT', body: JSON.stringify(body) }),
 
+  matchingRules: {
+    get: () => request('/settings/matching-rules'),
+    save: (rules) => request('/settings/matching-rules', { method: 'PUT', body: JSON.stringify({ rules }) }),
+    preview: (body) => request('/settings/matching-rules/preview', { method: 'POST', body: JSON.stringify(body) }),
+  },
+
 }
 
 
@@ -395,11 +410,13 @@ export const demo = {
 
 export const ingest = {
 
-  async parse(file) {
+  async parse(file, { documentType, fileParticulars } = {}) {
 
     const form = new FormData()
 
     form.append('file', file)
+    if (documentType) form.append('documentType', documentType)
+    if (fileParticulars) form.append('fileParticulars', fileParticulars)
 
     const token = getToken()
 
@@ -437,9 +454,27 @@ export const ingest = {
 
   },
 
-  import: (parseId) =>
+  import: (parseIdOrIds) => {
+    const parseIds = Array.isArray(parseIdOrIds) ? parseIdOrIds : [parseIdOrIds]
+    return request('/ingest/import', { method: 'POST', body: JSON.stringify({ parseIds }) })
+  },
 
-    request('/ingest/import', { method: 'POST', body: JSON.stringify({ parseId }) }),
+  async parseBatch(files, { documentType, fileParticulars } = {}) {
+    const form = new FormData()
+    for (const file of files) form.append('files', file)
+    if (documentType) form.append('documentType', documentType)
+    if (fileParticulars) form.append('fileParticulars', fileParticulars)
+
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/ingest/parse-batch`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`)
+    return data
+  },
 
 }
 
@@ -448,8 +483,9 @@ export const ingest = {
 export const activeLoans = {
 
   list: (search) =>
-
     request(`/active-loans${search ? `?search=${encodeURIComponent(search)}` : ''}`),
+
+  get: (loanNumber) => request(`/active-loans/${encodeURIComponent(loanNumber)}`),
 
 }
 
@@ -468,6 +504,14 @@ export const bankTransactions = {
 export const staging = {
 
   summary: () => request('/staging/summary'),
+
+}
+
+
+
+export const dashboard = {
+
+  stats: () => request('/dashboard/stats'),
 
 }
 
@@ -518,5 +562,269 @@ export const receipts = {
     if (!res.ok) throw new Error(data.error || res.statusText || 'Could not save receipt')
     return data
   },
+
+  update: async (id, payload, file) => {
+    const form = new FormData()
+    Object.entries(payload).forEach(([k, v]) => {
+      if (v != null && v !== '') form.append(k, String(v))
+    })
+    if (file) form.append('receipt', file)
+
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/receipts/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || res.statusText || 'Could not update receipt')
+    return data
+  },
+
+  remove: (id) =>
+    request(`/receipts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 }
 
+export const crif = {
+  parseBorrowerIds: async (file) => {
+    const form = new FormData()
+    form.append('file', file)
+
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/crif/parse-borrower-ids`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || res.statusText || 'Could not parse borrower file')
+    return data
+  },
+
+  pullBorrowerFromMonthlyBull: async ({ branchIDs, performMigration, file }) => {
+    const form = new FormData()
+    if (branchIDs) form.append('branchIDs', branchIDs)
+    form.append('performMigration', performMigration ? 'true' : 'false')
+    if (file) form.append('file', file)
+
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/crif/pull-borrower-from-monthly-bull`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || res.statusText || 'Pull request failed')
+    return data
+  },
+
+  /** Excel → LoanDisk API → NodeCRIF_SubjectData / NodeCRIF_ContractData */
+  syncFromLoandisk: async ({ branchIDs, file, borrowerIDs }) => {
+    const form = new FormData()
+    if (branchIDs) form.append('branchIDs', branchIDs)
+    if (borrowerIDs) form.append('borrowerIDs', borrowerIDs)
+    if (file) form.append('file', file)
+
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/crif/sync-from-loandisk`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+      // Large Excel files can take several minutes (LoanDisk per-borrower)
+      signal: AbortSignal.timeout(600_000),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || res.statusText || 'LoanDisk sync failed')
+    return data
+  },
+
+  syncStatus: () => request('/crif/sync-status', { timeout: 120000 }),
+
+  universalSync: (body = {}) =>
+    request('/crif/sync', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      timeout: 300000,
+    }),
+
+  migrationLogs: (params = {}) => {
+    const qs = new URLSearchParams()
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null && value !== '') qs.set(key, String(value))
+    })
+    const query = qs.toString()
+    return request(`/crif/migration-logs${query ? `?${query}` : ''}`)
+  },
+
+  migrationFailedRecords: (params = {}) => {
+    const qs = new URLSearchParams()
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null && value !== '') qs.set(key, String(value))
+    })
+    const query = qs.toString()
+    return request(`/crif/migration-failed-records${query ? `?${query}` : ''}`, { timeout: 120000 })
+  },
+
+  nodeData: (params = {}) => {
+    const qs = new URLSearchParams()
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null && value !== '') qs.set(key, String(value))
+    })
+    const query = qs.toString()
+    return request(`/crif/node-data${query ? `?${query}` : ''}`, { timeout: 120000 })
+  },
+
+  generateFile: (body) =>
+    request('/crif/generate-file', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      timeout: 300000,
+    }),
+
+  /** Download generated CRIF file via our API proxy (forces local save). */
+  downloadGeneratedFile: async (fileUrl) => {
+    const token = getToken()
+    const qs = new URLSearchParams({ url: fileUrl })
+    const res = await fetch(`${getApiUrl()}/crif/download-file?${qs}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || res.statusText || 'Download failed')
+    }
+
+    const disposition = res.headers.get('Content-Disposition') || ''
+    const match = disposition.match(/filename="([^"]+)"/i)
+    const fileName = match?.[1] || String(fileUrl).split('/').pop()?.split('?')[0] || 'CRIF_File.txt'
+    const blob = await res.blob()
+    return { blob, fileName }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// QuickBooks Data module API client
+// ---------------------------------------------------------------------------
+
+export const quickbooks = {
+  summary: () => request('/quickbooks/summary'),
+
+  library: (params = {}) => {
+    const q = new URLSearchParams(params).toString()
+    return request(`/quickbooks/library${q ? `?${q}` : ''}`)
+  },
+
+  libraryItem: (id) => request(`/quickbooks/library/${id}`),
+
+  importSmartRepay: (limit = 100) =>
+    request('/quickbooks/import/smartrepay', {
+      method: 'POST',
+      body: JSON.stringify({ limit }),
+    }),
+
+  importText: (text, context = {}) =>
+    request('/quickbooks/import/text', {
+      method: 'POST',
+      body: JSON.stringify({ text, ...context }),
+    }),
+
+  async importFiles(files, context = {}) {
+    const form = new FormData()
+    for (const file of files) form.append('files', file)
+    Object.entries(context).forEach(([k, v]) => { if (v != null) form.append(k, String(v)) })
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/quickbooks/import/files`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`)
+    return data
+  },
+
+  transactions: (params = {}) => {
+    const q = new URLSearchParams(params).toString()
+    return request(`/quickbooks/transactions${q ? `?${q}` : ''}`)
+  },
+
+  transaction: (id) => request(`/quickbooks/transactions/${id}`),
+
+  validate: (id) => request(`/quickbooks/transactions/${id}/validate`, { method: 'POST', body: '{}' }),
+
+  approve: (id) => request(`/quickbooks/transactions/${id}/approve`, { method: 'POST', body: '{}' }),
+
+  approveAll: (templateType = 'emi_receipt') =>
+    request('/quickbooks/approve-all', {
+      method: 'POST',
+      body: JSON.stringify({ templateType }),
+    }),
+
+  reject: (id, reason = '') =>
+    request(`/quickbooks/transactions/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+
+  emiReceipts: (params = {}) => {
+    const q = new URLSearchParams(params).toString()
+    return request(`/quickbooks/emi-receipts${q ? `?${q}` : ''}`)
+  },
+
+  paymentsDisbursed: (params = {}) => {
+    const q = new URLSearchParams(params).toString()
+    return request(`/quickbooks/payments-disbursed${q ? `?${q}` : ''}`)
+  },
+
+  createTransaction: (data) =>
+    request('/quickbooks/transactions', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  updateTransaction: (id, data) =>
+    request(`/quickbooks/transactions/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
+  deleteTransaction: (id) =>
+    request(`/quickbooks/transactions/${id}`, {
+      method: 'DELETE',
+    }),
+
+  accounts: () => request('/quickbooks/accounts'),
+
+  createAccount: (data) =>
+    request('/quickbooks/accounts', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  updateAccount: (id, data) =>
+    request(`/quickbooks/accounts/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
+  deleteAccount: (id) =>
+    request(`/quickbooks/accounts/${id}`, {
+      method: 'DELETE',
+    }),
+
+  exceptions: (params = {}) => {
+    const q = new URLSearchParams(params).toString()
+    return request(`/quickbooks/exceptions${q ? `?${q}` : ''}`)
+  },
+
+  preview: () => request('/quickbooks/preview'),
+
+  export: (format = 'json') =>
+    request('/quickbooks/export', {
+      method: 'POST',
+      body: JSON.stringify({ format }),
+    }),
+
+  exports: () => request('/quickbooks/exports'),
+
+  exportById: (id) => request(`/quickbooks/exports/${id}`),
+}

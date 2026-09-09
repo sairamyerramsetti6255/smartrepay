@@ -40,7 +40,7 @@ Open http://localhost:5173
 | `/exceptions` | Exception queue + SLA buckets |
 | `/reconcile` | Bank vs posted, human post approval |
 | `/audit` | Searchable audit log |
-| `/borrowers` | Borrower CRUD |
+| `/borrowers` | Borrower CRUD + **Sync to SQL Server** (SIL tables) |
 | `/settings/sla` | SLA thresholds (system_owner) |
 | `/settings/rules` | Matching rules (system_owner) |
 | `/reports/daily` | Daily reconciliation summary |
@@ -58,7 +58,26 @@ Backend runs at `http://localhost:3001/api`
 | `GET /transactions` | List transactions |
 | `POST /matching/run` | Run batch matching |
 | `POST /demo/seed` | Load demo data |
-| `POST /ingest/parse` | Parse CSV/Excel statement (multipart `file`) |
+| `POST /ingest/parse` | Parse one statement (multipart `file`) |
+| `POST /ingest/parse-batch` | Parse up to 10 files (multipart `files`) |
+| `POST /ingest/import` | Import staged parse session(s) — `{ parseId }` or `{ parseIds: [] }` |
+| `POST /loandisk/sync-sql` | Pull active/current loans → SQL Server (upsert only) |
+| `GET /loandisk/sync-sql/status` | Poll SQL sync job |
+
+### Loan Disk SQL sync
+
+- **Manual:** Borrowers → **Sync to SQL Server**
+- **Scheduled:** `LOANDISK_SYNC_ENABLED=true` and `LOANDISK_SYNC_CRON` in `server/.env`
+- **Tables:** `SILBorrowers`, `SILLoans`, `SILloanrepayments`, `Staging_LoandiskDueRecords`
+- **Never truncates** existing SQL data
+
+### Name matching tests
+
+```bash
+cd server && npm run test:name-match
+```
+
+Client feedback notes: `docs/CLIENT_RESPONSE.md`
 
 Database file: `server/smartrepay.db` (auto-created)
 

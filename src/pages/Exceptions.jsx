@@ -65,7 +65,7 @@ export function Exceptions() {
     if (search.trim()) {
       const q = search.trim().toLowerCase()
       list = list.filter((t) =>
-        [t.payer, t.matched_borrower_name, t.reference, t.source_filename]
+        [t.payer, t.transaction_description, t.matched_borrower_name, t.reference, t.source_filename]
           .some((v) => String(v ?? '').toLowerCase().includes(q))
       )
     }
@@ -85,7 +85,14 @@ export function Exceptions() {
 
   const columns = [
     { key: 'date', label: 'Date', render: (t) => <span className="text-[var(--text-secondary)]">{formatDate(t.date)}</span> },
-    { key: 'payer', label: 'Payer', render: (t) => <span className="font-medium">{t.payer || '—'}</span> },
+    {
+      key: 'transaction_description',
+      label: 'Description',
+      render: (t) => (
+        <span className="text-[var(--text-secondary)] truncate max-w-[200px] inline-block">{t.transaction_description || '—'}</span>
+      ),
+    },
+    { key: 'payer', label: 'Name', render: (t) => <span className="font-medium">{t.payer || '—'}</span> },
     { key: 'amount', label: 'Amount', align: 'right', render: (t) => formatCurrency(t.amount) },
     {
       key: 'status',

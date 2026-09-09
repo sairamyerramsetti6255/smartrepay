@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import toast from 'react-hot-toast'
+import { Link } from 'react-router-dom'
 import {
   RefreshCw,
   Search,
@@ -152,7 +153,15 @@ export function Repayments() {
     {
       key: 'LoanNumber',
       label: 'Loan #',
-      render: (r) => <span className="mono text-[12px] font-medium">{r.LoanNumber || '—'}</span>,
+      render: (r) => (
+        <Link
+          to={`/loans/${r.LoanNumber}/statement`}
+          className="mono text-[12px] font-medium text-[var(--accent)] hover:underline"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {r.LoanNumber || '—'}
+        </Link>
+      ),
     },
     {
       key: 'BorrowerFullName',

@@ -41,3 +41,28 @@ export function canExport(role) {
 export function canAccessSettings(role) {
   return role === ROLES.system_owner
 }
+
+// ---------------------------------------------------------------------------
+// QuickBooks Data module RBAC
+// ---------------------------------------------------------------------------
+
+/** Only accounting and system_owner can approve/reject QB transactions */
+export function canApproveQB(role) {
+  return [ROLES.accounting, ROLES.system_owner].includes(role)
+}
+
+/** Only accounting and system_owner can export QB data */
+export function canExportQB(role) {
+  return [ROLES.accounting, ROLES.system_owner].includes(role)
+}
+
+/** All roles can upload and view QB data */
+export function canUploadQB(role) {
+  return true
+}
+
+/** Mid office and above can correct QB extraction results */
+export function canCorrectQB(role) {
+  return [ROLES.mid_office, ROLES.accounting, ROLES.system_owner].includes(role)
+}
+

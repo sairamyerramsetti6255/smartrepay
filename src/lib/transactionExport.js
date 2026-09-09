@@ -9,7 +9,8 @@ export function exportMatchedTransactions(rows, borrowerById = {}) {
     [
       { key: 'date', label: 'Date', value: (r) => formatDate(r.date) },
       { key: 'source_filename', label: 'Document', value: (r) => r.source_filename || '' },
-      { key: 'payer', label: 'Payer', value: (r) => r.payer || '' },
+      { key: 'transaction_description', label: 'Description', value: (r) => r.transaction_description || '' },
+      { key: 'payer', label: 'Name', value: (r) => r.payer || '' },
       { key: 'amount', label: 'Amount', value: (r) => r.amount ?? '' },
       { key: 'status', label: 'Status', value: (r) => r.status || '' },
       {
@@ -23,7 +24,7 @@ export function exportMatchedTransactions(rows, borrowerById = {}) {
         value: (r) => (r.matched_borrower_id ? borrowerById[r.matched_borrower_id]?.full_name : '') || '',
       },
       { key: 'reference', label: 'Reference', value: (r) => r.reference || '' },
-      { key: 'description', label: 'Description', value: (r) => r.description || '' },
+      { key: 'description', label: 'Full particulars', value: (r) => r.description || '' },
     ],
     `matched-transactions-${today()}.xlsx`
   )
@@ -47,7 +48,8 @@ export function exportAllTransactions(rows, borrowerById = {}) {
         label: 'Status',
         value: (r) => STATUS_LABEL[r.status] || r.status || '',
       },
-      { key: 'payer', label: 'Payer', value: (r) => r.payer || '' },
+      { key: 'transaction_description', label: 'Description', value: (r) => r.transaction_description || '' },
+      { key: 'payer', label: 'Name', value: (r) => r.payer || '' },
       { key: 'amount', label: 'Amount', value: (r) => r.amount ?? '' },
       {
         key: 'matched_borrower',
@@ -72,7 +74,7 @@ export function exportAllTransactions(rows, borrowerById = {}) {
       },
       { key: 'source_filename', label: 'Document', value: (r) => r.source_filename || '' },
       { key: 'reference', label: 'Reference', value: (r) => r.reference || '' },
-      { key: 'description', label: 'Description', value: (r) => r.description || '' },
+      { key: 'description', label: 'Full particulars', value: (r) => r.description || '' },
     ],
     `all-transactions-${today()}.xlsx`
   )
@@ -85,7 +87,8 @@ export function exportUnmatchedTransactions(rows) {
     [
       { key: 'date', label: 'Date', value: (r) => formatDate(r.date) },
       { key: 'source_filename', label: 'Document', value: (r) => r.source_filename || '' },
-      { key: 'payer', label: 'Payer', value: (r) => r.payer || '' },
+      { key: 'transaction_description', label: 'Description', value: (r) => r.transaction_description || '' },
+      { key: 'payer', label: 'Name', value: (r) => r.payer || '' },
       { key: 'amount', label: 'Amount', value: (r) => r.amount ?? '' },
       {
         key: 'status',
@@ -108,7 +111,7 @@ export function exportUnmatchedTransactions(rows) {
         value: (r) => r.borrower_loandisk_id || '',
       },
       { key: 'reference', label: 'Reference', value: (r) => r.reference || '' },
-      { key: 'description', label: 'Description', value: (r) => r.description || '' },
+      { key: 'description', label: 'Full particulars', value: (r) => r.description || '' },
     ],
     `unmatched-transactions-${today()}.xlsx`
   )

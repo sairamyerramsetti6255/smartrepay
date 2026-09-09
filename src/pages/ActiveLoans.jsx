@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import toast from 'react-hot-toast'
-import { RefreshCw, Search, Landmark, CreditCard, User, Wallet, Layers } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { RefreshCw, Search, Landmark, CreditCard, User, Wallet, Layers, Loader2 } from 'lucide-react'
 import * as api from '@/lib/api'
 import { PageHeader } from '@/components/PageHeader'
 import { DataTable } from '@/components/DataTable'
@@ -55,6 +56,8 @@ export function ActiveLoans() {
   const [error, setError] = useState(null)
   const [search, setSearch] = useState('')
   const [detail, setDetail] = useState(null)
+  const [sqlSyncing, setSqlSyncing] = useState(false)
+  const [sqlSyncStatus, setSqlSyncStatus] = useState(null)
 
   async function load() {
     setLoading(true)
@@ -72,7 +75,52 @@ export function ActiveLoans() {
 
   useEffect(() => {
     load()
+    api.loandisk.syncSqlStatus().then(setSqlSyncStatus).catch(() => {})
   }, [])
+
+  async function syncFromLoanDisk() {
+    setSqlSyncing(true)
+    try {
+      await api.loandisk.syncSql()
+      toast.success('LoanDisk sync started')
+      const poll = async () => {
+        const snap = await api.loandisk.syncSqlStatus()
+        setSqlSyncStatus(snap)
+        if (snap.status === 'running') {
+          setTimeout(poll, 3000)
+        } else if (snap.status === 'completed') {
+          toast.success(snap.result?.message || 'LoanDisk sync completed')
+          setSqlSyncing(false)
+          await load()
+        } else if (snap.status === 'failed') {
+          toast.error(snap.error || 'LoanDisk sync failed')
+          setSqlSyncing(false)
+        }
+      }
+      setTimeout(poll, 2000)
+    } catch (e) {
+      toast.error(e.message)
+      setSqlSyncing(false)
+    }
+  }
+
+  const sqlSyncHint = useMemo(() => {
+    if (!sqlSyncStatus) return null
+    if (sqlSyncStatus.status === 'running') {
+      const phase = sqlSyncStatus.progress?.phase
+      return phase ? `Syncing from LoanDisk (${phase})…` : 'Syncing from LoanDisk…'
+    }
+    if (sqlSyncStatus.status === 'completed' && sqlSyncStatus.finishedAt) {
+      const msg = sqlSyncStatus.result?.message
+      return msg
+        ? `Last sync: ${formatDate(sqlSyncStatus.finishedAt)} — ${msg}`
+        : `Last sync: ${formatDate(sqlSyncStatus.finishedAt)}`
+    }
+    if (sqlSyncStatus.status === 'failed' && sqlSyncStatus.error) {
+      return `Last sync failed: ${sqlSyncStatus.error}`
+    }
+    return null
+  }, [sqlSyncStatus])
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -97,7 +145,15 @@ export function ActiveLoans() {
     {
       key: 'LoanNumber',
       label: 'Loan #',
-      render: (r) => <span className="mono text-[12px] font-medium">{r.LoanNumber || '—'}</span>,
+      render: (r) => (
+        <Link
+          to={`/loans/${r.LoanNumber}/statement`}
+          className="mono text-[12px] font-medium text-[var(--accent)] hover:underline"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {r.LoanNumber || '—'}
+        </Link>
+      ),
     },
     {
       key: 'BorrowerFullName',
@@ -138,13 +194,28 @@ export function ActiveLoans() {
     <div className="space-y-6">
       <PageHeader
         title="Active Loans"
-        subtitle="Live loan book from LoanDisk (Staging_LoandiskDueRecords)."
+        subtitle="Live loan book from LoanDisk. Click Sync to pull active/current loans into SQL Server."
         actions={
-          <Button variant="secondary" onClick={load} disabled={loading}>
-            <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} /> Refresh
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="secondary"
+              title="Pull active/current loans from LoanDisk into SQL Server (manual only — no automatic schedule)"
+              onClick={syncFromLoanDisk}
+              disabled={sqlSyncing || loading}
+            >
+              {sqlSyncing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Sync from LoanDisk
+            </Button>
+            <Button variant="secondary" onClick={load} disabled={loading || sqlSyncing}>
+              <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} /> Refresh
+            </Button>
+          </div>
         }
       />
+
+      {sqlSyncHint && (
+        <p className="text-[12px] text-[var(--text-tertiary)] -mt-4">{sqlSyncHint}</p>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard icon={Layers} label="Active loans" value={stats.count.toLocaleString()} />
@@ -180,7 +251,7 @@ export function ActiveLoans() {
           sortable
           filterable
           emptyMessage="No active loans found"
-          emptyDescription="Run the LoanDisk sync to populate Staging_LoandiskDueRecords."
+          emptyDescription="Click Sync from LoanDisk to pull active and current loans into SQL Server."
         />
       )}
 

@@ -8,6 +8,7 @@ dist
 server/.env
 .DS_Store
 *.log
+scratch/
 server/cd
 server/node
 server/npm

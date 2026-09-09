@@ -1,13 +1,36 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useCallback } from 'react'
 import { ChevronLeft, ChevronRight, ArrowUp, ArrowDown, ChevronsUpDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useSortableTable } from '@/hooks/useSortableTable'
-import { cn } from '@/lib/utils'
+import { cn, toDateKey } from '@/lib/utils'
 import { EmptyState } from '@/components/EmptyState'
 
 function SortIcon({ active, dir }) {
   if (!active) return <ChevronsUpDown className="h-3 w-3 opacity-40" />
   return dir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+}
+
+function matchesColumnFilter(col, row, val) {
+  const trimmed = String(val ?? '').trim()
+  if (!trimmed) return true
+
+  if (col?.filterType === 'date') {
+    const day = toDateKey(col.filterAccessor ? col.filterAccessor(row) : row[col.key])
+    if (!day) return false
+    // Support "YYYY-MM-DD" exact day, or "from|to" range from dual pickers
+    if (trimmed.includes('|')) {
+      const [from, to] = trimmed.split('|')
+      if (from && day < from) return false
+      if (to && day > to) return false
+      return true
+    }
+    return day === trimmed
+  }
+
+  const raw = col?.filterAccessor ? col.filterAccessor(row) : row[col.key]
+  return String(raw ?? '')
+    .toLowerCase()
+    .includes(trimmed.toLowerCase())
 }
 
 export function DataTable({
@@ -28,20 +51,31 @@ export function DataTable({
   const isSortable = (col) => sortable && col.sortable !== false && col.key !== 'actions'
 
   const filtered = useMemo(() => {
-    const active = Object.entries(filters).filter(([, v]) => v && v.trim())
+    const active = Object.entries(filters).filter(
+      ([, v]) => v && String(v).trim() && String(v).trim() !== '|'
+    )
     if (!active.length) return data
     return data.filter((row) =>
       active.every(([key, val]) => {
         const col = columns.find((c) => c.key === key)
-        const raw = col?.filterAccessor ? col.filterAccessor(row) : row[key]
-        return String(raw ?? '').toLowerCase().includes(val.trim().toLowerCase())
+        return matchesColumnFilter(col, row, val)
       })
     )
   }, [data, filters, columns])
 
+  const getSortValue = useCallback(
+    (key, row) => {
+      const col = columns.find((c) => c.key === key)
+      if (col?.sortAccessor) return col.sortAccessor(row)
+      return row[key]
+    },
+    [columns]
+  )
+
   const { paginated, page, setPage, totalPages, total, sortKey, sortDir, toggleSort } = useSortableTable(
     filtered,
-    pageSize
+    pageSize,
+    getSortValue
   )
 
   if (!data.length) {
@@ -55,6 +89,26 @@ export function DataTable({
   function updateFilter(key, value) {
     setFilters((f) => ({ ...f, [key]: value }))
     setPage(1)
+  }
+
+  function updateDateRange(key, part, value) {
+    setFilters((f) => {
+      const current = String(f[key] || '')
+      const [from = '', to = ''] = current.includes('|') ? current.split('|') : [current, '']
+      const nextFrom = part === 'from' ? value : from
+      const nextTo = part === 'to' ? value : to
+      return { ...f, [key]: `${nextFrom}|${nextTo}` }
+    })
+    setPage(1)
+  }
+
+  function dateRangeParts(key) {
+    const current = String(filters[key] || '')
+    if (current.includes('|')) {
+      const [from = '', to = ''] = current.split('|')
+      return { from, to }
+    }
+    return { from: current, to: '' }
   }
 
   return (
@@ -94,15 +148,34 @@ export function DataTable({
               {columns.map((col) => (
                 <th key={col.key} className="px-3 pb-2 pt-0 align-top">
                   {isFilterable(col) ? (
-                    <input
-                      value={filters[col.key] || ''}
-                      onChange={(e) => updateFilter(col.key, e.target.value)}
-                      placeholder="Filter…"
-                      className={cn(
-                        'w-full h-7 rounded-[var(--radius-sm)] border border-[var(--border-light)] bg-[var(--bg-card)] px-2 text-[12px] font-normal normal-case tracking-normal text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]',
-                        col.align === 'right' && 'text-right'
-                      )}
-                    />
+                    col.filterType === 'date' ? (
+                      <div className="flex min-w-[148px] flex-col gap-1">
+                        <input
+                          type="date"
+                          aria-label={`${col.label} from`}
+                          value={dateRangeParts(col.key).from}
+                          onChange={(e) => updateDateRange(col.key, 'from', e.target.value)}
+                          className="w-full h-7 rounded-[var(--radius-sm)] border border-[var(--border-light)] bg-[var(--bg-card)] px-1.5 text-[11px] font-normal normal-case tracking-normal text-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+                        />
+                        <input
+                          type="date"
+                          aria-label={`${col.label} to`}
+                          value={dateRangeParts(col.key).to}
+                          onChange={(e) => updateDateRange(col.key, 'to', e.target.value)}
+                          className="w-full h-7 rounded-[var(--radius-sm)] border border-[var(--border-light)] bg-[var(--bg-card)] px-1.5 text-[11px] font-normal normal-case tracking-normal text-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+                        />
+                      </div>
+                    ) : (
+                      <input
+                        value={filters[col.key] || ''}
+                        onChange={(e) => updateFilter(col.key, e.target.value)}
+                        placeholder="Filter…"
+                        className={cn(
+                          'w-full h-7 rounded-[var(--radius-sm)] border border-[var(--border-light)] bg-[var(--bg-card)] px-2 text-[12px] font-normal normal-case tracking-normal text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]',
+                          col.align === 'right' && 'text-right'
+                        )}
+                      />
+                    )
                   ) : null}
                 </th>
               ))}

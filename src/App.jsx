@@ -13,12 +13,18 @@ import { Reconcile } from '@/pages/Reconcile'
 import { Audit } from '@/pages/Audit'
 import { Borrowers } from '@/pages/Borrowers'
 import { ActiveLoans } from '@/pages/ActiveLoans'
+import { LoanStatement } from '@/pages/LoanStatement'
 import { ReceiptsUpload } from '@/pages/ReceiptsUpload'
 import { Repayments } from '@/pages/Repayments'
 import { LoanAnalytics } from '@/pages/LoanAnalytics'
 import { SettingsSla } from '@/pages/SettingsSla'
 import { SettingsRules } from '@/pages/SettingsRules'
 import { ReportsDaily } from '@/pages/ReportsDaily'
+import { Crif } from '@/pages/Crif'
+import { CrifNodeData } from '@/pages/CrifNodeData'
+import { CrifGenerateFile } from '@/pages/CrifGenerateFile'
+import { CrifFailedData } from '@/pages/CrifFailedData'
+import { QuickBooks } from '@/pages/quickbooks/QuickBooks'
 
 export default function App() {
   return (
@@ -44,8 +50,9 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-            {/* Old dashboard hidden — Loan Analytics now serves as the dashboard. */}
-            <Route index element={<Navigate to="/active-loans/analytics" replace />} />
+            {/* Reconciliation dashboard — matching & receipts only (no loan book). */}
+            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route path="dashboard" element={<LoanAnalytics />} />
             <Route path="dashboard-old" element={<Dashboard />} />
             <Route path="ingest" element={<Ingest />} />
             <Route path="match" element={<Match />} />
@@ -53,9 +60,15 @@ export default function App() {
             <Route path="reconcile" element={<Reconcile />} />
             <Route path="audit" element={<Audit />} />
             <Route path="active-loans" element={<ActiveLoans />} />
+            <Route path="loans/:loanNumber/statement" element={<LoanStatement />} />
             <Route path="receipts" element={<ReceiptsUpload />} />
+            <Route path="crif" element={<Crif />} />
+            <Route path="crif/node-data" element={<CrifNodeData />} />
+            <Route path="crif/generate-file" element={<CrifGenerateFile />} />
+            <Route path="crif/failed-data" element={<CrifFailedData />} />
+            <Route path="quickbooks" element={<QuickBooks />} />
             <Route path="repayments" element={<Repayments />} />
-            <Route path="active-loans/analytics" element={<LoanAnalytics />} />
+            <Route path="active-loans/analytics" element={<Navigate to="/dashboard" replace />} />
             <Route path="borrowers" element={<Borrowers />} />
             <Route path="settings/sla" element={<SettingsSla />} />
             <Route path="settings/rules" element={<SettingsRules />} />

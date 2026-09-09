@@ -33,7 +33,6 @@ export function Borrowers() {
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailBorrower, setDetailBorrower] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
-  const [detailData, setDetailData] = useState(null)
   const [editingId, setEditingId] = useState(null)
   const [form, setForm] = useState({ full_name: '', employer: '' })
   const [aliasTags, setAliasTags] = useState([])
