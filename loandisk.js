@@ -205,6 +205,29 @@ export function normalizeBorrowersFromPayload(data) {
 }
 
 export async function fetchAllBorrowers() {
+  if (process.env.LOANDISK_PUBLIC_KEY && process.env.LOANDISK_AUTH_TOKEN) {
+    try {
+      const { fetchAllLoansByStatus } = await import('./engine/src/currentLoansClient.js')
+      const { buildBorrowerRowsFromLoans } = await import('./borrowerLoanSyncService.js')
+      const { records } = await fetchAllLoansByStatus([18, 1])
+      const rows = buildBorrowerRowsFromLoans(records)
+      const borrowers = rows.map((r) => normalizeLoanDiskBorrower(r)).filter(Boolean)
+      if (borrowers.length > 0) {
+        return {
+          borrowers,
+          total: borrowers.length,
+          totalReported: borrowers.length,
+          branches: 5,
+          message: `Fetched ${borrowers.length} borrowers directly from LoanDisk API`,
+          source: 'DirectLoanDiskApi',
+          orgId: process.env.LOANDISK_BORROWER_ID || '4617884',
+        }
+      }
+    } catch (e) {
+      console.warn('Direct LoanDisk API fetch failed, falling back to proxy:', e.message)
+    }
+  }
+
   const data = await fetchGetAllBorrowersRaw()
   return {
     ...normalizeBorrowersFromPayload(data),
