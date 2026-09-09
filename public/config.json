@@ -1,9 +1,0 @@
-{
-  "apiUrl": "/api",
-  "useApi": true,
-  "simplifiedApiUrl": "/simplified-api",
-  "appUrl": "",
-  "appName": "SmartRepay AI",
-  "azureTenantId": "6263c342-495d-44b6-979d-edceaffad43b",
-  "azureClientId": "e8fb5423-7d61-4bc7-8f92-43c7160e56b6"
-}
