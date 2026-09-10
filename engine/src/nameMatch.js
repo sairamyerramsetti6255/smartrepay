@@ -1,3 +1,4 @@
+import { stripPaymentNote } from '../../../shared/bankName.js'
 /**
  * Hybrid name matching: blended per-token confidence (Jaro-Winkler, Damerau-Levenshtein,
  * Double Metaphone, Levenshtein) with a hard first+last gate.
@@ -472,6 +473,7 @@ function splitFusedToken(token, borrowerTokens) {
  * @returns {{ score: number, kind: string, breakdown: object|null }}
  */
 export function scoreNameMatch(a, b, opts = {}) {
+  a = stripPaymentNote(a)
   const typoFloor = opts.typoFloor ?? TYPO_FLOOR
   const ta = nameTokens(a)
   const tb = nameTokens(b)

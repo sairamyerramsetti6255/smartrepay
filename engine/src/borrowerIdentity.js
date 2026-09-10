@@ -1,3 +1,4 @@
+import { stripPaymentNote } from '../../../shared/bankName.js'
 import { nameTokens, scoreNameMatch, doubleMetaphone, normalizeNameKey } from './nameMatch.js'
 import { resolveParticularsFields, isCompanyName } from '../../particularsParse.js'
 
@@ -13,6 +14,7 @@ export function transactionIdentity(tx) {
   let name = parsed.borrowerName
   // A staged payer occasionally contains the entire narrative. Prefer its pipe name.
   if (name?.includes('|')) name = resolveParticularsFields({ particulars: name }).borrowerName
+  name = stripPaymentNote(name)
   if (isCompanyName(name) || generic.test(name)) name = ''
   let descriptionName = ''
   if (!name && !parsed.full.includes('|')) {
@@ -20,6 +22,7 @@ export function transactionIdentity(tx) {
       .replace(/\b(?:loan(?:\s*id)?|top[\s-]*up|account|ln)[\s:#-]*[a-z]*\d[\w-]*/gi, ' ')
       .replace(/\b(?:direct credit|cash deposit in branch|ebank|internal|same cust|transfer|salary|salaries|payment|repayment|from|to)\b/gi, ' ')
       .replace(/\d+/g, ' ').replace(/\s+/g, ' ').trim()
+    descriptionName = stripPaymentNote(descriptionName)
     if (isCompanyName(descriptionName) || generic.test(descriptionName)) descriptionName = ''
   }
   const employer = String(tx.EmployerName || '').trim() || parsed.description.match(/direct\s+credit\s+(.+?)\s*-\s*(?:salar(?:y|ies)|loans?)\b/i)?.[1] || ''
@@ -86,6 +89,7 @@ export function confirmedHistory(tx, identity, index) {
 }
 
 export function identityNameScore(input, target, floor = 0.7) {
+  input = stripPaymentNote(input)
   const a = personTokens(input), b = personTokens(target)
   const empty = { score: 0, nameKind: 'none' }
   if (!a.length || !b.length || isCompanyName(input) || isCompanyName(target)) return empty
@@ -120,6 +124,7 @@ export function identityNameScore(input, target, floor = 0.7) {
 }
 
 export function nameCandidates(name, index, floor = 0.7) {
+  name = stripPaymentNote(name)
   const key = `${floor}:${name}`
   if (index.cache.has(key)) return index.cache.get(key)
   const seen = new Set(index.compact.get(personTokens(name).join('')) || [])
