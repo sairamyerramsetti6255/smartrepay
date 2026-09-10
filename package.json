@@ -17,7 +17,8 @@
     "apply-receipts-schema": "node scripts/apply-receipts-schema.mjs",
     "refresh-staging": "node scripts/refresh-staging-from-sil.mjs",
     "refresh-staging-loandisk": "node scripts/refresh-staging-from-loandisk.mjs",
-    "test:name-match": "node engine/scripts/testNameMatch.js"
+    "test:name-match": "node engine/scripts/testNameMatch.js",
+    "test:matching": "node --test engine/tests/*.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

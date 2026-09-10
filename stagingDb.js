@@ -276,6 +276,7 @@ function shapeMatchRow(r) {
     employer_or_bank: r.EmployerOrBank,
     status: reviewStatusToUi(r.ReviewStatus),
     review_status: r.ReviewStatus || null,
+    posting_review_required: r.MatchType === 'review_required' && r.ReviewStatus !== 'confirmed',
     confidence_score,
     confidence_bucket,
     matched_borrower_id: r.BorrowerId || null,

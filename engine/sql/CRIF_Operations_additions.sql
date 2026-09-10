@@ -67,7 +67,7 @@
 			 WHERE m.ReviewStatus = 'unmatched') AS Unmatched,
 			(SELECT COUNT(*) FROM Staging_BankTransactions bt
 			 LEFT JOIN Staging_TransactionMatches m ON m.BankTransactionId = bt.Id
-			 WHERE m.BankTransactionId IS NULL) AS Pending;
+			 WHERE m.BankTransactionId IS NULL OR m.ReviewStatus = 'needs_review') AS Pending;
 	END
 
 	-- Exec CRIF_Operations '[{"FileName":"x.pdf","BorrowerName":"John","EmiPaidAmount":100}]','Save_BankTransactions',''
@@ -104,7 +104,7 @@
 				MatchMethod VARCHAR(20), ReviewStatus VARCHAR(20), Reasoning NVARCHAR(1000)
 			)
 		) AS S ON T.BankTransactionId = S.BankTransactionId
-		WHEN MATCHED THEN UPDATE SET
+		WHEN MATCHED AND ISNULL(T.ReviewStatus, '') NOT IN ('confirmed','rejected') AND NOT (T.ReviewStatus = 'auto_matched' AND T.MatchMethod = 'manual') THEN UPDATE SET
 			T.FileName = S.FileName, T.BankBorrowerName = S.BankBorrowerName,
 			T.LoanDiskBorrowerName = S.LoanDiskBorrowerName, T.BorrowerId = S.BorrowerId,
 			T.LoanNumber = S.LoanNumber, T.MatchedLoanNumbers = S.MatchedLoanNumbers,

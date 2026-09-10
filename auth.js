@@ -7,12 +7,18 @@ export function signToken(user) {
 }
 
 export function authMiddleware(req, res, next) {
+  let token = null
   const header = req.headers.authorization
-  if (!header?.startsWith('Bearer ')) {
+  if (header?.startsWith('Bearer ')) {
+    token = header.slice(7)
+  } else if (req.query?.token) {
+    token = req.query.token
+  }
+  if (!token) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
   try {
-    const payload = jwt.verify(header.slice(7), SECRET)
+    const payload = jwt.verify(token, SECRET)
     req.user = payload
     next()
   } catch {

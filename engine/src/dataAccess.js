@@ -275,6 +275,10 @@ export async function getBankTransactions() {
 }
 
 /** LoanDisk due loans to match against (via CRIF_Operations). */
+export async function getMatchHistory() {
+  return execCrif('{}', 'Get_TransactionMatches')
+}
+
 export async function getLoanDiskDueRecords() {
   return execCrif('{}', 'Get_LoandiskDueRecords')
 }
@@ -286,6 +290,8 @@ export async function getLoanDiskDueRecords() {
  */
 export async function saveTransactionMatches(matches) {
   if (!matches.length) return 0
+  const protectedIds = new Set((await getMatchHistory()).filter((r) => (['confirmed', 'rejected'].includes(r.ReviewStatus) || (r.ReviewStatus === 'auto_matched' && r.MatchMethod === 'manual'))).map((r) => String(r.Id)))
+  matches = matches.filter((m) => !protectedIds.has(String(m.bankTransactionId)))
   let saved = 0
 
   for (const part of chunk(matches, 200)) {

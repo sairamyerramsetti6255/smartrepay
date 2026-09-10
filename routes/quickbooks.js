@@ -28,6 +28,15 @@ import { extractFromText, extractFromImage, suggestColumnMapping } from '../qb/q
 import { normalizeDate, normalizeAmount, normalizeName, normalizeReference, buildTransactionHash } from '../qb/qbNormalize.js'
 import { validateTransaction } from '../qb/qbValidation.js'
 import { mapToEmiReceipt, mapToPaymentDisbursed } from '../qb/qbMapper.js'
+import {
+  getRpaStatus,
+  runRpaPipeline,
+  handleRpaChat,
+  getRpaLogs,
+  getRpaRunById,
+  saveRpaSettings,
+  getDesktopRpaScript,
+} from '../qb/qbRpaService.js'
 
 const router = express.Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } })
@@ -812,6 +821,92 @@ router.post('/import/loandisk', (req, res) => {
     error: 'LoanDisk import for QuickBooks is prepared but requires selecting borrower/loan data from the LoanDisk module first.',
     hint: 'Use the existing /loandisk endpoints to fetch data, then pass loan IDs to this endpoint.',
   })
+})
+
+// ===========================================================================
+// RPA AI AGENT ENDPOINTS
+// ===========================================================================
+
+// GET /api/quickbooks/rpa/status
+router.get('/rpa/status', (req, res) => {
+  try {
+    const status = getRpaStatus(db)
+    res.json(status)
+  } catch (e) {
+    console.error('[QB RPA] GET /rpa/status error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/quickbooks/rpa/pipeline
+router.post('/rpa/pipeline', async (req, res) => {
+  try {
+    const actor = req.user?.email || req.user?.sub || 'RPA AI Agent'
+    const result = await runRpaPipeline(db, req.body || {}, actor)
+    audit('qb_rpa_run', result.run_id, 'qb_rpa_pipeline', actor, null, result.metrics)
+    res.json(result)
+  } catch (e) {
+    console.error('[QB RPA] POST /rpa/pipeline error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/quickbooks/rpa/chat
+router.post('/rpa/chat', async (req, res) => {
+  try {
+    const actor = req.user?.email || req.user?.sub || 'User'
+    const { message, history } = req.body || {}
+    const result = await handleRpaChat(db, message, history, actor)
+    res.json(result)
+  } catch (e) {
+    console.error('[QB RPA] POST /rpa/chat error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// GET /api/quickbooks/rpa/logs
+router.get('/rpa/logs', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20
+    const logs = getRpaLogs(db, limit)
+    res.json({ rows: logs, total: logs.length })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// GET /api/quickbooks/rpa/runs/:id
+router.get('/rpa/runs/:id', (req, res) => {
+  try {
+    const run = getRpaRunById(db, req.params.id)
+    if (!run) return res.status(404).json({ error: 'RPA run not found' })
+    res.json(run)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/quickbooks/rpa/settings
+router.post('/rpa/settings', (req, res) => {
+  try {
+    const actor = req.user?.email || req.user?.sub || 'system'
+    const settings = saveRpaSettings(db, req.body || {})
+    audit('qb_rpa_settings', 'default', 'qb_rpa_settings_update', actor, null, settings)
+    res.json(settings)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// GET /api/quickbooks/rpa/script
+router.get('/rpa/script', (req, res) => {
+  try {
+    const format = req.query.format || 'python'
+    const script = getDesktopRpaScript(format)
+    res.json({ format, script })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
 })
 
 export default router

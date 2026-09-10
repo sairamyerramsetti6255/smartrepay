@@ -155,6 +155,41 @@ export function qbMigrateDb(db) {
       payload_json text
     );
 
+    -- RPA Bot Execution Runs
+    create table if not exists qb_rpa_runs (
+      id text primary key,
+      run_type text not null default 'full_pipeline',
+      status text default 'running' check (status in ('running','completed','completed_with_exceptions','failed')),
+      records_scanned integer default 0,
+      records_extracted integer default 0,
+      records_resolved integer default 0,
+      records_validated integer default 0,
+      records_auto_approved integer default 0,
+      records_excepted integer default 0,
+      records_exported integer default 0,
+      confidence_threshold real default 0.90,
+      execution_time_ms integer default 0,
+      triggered_by text default 'user',
+      logs_json text,
+      summary_text text,
+      created_at text default (datetime('now')),
+      completed_at text
+    );
+
+    -- RPA Bot Automation Settings
+    create table if not exists qb_rpa_settings (
+      id text primary key,
+      autopilot_enabled integer default 1,
+      auto_approve_min_confidence real default 0.90,
+      auto_ingest_smartrepay integer default 1,
+      auto_resolve_borrowers integer default 1,
+      auto_export_packages integer default 1,
+      schedule_interval text default 'hourly',
+      notification_email text,
+      created_at text default (datetime('now')),
+      updated_at text default (datetime('now'))
+    );
+
     -- Indexes for performance
     create index if not exists idx_qb_input_library_batch on qb_input_library(batch_id);
     create index if not exists idx_qb_input_library_source on qb_input_library(source_type);
@@ -165,6 +200,8 @@ export function qbMigrateDb(db) {
     create index if not exists idx_qb_transactions_batch on qb_transactions(batch_id);
     create index if not exists idx_qb_validation_txn on qb_validation_results(transaction_id);
     create index if not exists idx_qb_lines_txn on qb_transaction_lines(transaction_id);
+    create index if not exists idx_qb_rpa_runs_status on qb_rpa_runs(status);
+    create index if not exists idx_qb_rpa_runs_created on qb_rpa_runs(created_at);
   `)
 
   console.log('[QB] Database migration complete — qb_* tables ready')

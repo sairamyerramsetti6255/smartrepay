@@ -1,5 +1,7 @@
 node_modules/
 smartrepay.db*
+database.sqlite*
+*.sqlite*
 data/
 .env
 *.tmp

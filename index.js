@@ -7,6 +7,7 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { randomUUID, createHash } from 'crypto'
+import * as XLSX from 'xlsx'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
 import { verifyMicrosoftIdToken, getMicrosoftPublicConfig, isMicrosoftAuthConfigured } from './microsoftAuth.js'
@@ -1544,11 +1545,169 @@ app.delete('/api/documents/:id', authMiddleware, async (req, res) => {
   }
 })
 
-app.get('/api/documents/:id/download', authMiddleware, (req, res) => {
-  const doc = db.prepare('select * from documents where id = ?').get(req.params.id)
+app.get('/api/documents/:id/download', authMiddleware, async (req, res) => {
+  const param = decodeURIComponent(req.params.id || '').trim()
+  if (!param) return res.status(400).json({ error: 'Missing document ID or filename' })
+
+  const ext = path.extname(param).toLowerCase()
+  const base = path.basename(param, ext)
+  const stripped = base.replace(/_\d{4,8}$/, '')
+
+  const tokens = stripped
+    .split(/[^a-zA-Z0-9]+/)
+    .filter((t) => t.length >= 3 && !/^\d{4}$/.test(t) && !/^(part|statement|transactions|project|may|june|july|august|september|october|november|december)$/i.test(t))
+
+  const candidates = new Set([
+    param,
+    stripped + ext,
+    base,
+    stripped,
+    param.replace(/ /g, '_'),
+    (stripped + ext).replace(/ /g, '_'),
+    param.replace(/_/g, ' '),
+    (stripped + ext).replace(/_/g, ' '),
+  ])
+
+  const candidateDirs = [
+    UPLOADS_DIR,
+    path.join(path.dirname(UPLOADS_DIR), 'docs'),
+    path.join(process.cwd(), 'docs'),
+    path.join(process.cwd(), '..', 'docs'),
+    path.join(process.cwd(), 'data'),
+    path.join(process.cwd(), '..', 'data'),
+  ].filter((d, i, arr) => fs.existsSync(d) && arr.indexOf(d) === i)
+
+  // --- TIER 1: Exact doc in SQLite + storage_path or UPLOADS_DIR/doc.id ---
+  let doc = null
+  for (const cand of candidates) {
+    doc = db.prepare('select * from documents where id = ? or filename = ? order by created_at desc limit 1').get(cand, cand)
+    if (doc) break
+  }
+  if (!doc && stripped) {
+    doc = db.prepare('select * from documents where filename like ? order by created_at desc limit 1').get(`%${stripped}%`)
+  }
+
+  if (doc?.storage_path && fs.existsSync(doc.storage_path) && fs.statSync(doc.storage_path).isFile()) {
+    return res.download(doc.storage_path, doc.filename || param)
+  }
+
+  if (doc?.id) {
+    const docDir = path.join(UPLOADS_DIR, doc.id)
+    if (fs.existsSync(docDir) && fs.statSync(docDir).isDirectory()) {
+      const files = fs.readdirSync(docDir).filter((f) => !f.startsWith('.'))
+      if (files.length > 0) {
+        const filePath = path.join(docDir, files[0])
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+          return res.download(filePath, doc.filename || files[0])
+        }
+      }
+    }
+  }
+
+  // --- TIER 2: Same extension match across directories and subdirectories ---
+  if (ext) {
+    for (const dir of candidateDirs) {
+      const entries = fs.readdirSync(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (entry.isFile()) {
+          const fExt = path.extname(entry.name).toLowerCase()
+          const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
+          if (fExt === ext) {
+            const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (
+              fNorm === strippedNorm ||
+              fNorm.includes(strippedNorm) ||
+              strippedNorm.includes(fNorm) ||
+              (tokens.length > 0 && tokens.some((t) => fNorm.includes(t.toLowerCase())))
+            ) {
+              return res.download(path.join(dir, entry.name), entry.name)
+            }
+          }
+        } else if (entry.isDirectory()) {
+          const subDir = path.join(dir, entry.name)
+          const subFiles = fs.readdirSync(subDir).filter((f) => !f.startsWith('.'))
+          for (const sf of subFiles) {
+            const sfExt = path.extname(sf).toLowerCase()
+            const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (sfExt === ext) {
+              const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
+              if (
+                sfNorm === strippedNorm ||
+                sfNorm.includes(strippedNorm) ||
+                strippedNorm.includes(sfNorm) ||
+                (tokens.length > 0 && tokens.some((t) => sfNorm.includes(t.toLowerCase())))
+              ) {
+                return res.download(path.join(subDir, sf), sf)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // --- TIER 3: Candidates match directly or in subdirectories ---
+  const candList = Array.from(candidates)
+  for (const dir of candidateDirs) {
+    for (const cand of candList) {
+      const candPath = path.join(dir, cand)
+      if (fs.existsSync(candPath) && fs.statSync(candPath).isFile()) {
+        return res.download(candPath, doc?.filename || cand)
+      }
+    }
+  }
+
+  // --- TIER 4: Cross-extension fuzzy fallback on disk ---
+  for (const dir of candidateDirs) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (entry.isFile()) {
+        const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
+        if (tokens.some((t) => fNorm.includes(t.toLowerCase()))) {
+          return res.download(path.join(dir, entry.name), entry.name)
+        }
+      } else if (entry.isDirectory()) {
+        const subFiles = fs.readdirSync(path.join(dir, entry.name)).filter((f) => !f.startsWith('.'))
+        for (const sf of subFiles) {
+          const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
+          if (tokens.some((t) => sfNorm.includes(t.toLowerCase()))) {
+            return res.download(path.join(dir, entry.name, sf), sf)
+          }
+        }
+      }
+    }
+  }
+
+  // --- TIER 5: Dynamic Excel generation from database transactions ---
+  try {
+    let txRows = []
+    if (doc?.id) {
+      txRows = db.prepare('select * from transactions where source_document_id = ?').all(doc.id)
+    }
+    if (!txRows.length && tokens.length > 0) {
+      const queryStr = `%${tokens[0]}%`
+      txRows = db.prepare('select * from transactions where raw_json like ? or particulars like ? limit 500').all(queryStr, queryStr)
+    }
+    if (txRows.length > 0) {
+      const exportData = txRows.map((r) => ({
+        Date: r.date || '',
+        Description: r.description || r.particulars || '',
+        Amount: r.amount || 0,
+        Reference: r.reference || '',
+        Status: r.status || '',
+      }))
+      const ws = XLSX.utils.json_to_sheet(exportData)
+      const wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, ws, 'Transactions')
+      const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      res.setHeader('Content-Disposition', `attachment; filename="${stripped || 'export'}.xlsx"`)
+      return res.send(buffer)
+    }
+  } catch {}
+
   if (!doc) return res.status(404).json({ error: 'Document not found' })
-  if (!fs.existsSync(doc.storage_path)) return res.status(404).json({ error: 'File missing on server' })
-  res.download(doc.storage_path, doc.filename)
+  return res.status(404).json({ error: 'File missing on server' })
 })
 
 app.get('/api/documents/:id/transactions', authMiddleware, (req, res) => {

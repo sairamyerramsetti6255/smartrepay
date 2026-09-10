@@ -192,7 +192,10 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
   try {
     const sqlResult = await getSqlMatchResults()
     if (sqlResult?.transactions?.length) {
-      const matched = sqlResult.transactions.filter((t) => t.status === 'matched')
+      const matched = sqlResult.transactions.filter((t) =>
+        t.status === 'matched' && t.loan_number &&
+        (t.review_status === 'confirmed' || t.match_type !== 'review_required')
+      )
       if (matched.length > 0) {
         srTransactions = matched.slice(0, limit).map((t) => ({
           id: t.bank_transaction_id || t.id,

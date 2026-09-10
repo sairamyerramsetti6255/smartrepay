@@ -8,7 +8,7 @@
  *   90–99 — full name (all bank tokens found in borrower name)
  */
 
-const STOP_TOKENS = new Set(['mr', 'mrs', 'ms', 'miss', 'dr', 'the', 'jr', 'sr', 'ii', 'iii'])
+const STOP_TOKENS = new Set(['mr', 'mrs', 'ms', 'miss', 'dr', 'the', 'jr', 'sr', 'ii', 'iii', 'iv'])
 
 const SCORE_FIRST_LAST_BASE = 70
 const SCORE_FIRST_LAST_MAX = 89
@@ -25,6 +25,7 @@ const TYPO_FLOOR = 0.7
 export function nameTokens(name) {
   return String(name || '')
     .toLowerCase()
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()

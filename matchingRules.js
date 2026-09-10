@@ -5,9 +5,7 @@
 
 /** Signals removed from UI — always off at runtime regardless of saved settings. */
 export const DEPRECATED_SIGNAL_KEYS = [
-  'useLoanNumberHint',
-  'useSubsetSum',
-  'useBiWeekly',
+      'useBiWeekly',
   'useWeekly',
   'useAiAdjudication',
   'useTypoTolerance',
@@ -19,10 +17,10 @@ export const AMOUNT_TOLERANCE_MIN_DEFAULT = 1.5
 export const RULE_CATALOG = {
   /** Score cutoffs — independent limits (0–100 points), not part of the weight mix. */
   scoreLimits: [
-    { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate. First + last must match for at least 70.', min: 0, max: 100, step: 1, default: 70, unit: 'points' },
-    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Full name match tier (90+). With amount reconciliation, confidence becomes 100.', min: 0, max: 100, step: 1, default: 90, unit: 'points' },
-    { key: 'autoMatchConfidence', label: 'Auto-match confidence', hint: 'At or above this, a match is auto-approved (very likely / same person bands).', min: 0, max: 100, step: 1, default: 85, unit: 'points' },
-    { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 1, max: 30, step: 1, default: 8, unit: 'points' },
+    { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate. Single names can produce review candidates; automatic matching requires a strong identity.', min: 0, max: 100, step: 1, default: 70, unit: 'points' },
+    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Minimum strong identity score. Amount agreement alone cannot establish identity.', min: 92, max: 100, step: 1, default: 92, unit: 'points' },
+    { key: 'autoMatchConfidence', label: 'Posting confidence', hint: 'Rows above 70% are matched. This higher threshold controls readiness for posting, alongside identity and allocation checks.', min: 92, max: 100, step: 1, default: 92, unit: 'points' },
+    { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 8, max: 30, step: 1, default: 8, unit: 'points' },
   ],
   /** Only these two must sum to 100% — they blend name vs amount into the final confidence score. */
   confidenceWeights: [
@@ -35,13 +33,17 @@ export const RULE_CATALOG = {
     { key: 'typoToleranceFloor', label: 'Typo similarity floor', hint: 'How similar name tokens must be to count as a typo match (not a weight).', min: 0.5, max: 1, step: 0.05, default: 0.7, unit: 'similarity' },
   ],
   signals: [
+    { key: 'useLoanNumberHint', label: 'Labelled loan references', hint: 'Exact master lookup for Loan, LN, Top Up or Account references; never unlabelled numbers.', default: true },
+    { key: 'useSubsetSum', label: 'Multiple-loan allocation', hint: 'Check combinations within one borrower; ambiguous allocations require review.', default: true },
     { key: 'useBorrowerName', label: 'Borrower name field', hint: 'Match using payer / borrower name from particulars.', default: true },
-    { key: 'useDescription', label: 'Transaction description', hint: 'Also match text before the | in particulars.', default: true },
+    { key: 'useDescription', label: 'Transaction description', hint: 'Extract a person from narratives without a pipe; do not treat employer text as a borrower.', default: true },
   ],
   amountComponents: [
     { key: 'exact_single', label: 'Single EMI exact', default: 100 },
     { key: 'sum_all', label: 'All loans sum', default: 100 },
     { key: 'subset', label: 'Subset of loans', default: 100 },
+    { key: 'emi_multiple', label: 'Multiple EMIs', default: 100 },
+    { key: 'emi_with_charges', label: 'EMIs plus known charges', default: 100 },
     { key: 'partial', label: 'Partial payment', default: 55 },
     { key: 'mismatch', label: 'Amount mismatch', default: 25 },
     { key: 'none', label: 'No amount data', default: 10 },
@@ -50,7 +52,7 @@ export const RULE_CATALOG = {
   nameAlgorithm: {
     title: 'Per-token name blend',
     description:
-      'Each first/last token is scored with a weighted blend. Both tokens must clear the typo floor or the name score is 0.',
+      'Normalize punctuation and name order, retrieve aliases and typo candidates, then assess identity separately from payment allocation.',
     blend: [
       { key: 'jaro', label: 'Jaro-Winkler', weight: 0.45 },
       { key: 'damerau', label: 'Damerau-Levenshtein', weight: 0.3 },
@@ -58,17 +60,17 @@ export const RULE_CATALOG = {
       { key: 'levenshtein', label: 'Levenshtein similarity', weight: 0.1 },
     ],
     tiers: [
-      { range: '0', label: 'No match', description: 'First or last name failed the typo floor — different person.' },
-      { range: '70–89', label: 'First + last', description: 'Both first and last names match (typo-tolerant).' },
-      { range: '90–99', label: 'Full name', description: 'All bank name tokens found in the borrower name.' },
-      { range: '100', label: 'Full name + amount', description: 'Full name tier (≥ strong score) and EMI reconciles.' },
+      { range: '0', label: 'No name evidence', description: 'No qualifying person name; labelled references and cash amounts use separate paths.' },
+      { range: '70–91', label: 'Partial or fuzzy name', description: 'A candidate for review; initials and single names cannot auto-match.' },
+      { range: '92–99', label: 'Strong name', description: 'Still requires a unique identity and unambiguous payment allocation.' },
+      { range: '100', label: 'Exact labelled loan ID', description: 'Reference exists in the loan master. Posting still requires valid allocation and no conflicts.' },
     ],
   },
   confidenceBuckets: [
-    { key: 'same_person', min: 95, label: 'Same person', hint: 'Exact / same person — full name strong and amount usually reconciles.' },
-    { key: 'very_likely_match', min: 85, max: 94, label: 'Very likely', hint: 'Likely same person; may lack perfect amount or full confidence.' },
-    { key: 'possible_review', min: 70, max: 84, label: 'Review', hint: 'First + last passes — needs manual review.' },
-    { key: 'different_person', max: 69, label: 'Different person', hint: 'Not a valid match; name gate failed → confidence 0.' },
+    { key: 'same_person', min: 98, label: 'Same person', hint: 'Exact / same person — full name strong and amount usually reconciles.' },
+    { key: 'very_likely_match', min: 92, max: 97, label: 'Very likely', hint: 'Likely same person; may lack perfect amount or full confidence.' },
+    { key: 'possible_review', min: 80, max: 91, label: 'Review', hint: 'Evidence suggests a candidate; manual review required.' },
+    { key: 'different_person', max: 79, label: 'Unmatched', hint: 'Insufficient evidence to assign a borrower.' },
   ],
 }
 
@@ -131,7 +133,7 @@ export function getRuleCatalog(catalog = RULE_CATALOG) {
 }
 
 export const DEFAULT_MATCHING_RULES = {
-  version: 2,
+  version: 3,
   thresholds: Object.fromEntries(
     [...RULE_CATALOG.scoreLimits, ...RULE_CATALOG.confidenceWeights, ...RULE_CATALOG.tuning].map((t) => [t.key, t.default])
   ),
@@ -214,7 +216,7 @@ export function resolveMatchingRules(partial) {
     }
   }
 
-  return { version: 2, thresholds, signals, amountComponents }
+  return { version: 3, thresholds, signals, amountComponents }
 }
 
 /** Old settings stored matchingRules as [{ field, weight, active }, ...]. */
@@ -259,16 +261,17 @@ export function buildEngineConfig(rules = DEFAULT_MATCHING_RULES) {
     signals: {
       useBorrowerName: r.signals.useBorrowerName ?? { enabled: true },
       useDescription: r.signals.useDescription ?? { enabled: true },
-      useLoanNumberHint: { enabled: false },
-      useSubsetSum: { enabled: false },
+      useLoanNumberHint: r.signals.useLoanNumberHint,
+      useSubsetSum: r.signals.useSubsetSum,
       useBiWeekly: { enabled: false },
       useWeekly: { enabled: false },
       useAiAdjudication: { enabled: false },
       useTypoTolerance: { enabled: true },
     },
     amountComponents: r.amountComponents,
-    installmentScales: [{ scale: 1, freq: 'monthly' }],
-    useSubsetSum: false,
+    installmentScales: [{ scale: 1, freq: 'full EMI' }, { scale: 0.5, freq: 'half EMI' }, { scale: 0.25, freq: 'quarter EMI' }],
+    useSubsetSum: r.signals.useSubsetSum?.enabled !== false,
+    MAX_EMI_MULTIPLE: 60,
     aliasPatterns: [],
     rules: r,
   }
@@ -280,7 +283,8 @@ export function extractIdsWithPatterns(text, patterns = []) {
   for (const p of patterns) {
     if (!p.active) continue
     try {
-      const re = new RegExp(p.pattern, p.flags || 'i')
+      const flags = p.flags || 'i'
+      const re = new RegExp(p.pattern, flags.includes('g') ? flags : `${flags}g`)
       for (const m of s.matchAll(re)) {
         const cap = m[1] ?? m[0]
         if (cap) ids.add(String(cap).trim())
@@ -308,13 +312,11 @@ export async function previewMatchSample(input, rulesPartial = {}) {
     groupLoansByBorrower,
     buildBorrowerIndex,
     classify,
-    setMatchingEngineConfig,
   } = await import('./engine/src/matchingEngine.js')
   const { scoreNameMatch } = await import('./engine/src/nameMatch.js')
   const { reconcileAmount, confidenceBucket } = await import('./engine/src/matchingEngine.js')
 
   const engineCfg = buildEngineConfig(rulesPartial)
-  setMatchingEngineConfig(engineCfg)
 
   const payerName = String(input.payerName || '').trim()
   const description = String(input.description || '').trim()
@@ -346,7 +348,7 @@ export async function previewMatchSample(input, rulesPartial = {}) {
 
   const groups = groupLoansByBorrower(loans)
   const index = buildBorrowerIndex(groups)
-  const { record, needsAi, candidates } = classify(tx, index)
+  const { record, needsAi, candidates } = classify(tx, index, engineCfg)
 
   const nameFromPayer = payerName ? scoreNameMatch(payerName, borrowerName, { typoFloor: engineCfg.TYPO_FLOOR }) : { score: 0, kind: 'none' }
   const nameFromDesc =
@@ -355,9 +357,8 @@ export async function previewMatchSample(input, rulesPartial = {}) {
       : { score: 0, kind: 'none' }
 
   const group = [...groups.values()][0]
-  const amountRecon = reconcileAmount(amount, group?.loans || [])
+  const amountRecon = reconcileAmount(amount, group?.loans || [], engineCfg)
 
-  setMatchingEngineConfig(buildEngineConfig())
 
   return {
     nameScore: Math.max(nameFromPayer.score, nameFromDesc.score),

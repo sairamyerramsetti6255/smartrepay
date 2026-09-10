@@ -5,7 +5,11 @@
  * headers are not mistaken for individual borrower names.
  */
 
-const COMPANY_NAMES = /^(simplified\s+lend(ing)?(\s+lt|\s+ltd|\s+limited)?|slending)$/i
+const COMPANY_NAMES = /^(simplified\s*(?:lend(?:ing)?|lean)(?:\s*(?:lt|ltd|limited))?|slending)$/i
+
+export function isCompanyName(value) {
+  return COMPANY_NAMES.test(String(value || '').replace(/[^a-z\s]/gi, ' ').replace(/\s+/g, ' ').trim())
+}
 
 export function parsePipeParticulars(particulars) {
   const full = String(particulars || '').trim().replace(/\s+/g, ' ')
@@ -15,7 +19,7 @@ export function parsePipeParticulars(particulars) {
   }
   const description = full.slice(0, idx).trim()
   const rawName = full.slice(idx + 1).trim()
-  const isCompany = COMPANY_NAMES.test(rawName)
+  const isCompany = isCompanyName(rawName)
 
   return {
     full,
@@ -43,7 +47,7 @@ export function resolveParticularsFields({ particulars, borrowerName, payer, des
   
   // If the provided borrowerName/payer is a company name or empty, do not use it as borrower name
   let name = String(borrowerName || payer || '').trim()
-  if (COMPANY_NAMES.test(name)) {
+  if (isCompanyName(name)) {
     name = ''
   }
   if (!name && parsed.borrowerName) {
@@ -55,6 +59,6 @@ export function resolveParticularsFields({ particulars, borrowerName, payer, des
     full: full || parsed.full,
     description: desc,
     borrowerName: name,
-    companyAccount: parsed.companyAccount,
+    companyAccount: parsed.companyAccount || (isCompanyName(borrowerName || payer) ? 'Simplified Lending' : null),
   }
 }
