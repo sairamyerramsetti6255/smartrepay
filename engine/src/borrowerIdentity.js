@@ -1,4 +1,4 @@
-import { stripPaymentNote } from '../../../shared/bankName.js'
+import { stripPaymentNote } from './bankName.js'
 import { nameTokens, scoreNameMatch, doubleMetaphone, normalizeNameKey } from './nameMatch.js'
 import { resolveParticularsFields, isCompanyName } from '../../particularsParse.js'
 

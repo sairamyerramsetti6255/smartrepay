@@ -1,4 +1,4 @@
-import { stripPaymentNote } from '../../../shared/bankName.js'
+import { stripPaymentNote } from './bankName.js'
 /**
  * Hybrid name matching: blended per-token confidence (Jaro-Winkler, Damerau-Levenshtein,
  * Double Metaphone, Levenshtein) with a hard first+last gate.
