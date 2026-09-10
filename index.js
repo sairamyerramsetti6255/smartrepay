@@ -221,19 +221,24 @@ setInterval(() => {
 }, 5 * 60 * 1000)
 
 // --- Health ---
-app.get('/api/health', (_req, res) =>
-  res.json({
-    ok: true,
-    backend: 'node-sqlite',
-    ai: !!process.env.OPENROUTER_API_KEY,
-    build: '1.8.0',
-    heavyJob: getActiveJobName(),
-    features: {
-      documents: true,
-      loandiskBorrowerSearch: true,
-    },
-  })
-)
+const healthPayload = () => ({
+  ok: true,
+  status: 'healthy',
+  backend: 'node-sqlite',
+  ai: !!process.env.OPENROUTER_API_KEY,
+  build: '1.8.0',
+  heavyJob: getActiveJobName(),
+  features: {
+    documents: true,
+    loandiskBorrowerSearch: true,
+  },
+})
+
+app.get('/', (_req, res) => res.json(healthPayload()))
+app.get('/health', (_req, res) => res.json(healthPayload()))
+app.get('/ping', (_req, res) => res.send('pong'))
+app.get('/api/health', (_req, res) => res.json(healthPayload()))
+
 
 // --- Ingest helpers ---
 
