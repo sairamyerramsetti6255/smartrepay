@@ -75,17 +75,44 @@ qbMigrateDb(db)
 const app = express()
 const PORT = process.env.PORT || 3001
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true)
-      if (process.env.NODE_ENV === 'production') return cb(null, true)
-      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true)
-      return cb(null, false)
-    },
-    credentials: true,
-  })
-)
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow all origins (including https://smartrepay.pbshope.in, *.pbshope.in, localhost)
+    return callback(null, true)
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: [
+    'Origin',
+    'X-Requested-With',
+    'Content-Type',
+    'Accept',
+    'Authorization',
+    'Cache-Control',
+    'Pragma',
+  ],
+  exposedHeaders: ['Content-Disposition'],
+  maxAge: 86400,
+}
+
+app.use(cors(corsOptions))
+app.options('*', cors(corsOptions))
+
+// Robust fallback header injection to guarantee CORS headers on all responses & errors
+app.use((req, res, next) => {
+  const origin = req.headers.origin
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Access-Control-Allow-Credentials', 'true')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma')
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204)
+  }
+  next()
+})
+
 app.use(express.json({ limit: '50mb' }))
 app.use('/api', (_req, res, next) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate')
