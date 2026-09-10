@@ -1,4 +1,15 @@
 import 'dotenv/config'
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason)
+})
+
+console.log(`[BOOT] Initializing SmartRepay Backend on Node ${process.version}...`)
+
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -10,6 +21,7 @@ import { randomUUID, createHash } from 'crypto'
 import * as XLSX from 'xlsx'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
+
 import { verifyMicrosoftIdToken, getMicrosoftPublicConfig, isMicrosoftAuthConfigured } from './microsoftAuth.js'
 import { matchTransaction, detectExceptionType } from './matcher.js'
 import { runHeavyJob, isHeavyJobRunning, getActiveJobName } from './jobRunner.js'
