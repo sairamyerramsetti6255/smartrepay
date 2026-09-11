@@ -1,9 +1,10 @@
 import { PDFParse } from 'pdf-parse'
 import { extractNameFromParticulars, parsePipeParticulars } from './particularsParse.js'
+import { extractFromTextWithAI, extractFromImageWithAI } from './openrouter.js'
 
 const SKIP_PARTICULARS = /balance (brought|carried) forward/i
-const BANK_MARKERS = /Date Posted|Detailed Client Statement|Cheque No\.\s*\/\s*Reference/i
-const EMPLOYER_MARKERS = /DEDUCTIONS TOTALS BY EMPLOYEE|Staff Deductions/i
+const BANK_MARKERS = /Date Posted|Detailed Client Statement|Cheque No\.\s*\/\s*Reference|Available Balance|Ledger Balance|Current Balance/i
+const EMPLOYER_MARKERS = /DEDUCTIONS TOTALS BY EMPLOYEE|Staff Deductions|Deduction Listing|Payroll Deductions|Employee Deductions|Salary Deductions|Staff Loans|Simplified Lending|Pay Date|DEDUCTIONS/i
 
 function parseAmount(val) {
   if (val == null || val === '') return NaN
@@ -56,7 +57,6 @@ function normalizeBankDate(val) {
   if (slash) return slash
   return String(val).trim()
 }
-
 
 function detectPdfType(text, filename) {
   if (BANK_MARKERS.test(text) || /^\d{1,2}\/\d{1,2}\/\d{2}\s+\d{1,2}\/\d{1,2}\/\d{2}/m.test(text)) {
@@ -126,51 +126,62 @@ function extractEmployerMeta(text, filename) {
 function isSkipLine(line) {
   if (!line || line === '-' || line === '$') return true
   if (/^--\s*\d+\s+of\s+\d+\s*--$/i.test(line)) return true
-  if (/^Simplified Lending/i.test(line)) return true
+  if (/^Simplified Lending/i.test(line) && !/\d+\.\d{2}/.test(line)) return true
   if (/^DEDUCTIONS TOTALS BY EMPLOYEE/i.test(line)) return true
   if (/^Name\s+Amount/i.test(line)) return true
   if (/^ACC\|?No Comments/i.test(line)) return true
   if (/^ACCT No\./i.test(line)) return true
-  if (/^\d[\d,]*\.\d{2}\s*\$?$/.test(line.replace(/\t/g, '').trim())) return true
+  if (/^(total|subtotal|grand total|page \d+|date:?|pay period|company\s*name)/i.test(line.trim())) return true
+  if (/^(emp(loyee)?\s*name|name\s+amount|deduction\s+amount|staff\s+deduction)/i.test(line.trim())) return true
   if (/^Cable Bahamas Ltd\./i.test(line) && /Pay Date/i.test(line)) return true
-  if (/^Date:/i.test(line)) return true
+  if (/^Date:/i.test(line) && !/\d+\.\d{2}/.test(line)) return true
   return false
 }
 
 function isRemarkContinuation(line) {
   if (isSkipLine(line)) return false
-  if (/\$\s*[\d,]+\.\d{2}/.test(line) || /[\d,]+\.\d{2}\s*\$/.test(line)) return false
+  if (/\$\s*[\d,]+\.\d{2}/.test(line) || /[\d,]+\.\d{2}\s*\$/.test(line) || /\b\d+\.\d{2}\b/.test(line)) return false
   return /^[A-Za-z(]/.test(line)
 }
 
 function parseEmployerAmountLine(line) {
-  const parts = line.split('\t').map((s) => s.trim()).filter((s) => s !== '' && s !== '$')
+  if (!line || isSkipLine(line)) return null
+  const trimmed = line.trim()
+
+  // 1. Delimited by tabs, pipes, or 2+ consecutive spaces
+  const parts = trimmed.split(/\t+|\s{2,}|\|/).map((s) => s.trim()).filter((s) => s && s !== '$')
   if (parts.length >= 2) {
     let amount = null
     let amountIdx = -1
-    for (let i = 0; i < parts.length; i++) {
+    for (let i = parts.length - 1; i >= 0; i--) {
       const n = parseAmount(parts[i])
-      if (!isNaN(n) && n > 0 && /[\d,]+\.\d{2}/.test(parts[i])) {
+      if (!isNaN(n) && n > 0 && /^(?:\$|BSD|USD)?\s*[\d,]+(?:\.\d{2})?$/.test(parts[i])) {
         amount = n
         amountIdx = i
         break
       }
     }
-    if (amount !== null && amountIdx >= 1) {
-      const name = parts.slice(0, amountIdx).join(' ').trim()
-      if (name && !/^(name|amount)$/i.test(name)) {
-        const comments = parts.slice(amountIdx + 1).join(' ').trim()
+    if (amount !== null && amountIdx > 0) {
+      const before = parts.slice(0, amountIdx)
+      const nameParts = before.filter((p) => !/^#?\d+$/.test(p) && !/^(emp|id|#|no\.?)[-_ ]*\d*$/i.test(p))
+      const name = (nameParts.length ? nameParts : before).join(' ').trim()
+      const comments = parts.slice(amountIdx + 1).join(' ').trim()
+      if (name.length >= 2 && !/^(name|amount|total|employee|id|emp\s*id|grand total|subtotal)$/i.test(name)) {
         return { name, amount, comments }
       }
     }
   }
 
-  // Space-separated: "Employee Name 450.00 optional remarks"
-  const space = line.match(/^(.+?)\s+([\d,]+\.\d{2})\s*\$?\s*(.*)$/)
-  if (space) {
-    const name = space[1].trim()
-    if (name && name.length > 2 && !/^(name|amount|total|employee)$/i.test(name)) {
-      return { name, amount: parseAmount(space[2]), comments: space[3].trim() }
+  // 2. Space-separated: "John Doe 450.00 optional remarks" or "10482 Jane Smith $450.00"
+  const m = trimmed.match(
+    /^(?:(?:(?:#?\d+|[A-Za-z]{1,4}[-#]\d+)\s+)?)((?:[A-Za-z][A-Za-z.,\x27-]+\s*)+?)\s+(?:\$|BSD|USD)?\s*([\d,]+(?:\.\d{2})?)(?:\s+(.*))?$/i
+  )
+  if (m) {
+    const name = m[1].trim()
+    const amount = parseAmount(m[2])
+    const comments = (m[3] || '').trim()
+    if (!isNaN(amount) && amount > 0 && name.length >= 3 && !/^(name|amount|total|employee|grand total|subtotal)$/i.test(name)) {
+      return { name, amount, comments }
     }
   }
 
@@ -186,7 +197,8 @@ function parseEmployerStatement(text, filename, fileParticulars = '') {
   const rows = []
   let pendingRemark = ''
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
     if (isSkipLine(line)) continue
 
     const parsed = parseEmployerAmountLine(line)
@@ -215,6 +227,26 @@ function parseEmployerStatement(text, filename, fileParticulars = '') {
       continue
     }
 
+    // Lookahead pairing: line i is a name and line i+1 is an amount
+    if (i + 1 < lines.length && /^[A-Za-z][A-Za-z\s.,'-]{2,40}$/.test(line) && !/^(name|amount|total|deduction|employee)$/i.test(line)) {
+      const nextLine = lines[i + 1]
+      const nextAmount = parseAmount(nextLine)
+      if (!isNaN(nextAmount) && nextAmount > 0 && /^(?:\$|BSD|USD)?\s*[\d,]+(?:\.\d{2})?$/.test(nextLine)) {
+        const rowDate = statementDate
+        const remarks = `Salary deduction — ${employer}`
+        rows.push({
+          name: line.trim(),
+          amount: nextAmount,
+          remarks,
+          employer,
+          date: rowDate,
+          statementDate,
+        })
+        i++ // Skip the amount line
+        continue
+      }
+    }
+
     if (isRemarkContinuation(line) && rows.length) {
       pendingRemark += (pendingRemark ? ' ' : '') + line
     }
@@ -232,7 +264,7 @@ function toEmployerCreditRows(rows) {
   return rows.map((r) => ({
     datePosted: r.statementDate,
     valueDate: r.date,
-    reference: '',
+    reference: r.reference || '',
     particulars: r.remarks,
     creditAmount: r.amount,
     name: r.name,
@@ -245,7 +277,7 @@ function toEmployerImportRows(rows) {
   return rows.map((r) => ({
     datePosted: r.statementDate,
     valueDate: r.date,
-    reference: '',
+    reference: r.reference || '',
     particulars: r.remarks,
     creditAmount: r.amount,
     name: r.name,
@@ -258,7 +290,7 @@ function toEmployerImportRows(rows) {
   }))
 }
 
-// --- Bank statement parser (existing) ---
+// --- Bank statement parser ---
 
 function cleanBankText(text) {
   return text
@@ -391,11 +423,13 @@ export async function parsePdfBuffer(buffer, filename = 'statement.pdf', options
   const parser = new PDFParse({ data: buffer })
   try {
     const result = await parser.getText()
-    const detected = detectPdfType(result.text, filename)
+    const rawText = (result.text || '').trim()
+    const detected = detectPdfType(rawText, filename)
     const tryEmployer = forceEmployer || (!forceBank && detected === 'employer')
 
-    if (tryEmployer) {
-      const employerRows = parseEmployerStatement(result.text, filename, fileParticulars)
+    // 1. Try deterministic employer parsing
+    if (tryEmployer && rawText.length > 0) {
+      const employerRows = parseEmployerStatement(rawText, filename, fileParticulars)
       if (employerRows.length) {
         const creditRows = toEmployerCreditRows(employerRows)
         return {
@@ -406,15 +440,11 @@ export async function parsePdfBuffer(buffer, filename = 'statement.pdf', options
           rows: toEmployerImportRows(employerRows),
         }
       }
-      if (forceEmployer) {
-        throw new Error(
-          'No employee repayment rows found in this PDF. Check the file format or add notes in File particulars (employer name, pay period).'
-        )
-      }
     }
 
-    if (forceBank || !forceEmployer) {
-      const parsed = groupBankBlocks(result.text).map(parseBankBlock).filter(Boolean)
+    // 2. Try deterministic bank statement parsing
+    if ((forceBank || !forceEmployer) && rawText.length > 0) {
+      const parsed = groupBankBlocks(rawText).map(parseBankBlock).filter(Boolean)
       const creditRows = filterBankCredits(parsed)
       if (creditRows.length) {
         return {
@@ -427,21 +457,104 @@ export async function parsePdfBuffer(buffer, filename = 'statement.pdf', options
       }
     }
 
-    if (forceBank) {
-      throw new Error('No credit transactions found in bank statement PDF')
+    // 3. Fallback: try employer parsing on rawText if not yet tried
+    if (rawText.length > 0) {
+      const fallbackEmployer = parseEmployerStatement(rawText, filename, fileParticulars)
+      if (fallbackEmployer.length) {
+        const creditRows = toEmployerCreditRows(fallbackEmployer)
+        return {
+          method: 'pdf',
+          source: 'employer',
+          documentType: 'employer',
+          creditRows,
+          rows: toEmployerImportRows(fallbackEmployer),
+        }
+      }
     }
 
-    // Last resort: try employer parser even when auto-detect said bank
-    const fallbackEmployer = parseEmployerStatement(result.text, filename, fileParticulars)
-    if (fallbackEmployer.length) {
-      const creditRows = toEmployerCreditRows(fallbackEmployer)
-      return {
-        method: 'pdf',
-        source: 'employer',
-        documentType: 'employer',
-        creditRows,
-        rows: toEmployerImportRows(fallbackEmployer),
+    // 4. AI Text Fallback: If text was extracted but line parsing missed it, use AI extraction
+    if (rawText.length >= 20 && process.env.OPENROUTER_API_KEY) {
+      try {
+        const aiRows = await extractFromTextWithAI(rawText, {
+          documentType: documentType || (detected === 'employer' ? 'employer' : 'bank'),
+          fileParticulars,
+        })
+        if (aiRows.length) {
+          const mappedRows = aiRows.map((r) => ({
+            datePosted: r.date,
+            valueDate: r.date,
+            reference: r.reference || '',
+            particulars: r.description || (documentType === 'employer' ? 'Salary deduction' : 'Credit deposit'),
+            creditAmount: r.amount,
+            name: r.payer,
+            date: r.date,
+            payer: r.payer,
+            description: r.description,
+            amount: r.amount,
+            employer: documentType === 'employer' ? (fileParticulars || employerFromFilename(filename)) : undefined,
+            remarks: r.description,
+          }))
+          return {
+            method: 'ai',
+            source: documentType === 'employer' ? 'employer' : detected,
+            documentType: documentType || detected,
+            creditRows: mappedRows,
+            rows: mappedRows,
+          }
+        }
+      } catch (aiErr) {
+        console.warn('AI PDF text extraction fallback attempt failed:', aiErr.message)
       }
+    }
+
+    // 5. Scanned PDF / Image PDF Fallback: If text is empty or too short, extract page screenshot / embedded image
+    if (process.env.OPENROUTER_API_KEY) {
+      try {
+        const screenshotResult = await parser.getScreenshot({ imageBuffer: true, imageDataUrl: true })
+        const firstPage = screenshotResult.pages?.[0]
+        if (firstPage?.data && firstPage.data.length > 0) {
+          const imgBuffer = Buffer.from(firstPage.data)
+          const aiRows = await extractFromImageWithAI(imgBuffer, 'image/png', {
+            documentType: documentType || (detected === 'employer' ? 'employer' : 'bank'),
+            fileParticulars,
+          })
+          if (aiRows.length) {
+            const mappedRows = aiRows.map((r) => ({
+              datePosted: r.date,
+              valueDate: r.date,
+              reference: r.reference || '',
+              particulars: r.description,
+              creditAmount: r.amount,
+              name: r.payer,
+              date: r.date,
+              payer: r.payer,
+              description: r.description,
+              amount: r.amount,
+              employer: documentType === 'employer' ? (fileParticulars || employerFromFilename(filename)) : undefined,
+              remarks: r.description,
+            }))
+            return {
+              method: 'ai',
+              source: documentType === 'employer' ? 'employer' : 'image',
+              documentType: documentType || 'image',
+              creditRows: mappedRows,
+              rows: mappedRows,
+            }
+          }
+        }
+      } catch (ocrErr) {
+        console.warn('AI PDF OCR screenshot extraction failed:', ocrErr.message)
+      }
+    }
+
+    if (forceEmployer) {
+      throw new Error(
+        'No employee repayment rows found in this PDF. Check the file format or add notes in File particulars (employer name, pay period).'
+      )
+    }
+
+    if (forceBank) {
+      throw new Error('No credit transactions found in bank statement PDF')
     }
 
     throw new Error('No credit or employee repayment rows found in PDF')

@@ -1,3 +1,5 @@
+import { createConnectorRouter } from './qb/qbConnectorRoutes.js'
+import { startRpaScheduler } from './qb/qbRpaService.js'
 import 'dotenv/config'
 
 process.on('uncaughtException', (err) => {
@@ -2046,7 +2048,9 @@ if (fs.existsSync(distPath)) {
 }
 
 // QuickBooks Data module routes (additive — no existing routes affected)
+app.use('/api/quickbooks-connector', createConnectorRouter(db))
 app.use('/api/quickbooks', authMiddleware, quickbooksRouter)
+const stopQbScheduler = startRpaScheduler(db)
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`SmartRepay running on 0.0.0.0:${PORT}`)
@@ -2054,6 +2058,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`QuickBooks Data: GET /api/quickbooks/summary`)
   console.log('Login: admin@pbshope.com')
 })
+
+server.on('close', stopQbScheduler)
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {

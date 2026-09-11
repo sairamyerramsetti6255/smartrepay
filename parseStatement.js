@@ -218,9 +218,25 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
           ? 'image/webp'
           : 'image/jpeg'
     const aiRows = await extractFromImageWithAI(buffer, mimeType, { documentType, fileParticulars })
-    if (!aiRows.length) throw new Error('No repayment rows found in image')
+    if (!aiRows.length) throw new Error('No repayment or deduction rows found in image')
+
+    const creditRows = aiRows.map((r) => ({
+      datePosted: r.date,
+      valueDate: r.date,
+      reference: r.reference || '',
+      particulars: r.description || (documentType === 'employer' ? 'Salary deduction' : 'Deposit'),
+      creditAmount: r.amount,
+      name: r.payer,
+      employer: documentType === 'employer' ? (fileParticulars || 'Employer') : undefined,
+      remarks: r.description,
+      date: r.date,
+      payer: r.payer,
+      description: r.description,
+      amount: r.amount,
+    }))
+
     const rows = enrichParsedRows(
-      aiRows.map((r) => ({ ...r, import_hash: rowHash(r) })),
+      creditRows.map((r) => ({ ...r, import_hash: rowHash(r) })),
       { documentType: documentType || 'image', fileParticulars }
     )
     return {
@@ -228,7 +244,7 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
       source: documentType === 'employer' ? 'employer' : documentType || 'image',
       documentType: documentType || 'image',
       rawRows: aiRows.slice(0, 12),
-      creditRows: aiRows,
+      creditRows,
       rows,
     }
   }

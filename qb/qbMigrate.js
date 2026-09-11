@@ -179,7 +179,7 @@ export function qbMigrateDb(db) {
     -- RPA Bot Automation Settings
     create table if not exists qb_rpa_settings (
       id text primary key,
-      autopilot_enabled integer default 1,
+      autopilot_enabled integer default 0,
       auto_approve_min_confidence real default 0.90,
       auto_ingest_smartrepay integer default 1,
       auto_resolve_borrowers integer default 1,
@@ -190,6 +190,33 @@ export function qbMigrateDb(db) {
       updated_at text default (datetime('now'))
     );
 
+    create table if not exists qb_desktop_deliveries (
+      id text primary key,
+      transaction_id text not null unique references qb_transactions(id),
+      company_name text not null,
+      payload_json text not null,
+      payload_hash text not null,
+      status text not null default 'queued' check(status in ('queued','processing','posted','failed','uncertain')),
+      claim_token text,
+      claimed_at text,
+      external_id text,
+      error text,
+      created_by text,
+      created_at text default (datetime('now')),
+      updated_at text default (datetime('now'))
+    );
+    create table if not exists qb_desktop_health (
+      id text primary key,
+      company_name text not null,
+      currency text not null,
+      accounts_json text not null default '[]',
+      last_seen text not null
+    );
+    create table if not exists qb_agent_audit (
+      id text primary key, actor text not null, tool_name text not null,
+      arguments_json text, result_json text, status text not null,
+      created_at text default (datetime('now'))
+    );
     -- Indexes for performance
     create index if not exists idx_qb_input_library_batch on qb_input_library(batch_id);
     create index if not exists idx_qb_input_library_source on qb_input_library(source_type);
@@ -203,6 +230,9 @@ export function qbMigrateDb(db) {
     create index if not exists idx_qb_rpa_runs_status on qb_rpa_runs(status);
     create index if not exists idx_qb_rpa_runs_created on qb_rpa_runs(created_at);
   `)
+
+  const settingsCols = db.prepare('pragma table_info(qb_rpa_settings)').all().map(c => c.name)
+  if (!settingsCols.includes('desktop_posting_enabled')) db.exec('alter table qb_rpa_settings add column desktop_posting_enabled integer not null default 0')
 
   console.log('[QB] Database migration complete — qb_* tables ready')
 }

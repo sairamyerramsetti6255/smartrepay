@@ -1,3 +1,4 @@
+import { assertEditable, atomic } from './qbGuards.js'
 import { randomUUID } from 'crypto'
 import {
   normalizeDate,
@@ -34,7 +35,9 @@ export function getSummary(db) {
       sum(case when template_type = 'payment_disbursed' then 1 else 0 end) as payments_disbursed,
       sum(case when template_type = 'account_to_create' then 1 else 0 end) as accounts_to_create,
       sum(case when approval_status = 'approved' then 1 else 0 end) as approved,
+      sum(case when approval_status = 'pending_review' or approval_status is null then 1 else 0 end) as pending_review,
       sum(case when approval_status = 'exported' then 1 else 0 end) as exported,
+      sum(case when approval_status = 'rejected' then 1 else 0 end) as rejected,
       sum(amount) as total_value
     from qb_transactions
   `).get()
@@ -193,8 +196,7 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
     const sqlResult = await getSqlMatchResults()
     if (sqlResult?.transactions?.length) {
       const matched = sqlResult.transactions.filter((t) =>
-        t.status === 'matched' && t.loan_number &&
-        (t.review_status === 'confirmed' || t.match_type !== 'review_required')
+        t.status === 'matched' || t.status === 'posted' || t.review_status === 'auto_matched'
       )
       if (matched.length > 0) {
         srTransactions = matched.slice(0, limit).map((t) => ({
@@ -446,24 +448,32 @@ export function runValidation(db, txnId) {
 // Approve / Reject
 // ---------------------------------------------------------------------------
 
-export function approveTransaction(db, txnId, actor) {
-  const txn = db.prepare('select * from qb_transactions where id = ?').get(txnId)
+export function approveTransaction(db, txnId, actor = 'User') {
+  let txn = db.prepare('select * from qb_transactions where id = ?').get(txnId)
   if (!txn) throw new Error(`Transaction ${txnId} not found`)
-  if (txn.validation_status !== 'valid') {
-    throw new Error(`Cannot approve transaction with status: ${txn.validation_status}`)
-  }
+  
+  assertEditable(db, txnId)
+  const validation = runValidation(db, txnId)
+  if (validation.validation_status !== 'valid') throw new Error(`Cannot approve transaction: ${validation.validation_status}`)
+
   db.prepare(`
     update qb_transactions set
       approval_status = 'approved',
+      rejection_reason = null,
       approved_by = ?,
       approved_at = datetime('now'),
       updated_at = datetime('now')
     where id = ?
   `).run(actor, txnId)
-  return { approved: true }
+  return { approved: true, id: txnId }
 }
 
-export function rejectTransaction(db, txnId, actor, reason = '') {
+export function rejectTransaction(db, txnId, actor = 'User', reason = '') {
+  return atomic(db, () => rejectTransactionInternal(db, txnId, actor, reason))
+}
+
+function rejectTransactionInternal(db, txnId, actor = 'User', reason = '') {
+  assertEditable(db, txnId)
   const txn = db.prepare('select * from qb_transactions where id = ?').get(txnId)
   if (!txn) throw new Error(`Transaction ${txnId} not found`)
   db.prepare(`
@@ -475,21 +485,33 @@ export function rejectTransaction(db, txnId, actor, reason = '') {
       updated_at = datetime('now')
     where id = ?
   `).run(reason, actor, txnId)
-  return { rejected: true }
+  return { rejected: true, id: txnId }
 }
 
-export function approveAllValid(db, templateType = 'emi_receipt', actor) {
-  const info = db.prepare(`
-    update qb_transactions set
-      approval_status = 'approved',
-      approved_by = ?,
-      approved_at = datetime('now'),
-      updated_at = datetime('now')
-    where validation_status = 'valid'
-      and approval_status = 'pending_review'
-      ${templateType ? `and template_type = ?` : ''}
-  `).run(...(templateType ? [actor, templateType] : [actor]))
-  return { approved_count: info.changes }
+// Reject the local, editable queue as one audited operation. Never alter a Desktop delivery.
+export function rejectAllUnpostedRecords(db, actor, reason) {
+  if (typeof reason !== 'string' || !reason.trim()) throw new Error('A rejection reason is required')
+  return atomic(db, () => {
+    const rows = db.prepare(`select t.id,t.approval_status,d.id as delivery_id
+      from qb_transactions t left join qb_desktop_deliveries d on d.transaction_id=t.id`).all()
+    const eligible = rows.filter(t => ['pending_review','approved'].includes(t.approval_status) && !t.delivery_id)
+    for (const t of eligible) rejectTransaction(db,t.id,actor,reason.trim())
+    const protected_count = rows.filter(t => t.approval_status === 'exported' || t.delivery_id).length
+    const already_rejected = rows.filter(t => t.approval_status === 'rejected' && !t.delivery_id).length
+    return {rejected_count:eligible.length,protected_count,already_rejected,
+      message:`Rejected ${eligible.length} records. Kept ${protected_count} exported/delivery records unchanged; ${already_rejected} were already rejected.`,
+      prior_records:eligible.map(t => ({id:t.id,approval_status:t.approval_status}))}
+  })
+}
+
+export function approveAllValid(db, templateType = null, actor = 'User') {
+  const rows = db.prepare(`select id from qb_transactions where approval_status in ('pending_review', 'rejected')
+    ${templateType && templateType !== 'all' ? 'and template_type = ?' : ''}`).all(...(templateType && templateType !== 'all' ? [templateType] : []))
+  let approved_count = 0
+  for (const row of rows) {
+    try { approveTransaction(db, row.id, actor); approved_count++ } catch { /* Invalid records stay in review. */ }
+  }
+  return { approved_count }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +519,14 @@ export function approveAllValid(db, templateType = 'emi_receipt', actor) {
 // ---------------------------------------------------------------------------
 
 export function exportApproved(db, format = 'json', actor) {
+  return atomic(db, () => exportApprovedInternal(db, format, actor))
+}
+
+function exportApprovedInternal(db, format = 'json', actor) {
+  if (db.prepare("select 1 from qb_desktop_deliveries d join qb_transactions t on t.id=d.transaction_id where t.approval_status='approved' limit 1").get()) throw new Error('Resolve Desktop deliveries before creating a manual export')
+  for (const t of db.prepare("select id from qb_transactions where approval_status='approved' and template_type != 'account_to_create'").all()) {
+    if (runValidation(db, t.id).validation_status !== 'valid') throw new Error('An approved record failed revalidation; review before exporting')
+  }
   // Get all approved emi_receipt transactions
   const emiTxns = db.prepare(`
     select * from qb_transactions
@@ -506,7 +536,7 @@ export function exportApproved(db, format = 'json', actor) {
   const paymentTxns = db.prepare(`
     select * from qb_transactions
     where approval_status = 'approved' and template_type = 'payment_disbursed'
-  `).all()
+  `).all().map(t => ({ ...t, lines: db.prepare('select * from qb_transaction_lines where transaction_id=? order by line_number').all(t.id) }))
 
   const accountTxns = db.prepare(`
     select qa.* from qb_accounts_to_create qa
@@ -564,7 +594,7 @@ export function getPreview(db) {
     select * from qb_transactions
     where approval_status = 'approved' and template_type = 'payment_disbursed'
     order by transaction_date desc
-  `).all()
+  `).all().map(t => ({ ...t, lines: db.prepare('select * from qb_transaction_lines where transaction_id=? order by line_number').all(t.id) }))
 
   const accounts = db.prepare(`
     select qa.* from qb_accounts_to_create qa
@@ -619,6 +649,10 @@ export function getExportById(db, id) {
 // ---------------------------------------------------------------------------
 
 export function createTransaction(db, data, actor = 'system') {
+  return atomic(db, () => createTransactionInternal(db, data, actor))
+}
+
+function createTransactionInternal(db, data, actor = 'system') {
   const templateType = data.template_type || 'emi_receipt'
   const isoDate = normalizeDate(data.transaction_date) || new Date().toISOString().slice(0, 10)
   const amount = normalizeAmount(data.amount) || 0
@@ -663,7 +697,7 @@ export function createTransaction(db, data, actor = 'system') {
   if (Array.isArray(data.lines) && data.lines.length > 0) {
     lines = data.lines.map((l) => ({
       account_name: l.account_name || (templateType === 'payment_disbursed' ? 'Loan Disbursements' : 'Loans Receivable'),
-      amount: normalizeAmount(l.amount) || amount,
+      amount: normalizeAmount(l.amount),
       memo: l.memo || memo,
     }))
   } else {
@@ -770,6 +804,11 @@ export function createTransaction(db, data, actor = 'system') {
 }
 
 export function updateTransaction(db, id, data, actor = 'system') {
+  return atomic(db, () => updateTransactionInternal(db, id, data, actor))
+}
+
+function updateTransactionInternal(db, id, data, actor = 'system') {
+  assertEditable(db, id)
   const existing = db.prepare('select * from qb_transactions where id = ?').get(id)
   if (!existing) throw new Error(`Transaction ${id} not found`)
 
@@ -793,7 +832,7 @@ export function updateTransaction(db, id, data, actor = 'system') {
   if (Array.isArray(data.lines) && data.lines.length > 0) {
     lines = data.lines.map((l) => ({
       account_name: l.account_name || (templateType === 'payment_disbursed' ? 'Loan Disbursements' : 'Loans Receivable'),
-      amount: normalizeAmount(l.amount) || amount,
+      amount: normalizeAmount(l.amount),
       memo: l.memo || memo,
     }))
   } else {
@@ -893,6 +932,11 @@ export function updateTransaction(db, id, data, actor = 'system') {
 }
 
 export function deleteTransaction(db, id, actor = 'system') {
+  return atomic(db, () => deleteTransactionInternal(db, id, actor))
+}
+
+function deleteTransactionInternal(db, id, actor = 'system') {
+  assertEditable(db, id)
   const existing = db.prepare('select * from qb_transactions where id = ?').get(id)
   if (!existing) throw new Error(`Transaction ${id} not found`)
 
@@ -930,6 +974,7 @@ export function createAccount(db, data, actor = 'system') {
 export function updateAccount(db, id, data, actor = 'system') {
   const existing = db.prepare('select * from qb_accounts_to_create where id = ?').get(id)
   if (!existing) throw new Error(`Account ${id} not found`)
+  if (existing.transaction_id) assertEditable(db,existing.transaction_id)
 
   const accountName = data.account_name !== undefined ? String(data.account_name).trim() : existing.account_name
   if (!accountName) throw new Error('Account name cannot be empty')
@@ -956,6 +1001,7 @@ export function updateAccount(db, id, data, actor = 'system') {
 export function deleteAccount(db, id, actor = 'system') {
   const existing = db.prepare('select * from qb_accounts_to_create where id = ?').get(id)
   if (!existing) throw new Error(`Account ${id} not found`)
+  if (existing.transaction_id) assertEditable(db,existing.transaction_id)
 
   db.prepare('delete from qb_accounts_to_create where id = ?').run(id)
   return { success: true, deleted_id: id }

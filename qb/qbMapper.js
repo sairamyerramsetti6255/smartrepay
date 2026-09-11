@@ -64,7 +64,8 @@ export function mapToPaymentDisbursed(txn) {
     Payee_Name: normalizeName(txn.vendor_name || txn.customer_name).raw,
     Ref_Number: normalizeReference(txn.reference_number) || txn.id,
     Total_Amount: normalizeAmount(txn.amount) || 0,
-    Line_Account: 'Loans Receivable',
+    Line_Account: txn.lines?.[0]?.account_name || 'Loans Receivable',
+    line_items: (txn.lines || []).map(l => ({ Line_Account:l.account_name, Line_Amount:l.amount, Line_Memo:l.memo || '' })),
     Line_Memo: txn.payment_method || 'Loan principal disbursement',
     _meta: {
       source_id: txn.input_id,

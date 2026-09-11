@@ -1,3 +1,7 @@
+import { listReviewQueue, getReviewDetail, correctReviewRecord, reconciliationReport, approveReviewedRecord } from '../qb/qbOperationsService.js'
+import { lookupBorrower } from '../qb/qbBorrowerResolver.js'
+import { requireQuickBooksRole, canManageQuickBooks } from '../qb/qbGuards.js'
+import { listDeliveries, queueDesktopApproved, retryFailedDelivery, cancelUnsentDelivery } from '../qb/qbDesktopService.js'
 import express from 'express'
 import { randomUUID } from 'crypto'
 import multer from 'multer'
@@ -36,7 +40,11 @@ import {
   getRpaRunById,
   saveRpaSettings,
   getDesktopRpaScript,
+  detectDesktopApps,
+  generateReconciliationPackage,
+  launchDesktopApplication,
 } from '../qb/qbRpaService.js'
+import { getMcpManifest, executeMcpToolCall } from '../qb/qbMcpService.js'
 
 const router = express.Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } })
@@ -45,11 +53,13 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 
 // RBAC helpers — backend enforcement
 // ---------------------------------------------------------------------------
 
-const QB_APPROVER_ROLES = ['accounting', 'system_owner']
-const QB_EXPORT_ROLES = ['accounting', 'system_owner']
-
-function canApprove(role) { return QB_APPROVER_ROLES.includes(role) }
-function canExport(role) { return QB_EXPORT_ROLES.includes(role) }
+const canApprove = canManageQuickBooks
+const canExport = canManageQuickBooks
+// All ledger mutations require an accounting role. Chat independently filters its tool permissions.
+router.use((req,res,next) => {
+  if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.path !== '/rpa/chat') return requireQuickBooksRole(req,res,next)
+  next()
+})
 
 // ---------------------------------------------------------------------------
 // Audit helper (reuses existing SmartRepay audit table)
@@ -856,7 +866,7 @@ router.post('/rpa/chat', async (req, res) => {
   try {
     const actor = req.user?.email || req.user?.sub || 'User'
     const { message, history } = req.body || {}
-    const result = await handleRpaChat(db, message, history, actor)
+    const result = await handleRpaChat(db, message, history, actor, req.user?.role)
     res.json(result)
   } catch (e) {
     console.error('[QB RPA] POST /rpa/chat error:', e)
@@ -909,4 +919,94 @@ router.get('/rpa/script', (req, res) => {
   }
 })
 
+// GET /api/quickbooks/rpa/apps-status
+router.get('/rpa/apps-status', (req, res) => {
+  try {
+    const apps = detectDesktopApps()
+    res.json(apps)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/quickbooks/rpa/open-desktop
+router.post('/rpa/open-desktop', async (req, res) => {
+  try {
+    const result = await launchDesktopApplication(db, req.body || {})
+    res.json(result)
+  } catch (e) {
+    console.error('[QB RPA] POST /rpa/open-desktop error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// GET /api/quickbooks/rpa/download-file
+router.get('/rpa/download-file', requireQuickBooksRole, (req, res) => {
+  try {
+    const { format } = req.query
+    const pkg = generateReconciliationPackage(db)
+    const filePath = format === 'iif' ? pkg.iifPath : pkg.excelPath
+    const fileName = format === 'iif' ? pkg.iifFileName : pkg.excelFileName
+    res.download(filePath, fileName)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Model Context Protocol (MCP) Standard Endpoints
+// ---------------------------------------------------------------------------
+
+// GET /api/quickbooks/mcp/manifest & GET /api/quickbooks/mcp/tools
+router.get(['/mcp/manifest', '/mcp/tools'], (req, res) => {
+  try {
+    const manifest = getMcpManifest()
+    res.json(manifest)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/quickbooks/mcp/call & POST /api/quickbooks/mcp/tools/call
+router.post(['/mcp/call', '/mcp/tools/call'], async (req, res) => {
+  try {
+    const actor = req.user?.email || req.user?.sub || 'MCP Client'
+    const toolName = req.body.name || req.body.tool || req.body.params?.name
+    const args = req.body.arguments || req.body.args || req.body.params?.arguments || {}
+
+    if (!toolName) {
+      return res.status(400).json({ error: 'Tool name is required in MCP tool call request' })
+    }
+
+    const response = await executeMcpToolCall(db, toolName, args, actor, req.user?.role)
+    audit('qb_mcp_tool', toolName, 'mcp_tool_execution', actor, null, { tool: toolName, args })
+    res.json(response)
+  } catch (e) {
+    console.error('[QB MCP Tool Error]', e)
+    res.status(500).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: e.message },
+    })
+  }
+})
+
+router.get('/rpa/deliveries', (req,res) => res.json({ rows:listDeliveries(db) }))
+router.post('/rpa/deliveries', (req,res) => {
+  try { res.json(queueDesktopApproved(db,req.user.email || req.user.sub)) }
+  catch(e) { res.status(400).json({error:e.message}) }
+})
+router.post('/rpa/deliveries/:id/retry', (req,res) => {
+  try { res.json(retryFailedDelivery(db,req.params.id)) }
+  catch(e) { res.status(400).json({error:e.message}) }
+})
+router.post('/rpa/deliveries/:id/cancel', (req,res) => {
+  try { res.json(cancelUnsentDelivery(db,req.params.id,req.user.email || req.user.sub)) }
+  catch(e) { res.status(400).json({error:e.message}) }
+})
+router.get('/rpa/review', (req,res) => {try {res.json(listReviewQueue(db,req.query))} catch(e){res.status(400).json({error:e.message})}})
+router.get('/rpa/review/:id', (req,res) => {try {res.json(getReviewDetail(db,req.params.id))} catch(e){res.status(404).json({error:e.message})}})
+router.post('/rpa/review/:id', (req,res) => {try {res.json(correctReviewRecord(db,req.params.id,req.body,req.user.email || req.user.sub))} catch(e){res.status(400).json({error:e.message})}})
+router.get('/rpa/borrower-options', (req,res) => {try {res.json(lookupBorrower(db,String(req.query.query||'')))} catch(e){res.status(400).json({error:e.message})}})
+router.get('/rpa/report', (req,res) => {try {res.json(reconciliationReport(db,req.query))} catch(e){res.status(400).json({error:e.message})}})
+router.post('/rpa/review/:id/approve', (req,res) => {try {res.json(approveReviewedRecord(db,req.params.id,req.body.review_version,req.user.email || req.user.sub))} catch(e){res.status(400).json({error:e.message})}})
 export default router

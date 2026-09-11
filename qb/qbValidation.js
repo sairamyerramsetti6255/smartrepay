@@ -62,16 +62,16 @@ function ruleQB004_dateValid(txn) {
 
 function ruleQB005_lineTotalsMatch(txn, lines) {
   // Only applies to EMI receipts
-  if (txn.template_type !== 'emi_receipt') {
+  if (!['emi_receipt','payment_disbursed'].includes(txn.template_type)) {
     return { code: 'QB005', field: 'line_items', severity: 'INFO', status: 'pass', message: 'Line total check not applicable for this template type' }
   }
   if (!lines || lines.length === 0) {
-    return { code: 'QB005', field: 'line_items', severity: 'BLOCKING', status: 'fail', message: 'EMI receipt has no line items' }
+    return { code: 'QB005', field: 'line_items', severity: 'BLOCKING', status: 'fail', message: 'Transaction has no line items' }
   }
   const lineTotal = lines.reduce((sum, l) => sum + (normalizeAmount(l.amount) || 0), 0)
   const txnTotal = normalizeAmount(txn.amount) || 0
   const diff = Math.abs(lineTotal - txnTotal)
-  const ok = diff < 0.01 // Allow 1-cent floating point tolerance
+  const ok = lines.every(l => Number.isFinite(Number(l.amount)) && Number(l.amount) > 0 && String(l.account_name || '').trim()) && lines.reduce((n,l) => n + Math.round(Number(l.amount)*100),0) === Math.round(txnTotal*100)
   return {
     code: 'QB005',
     field: 'line_items',

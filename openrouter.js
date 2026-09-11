@@ -15,10 +15,76 @@ function normalizeDate(val) {
   return String(val).trim()
 }
 
-export async function extractWithAI(headers, sampleRows, context = {}) {
+export function parseJsonArrayFromText(content) {
+  if (!content) return []
+  // Remove markdown code blocks if present
+  let clean = content.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim()
+  
+  // Look for JSON array [...]
+  const match = clean.match(/\[[\s\S]*\]/)
+  if (!match) return []
+
+  try {
+    const parsed = JSON.parse(match[0])
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    // Attempt cleanup of trailing commas
+    const fixed = match[0].replace(/,\s*([\]}])/g, '$1')
+    try {
+      const parsed = JSON.parse(fixed)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+}
+
+async function callOpenRouterWithFallback({ messages, models, temperature = 0.1 }) {
   const apiKey = process.env.OPENROUTER_API_KEY
   if (!apiKey) throw new Error('AI extraction unavailable — set OPENROUTER_API_KEY in server/.env')
 
+  let lastError = null
+  for (const model of models) {
+    if (!model) continue
+    try {
+      const res = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:5173',
+          'X-Title': process.env.OPENROUTER_APP_NAME || 'SmartRepay AI',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature,
+        }),
+      })
+
+      if (!res.ok) {
+        const errText = await res.text()
+        lastError = new Error(`Model ${model} returned ${res.status}: ${errText.slice(0, 200)}`)
+        continue
+      }
+
+      const data = await res.json()
+      if (data.error) {
+        lastError = new Error(`Model ${model} error: ${data.error.message || JSON.stringify(data.error)}`)
+        continue
+      }
+
+      const content = data.choices?.[0]?.message?.content || ''
+      if (content) return content
+    } catch (e) {
+      lastError = e
+    }
+  }
+
+  throw lastError || new Error('All AI extraction models failed')
+}
+
+export async function extractWithAI(headers, sampleRows, context = {}) {
   const docHint = context.fileParticulars
     ? `\nFile notes from uploader: ${context.fileParticulars}`
     : ''
@@ -37,109 +103,155 @@ Map the spreadsheet columns to this schema for EACH transaction row:
 ${typeHint}${docHint}
 
 Headers: ${JSON.stringify(headers)}
-Sample rows: ${JSON.stringify(sampleRows.slice(0, 6))}
+Sample rows: ${JSON.stringify(sampleRows.slice(0, 8))}
 
 Return ONLY a JSON array of objects with keys: date, payer, description, amount, reference.
 Skip header rows and empty rows. Include ONLY credit/incoming payment rows (amount > 0). Exclude debits, withdrawals, and negative amounts.`
 
-  const res = await fetch(OPENROUTER_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:5173',
-      'X-Title': process.env.OPENROUTER_APP_NAME || 'SmartRepay AI',
-    },
-    body: JSON.stringify({
-      model: process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-    }),
+  const models = [
+    process.env.OPENROUTER_MODEL,
+    'google/gemini-2.5-flash',
+    'openai/gpt-4o-mini',
+  ].filter(Boolean)
+
+  const content = await callOpenRouterWithFallback({
+    messages: [{ role: 'user', content: prompt }],
+    models,
   })
 
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`AI extraction failed: ${err.slice(0, 200)}`)
-  }
+  const parsed = parseJsonArrayFromText(content)
+  if (!parsed.length) throw new Error('AI returned invalid format')
 
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content || ''
-  const match = content.match(/\[[\s\S]*\]/)
-  if (!match) throw new Error('AI returned invalid format')
-
-  const parsed = JSON.parse(match[0])
   return parsed
     .map((r) => ({
       date: normalizeDate(r.date),
-      payer: String(r.payer || r.beneficiary || '').trim(),
-      description: String(r.description || '').trim(),
+      payer: String(r.payer || r.beneficiary || r.name || r.employee || '').trim(),
+      description: String(r.description || r.memo || '').trim(),
       amount: parseAmount(r.amount),
       reference: String(r.reference || r['reference number'] || '').trim(),
     }))
     .filter((r) => r.date && !isNaN(r.amount) && r.amount > 0)
 }
 
-/** Extract credit rows from a scanned statement image (photo / screenshot). */
-export async function extractFromImageWithAI(buffer, mimeType, context = {}) {
-  const apiKey = process.env.OPENROUTER_API_KEY
-  if (!apiKey) throw new Error('AI extraction unavailable — set OPENROUTER_API_KEY in server/.env')
+/** Extract credit / deduction rows from unstructured PDF or raw statement text */
+export async function extractFromTextWithAI(rawText, context = {}) {
+  const docHint = context.fileParticulars ? `Uploader notes: ${context.fileParticulars}. ` : ''
+  const isEmployer = context.documentType === 'employer' || /deduction|payroll/i.test(rawText)
+  const typeHint = isEmployer
+    ? 'This is an employer payroll deduction listing. Extract every employee name and their deduction/repayment amount.'
+    : 'This is a bank or credit statement. Extract every incoming credit/deposit transaction.'
 
+  const today = new Date().toISOString().slice(0, 10)
+  const prompt = `You are a high-accuracy financial document parser for SmartRepay (Simplified Lending Bahamas).
+${docHint}${typeHint}
+
+Document Text:
+"""
+${rawText.slice(0, 45000)}
+"""
+
+Extract all individual payment/deduction transactions.
+Return ONLY a valid JSON array of objects:
+[
+  {
+    "date": "YYYY-MM-DD",
+    "payer": "Employee or Borrower Full Name",
+    "description": "Salary deduction / loan payment notes",
+    "amount": 123.45,
+    "reference": "Emp ID, Ref, or Account number if present"
+  }
+]
+Rules:
+1. "payer" must be the individual person's name (clean up IDs and titles).
+2. "amount" must be a positive numeric amount (never negative, exclude total/subtotal summary lines).
+3. If no specific transaction date is on a row, use the document statement/pay date, or "${today}".
+4. Exclude debit/fee/summary lines. Return ONLY the JSON array.`
+
+  const models = [
+    'google/gemini-2.5-flash',
+    'openai/gpt-4o-mini',
+    process.env.OPENROUTER_MODEL,
+  ].filter(Boolean)
+
+  const content = await callOpenRouterWithFallback({
+    messages: [{ role: 'user', content: prompt }],
+    models,
+  })
+
+  const parsed = parseJsonArrayFromText(content)
+  if (!parsed.length) throw new Error('AI could not identify deduction or repayment rows in this document')
+
+  return parsed
+    .map((r) => ({
+      date: normalizeDate(r.date) || today,
+      payer: String(r.payer || r.name || r.employee || '').trim(),
+      description: String(r.description || r.remarks || context.fileParticulars || (isEmployer ? 'Salary deduction' : 'Credit deposit')).trim(),
+      amount: parseAmount(r.amount),
+      reference: String(r.reference || '').trim(),
+    }))
+    .filter((r) => r.payer && !isNaN(r.amount) && r.amount > 0)
+}
+
+/** Extract credit rows from a scanned statement image (photo / screenshot / raster PDF page). */
+export async function extractFromImageWithAI(buffer, mimeType, context = {}) {
   const base64 = buffer.toString('base64')
   const dataUrl = `data:${mimeType || 'image/jpeg'};base64,${base64}`
   const docHint = context.fileParticulars ? `Uploader notes: ${context.fileParticulars}. ` : ''
-  const typeHint =
-    context.documentType === 'employer'
-      ? 'This is an employer payroll / staff deduction list — one row per employee with name and deduction amount.'
-      : context.documentType === 'bank'
-        ? 'This is a bank statement — extract credit/deposit lines only.'
-        : 'Extract employee repayment or bank credit lines (amounts received).'
+  const isEmployer = context.documentType === 'employer'
+  const typeHint = isEmployer
+    ? 'This is an employer payroll / staff deduction list — one row per employee with employee name and deduction amount.'
+    : context.documentType === 'bank'
+      ? 'This is a bank statement — extract credit/deposit lines only.'
+      : 'Extract employee repayment or bank credit lines (amounts received).'
 
-  const prompt = `${docHint}${typeHint}
+  const today = new Date().toISOString().slice(0, 10)
+  const prompt = `You are a high-accuracy document OCR parser for SmartRepay (Simplified Lending Bahamas).
+${docHint}${typeHint}
 
-Return ONLY a JSON array of credit/repayment rows with keys: date (YYYY-MM-DD), payer (person name), description, amount (positive number), reference.
-Include ONLY incoming payments / EMI deductions with amount > 0. Use today's date if no date visible.`
+Read this statement/deduction document image and extract all individual deduction/repayment rows.
+Return ONLY a valid JSON array of objects:
+[
+  {
+    "date": "YYYY-MM-DD",
+    "payer": "Employee or Borrower Full Name",
+    "description": "Salary deduction or payment particulars",
+    "amount": 123.45,
+    "reference": "Employee ID or reference code if present"
+  }
+]
+Rules:
+1. "payer" must be the individual employee/borrower's name.
+2. "amount" must be the numeric amount (positive number). Exclude grand totals and subtotals.
+3. If no row date is visible, use the document header date or "${today}".
+4. Return ONLY the JSON array.`
 
-  const model = process.env.OPENROUTER_VISION_MODEL || process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001'
+  const models = [
+    process.env.OPENROUTER_VISION_MODEL,
+    'google/gemini-2.5-flash',
+    'openai/gpt-4o-mini',
+  ].filter(Boolean)
 
-  const res = await fetch(OPENROUTER_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:5173',
-      'X-Title': process.env.OPENROUTER_APP_NAME || 'SmartRepay AI',
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: dataUrl } },
-          ],
-        },
-      ],
-      temperature: 0.1,
-    }),
+  const content = await callOpenRouterWithFallback({
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: dataUrl } },
+        ],
+      },
+    ],
+    models,
   })
 
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`AI image extraction failed: ${err.slice(0, 200)}`)
-  }
+  const parsed = parseJsonArrayFromText(content)
+  if (!parsed.length) throw new Error('AI could not read repayment rows from this image')
 
-  const data = await res.json()
-  const content = data.choices?.[0]?.message?.content || ''
-  const match = content.match(/\[[\s\S]*\]/)
-  if (!match) throw new Error('AI could not read repayment rows from this image')
-
-  const parsed = JSON.parse(match[0])
   return parsed
     .map((r) => ({
-      date: normalizeDate(r.date) || new Date().toISOString().slice(0, 10),
+      date: normalizeDate(r.date) || today,
       payer: String(r.payer || r.name || r.employee || '').trim(),
-      description: String(r.description || r.remarks || context.fileParticulars || '').trim(),
+      description: String(r.description || r.remarks || context.fileParticulars || (isEmployer ? 'Salary deduction' : 'Deposit')).trim(),
       amount: parseAmount(r.amount),
       reference: String(r.reference || '').trim(),
     }))
