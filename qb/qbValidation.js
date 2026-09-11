@@ -1,4 +1,5 @@
 import { isValidDate, normalizeAmount } from './qbNormalize.js'
+import { lookupBorrower } from './qbBorrowerResolver.js'
 
 /**
  * QuickBooks Data — Deterministic Validation Engine
@@ -39,13 +40,14 @@ function ruleQB002_amountPositive(txn) {
 }
 
 function ruleQB003_customerNamePresent(txn) {
-  const ok = !!txn.customer_name && String(txn.customer_name).trim().length > 0
+  const name = txn.customer_name || txn.vendor_name
+  const ok = !!name && String(name).trim().length > 0
   return {
     code: 'QB003',
     field: 'customer_name',
     severity: 'BLOCKING',
     status: ok ? 'pass' : 'fail',
-    message: ok ? 'Customer name present' : 'Customer / payee name is missing',
+    message: ok ? 'Customer / payee name present' : 'Customer / payee name is missing',
   }
 }
 
@@ -61,8 +63,8 @@ function ruleQB004_dateValid(txn) {
 }
 
 function ruleQB005_lineTotalsMatch(txn, lines) {
-  // Only applies to EMI receipts
-  if (!['emi_receipt','payment_disbursed'].includes(txn.template_type)) {
+  // Applies to EMI receipts and payments disbursed
+  if (!['emi_receipt', 'payment_disbursed'].includes(txn.template_type)) {
     return { code: 'QB005', field: 'line_items', severity: 'INFO', status: 'pass', message: 'Line total check not applicable for this template type' }
   }
   if (!lines || lines.length === 0) {
@@ -78,8 +80,8 @@ function ruleQB005_lineTotalsMatch(txn, lines) {
     severity: 'BLOCKING',
     status: ok ? 'pass' : 'fail',
     message: ok
-      ? `Line total ${lineTotal.toFixed(2)} matches deposit ${txnTotal.toFixed(2)}`
-      : `Line total ${lineTotal.toFixed(2)} does not match deposit ${txnTotal.toFixed(2)} — difference: ${diff.toFixed(2)}`,
+      ? `Line total ${lineTotal.toFixed(2)} matches total ${txnTotal.toFixed(2)}`
+      : `Line total ${lineTotal.toFixed(2)} does not match total ${txnTotal.toFixed(2)} — difference: ${diff.toFixed(2)}`,
   }
 }
 
@@ -127,8 +129,12 @@ function ruleQB008_confidenceCheck(txn) {
   }
 }
 
-function ruleQB009_borrowerMatched(txn) {
-  if (txn.template_type && txn.template_type !== 'emi_receipt') {
+function ruleQB009_borrowerMatched(txn, db = null) {
+  const isReceipt = txn.template_type === 'emi_receipt'
+  const isDisbursed = txn.template_type === 'payment_disbursed'
+  const partyName = txn.customer_name || txn.vendor_name || ''
+
+  if (!isReceipt && !isDisbursed) {
     return {
       code: 'QB009',
       field: 'borrower_id',
@@ -137,15 +143,81 @@ function ruleQB009_borrowerMatched(txn) {
       message: 'Borrower matching not applicable for this template type',
     }
   }
+
+  if (db && (partyName || txn.borrower_id)) {
+    const lookup = lookupBorrower(db, partyName, txn.amount, txn.borrower_id)
+    if (lookup.top_match) {
+      const top = lookup.top_match
+      if (txn.borrower_id && String(txn.borrower_id).trim()) {
+        const provId = String(txn.borrower_id).trim().toLowerCase()
+        const topBId = String(top.borrower_id || '').toLowerCase()
+        const topLdId = String(top.loandisk_id || '').toLowerCase()
+        const topLoanId = String(top.loan_id || '').toLowerCase()
+        const isMatch = provId === topBId || provId === topLdId || provId === topLoanId
+        if (!isMatch) {
+          return {
+            code: 'QB009',
+            field: 'borrower_id',
+            severity: 'WARNING',
+            status: 'fail',
+            message: `Provided Borrower ID (${txn.borrower_id}) does not match LoanDisk borrower ${top.full_name} (${top.loandisk_id || top.borrower_id})`,
+          }
+        }
+      }
+      return {
+        code: 'QB009',
+        field: 'borrower_id',
+        severity: 'INFO',
+        status: 'pass',
+        message: `Borrower matched in LoanDisk: ${top.full_name} (ID: ${top.loandisk_id || top.borrower_id}, Name score: ${top.score}%)`,
+      }
+    } else if (lookup.match_count > 1) {
+      return {
+        code: 'QB009',
+        field: 'borrower_id',
+        severity: 'WARNING',
+        status: 'fail',
+        message: `Multiple candidate borrowers found in LoanDisk for "${partyName}" (${lookup.match_count} matches) — manual review required`,
+      }
+    } else {
+      if (isDisbursed && !txn.borrower_id) {
+        return {
+          code: 'QB009',
+          field: 'borrower_id',
+          severity: 'INFO',
+          status: 'pass',
+          message: 'Payee not linked to LoanDisk borrower (standard disbursement / vendor payment)',
+        }
+      }
+      return {
+        code: 'QB009',
+        field: 'borrower_id',
+        severity: 'WARNING',
+        status: 'fail',
+        message: `Borrower "${partyName || txn.borrower_id}" not found in LoanDisk active borrowers list — manual review required`,
+      }
+    }
+  }
+
+  if (isDisbursed && !txn.borrower_id) {
+    return {
+      code: 'QB009',
+      field: 'borrower_id',
+      severity: 'INFO',
+      status: 'pass',
+      message: 'Payee not linked to LoanDisk borrower (standard disbursement / vendor payment)',
+    }
+  }
+
   const ok = !!txn.borrower_id && String(txn.borrower_id).trim().length > 0
   return {
     code: 'QB009',
     field: 'borrower_id',
-    severity: 'INFO',
+    severity: ok ? 'INFO' : 'WARNING',
     status: ok ? 'pass' : 'fail',
     message: ok
       ? `Borrower matched in LoanDisk: ${txn.borrower_id}`
-      : 'Borrower not found in LoanDisk active borrowers list — manual review required',
+      : `Borrower ${partyName ? `"${partyName}" ` : ''}not found in LoanDisk active borrowers list — manual review required`,
   }
 }
 
@@ -163,6 +235,73 @@ function ruleQB010_bankAccountForPayment(txn) {
   }
 }
 
+function ruleQB011_emiAmountValidation(txn, db = null) {
+  const isReceipt = txn.template_type === 'emi_receipt'
+  const isDisbursed = txn.template_type === 'payment_disbursed'
+  const partyName = txn.customer_name || txn.vendor_name || ''
+  const amt = normalizeAmount(txn.amount)
+
+  if (!isReceipt && !isDisbursed) {
+    return {
+      code: 'QB011',
+      field: 'amount',
+      severity: 'INFO',
+      status: 'pass',
+      message: 'EMI amount validation not applicable for this template type',
+    }
+  }
+
+  if (db && (partyName || txn.borrower_id) && !isNaN(amt) && amt > 0) {
+    const lookup = lookupBorrower(db, partyName, amt, txn.borrower_id)
+    if (lookup.top_match && lookup.top_match.expected_emi != null && lookup.top_match.expected_emi > 0) {
+      const exp = lookup.top_match.expected_emi
+      const diff = Math.round(Math.abs(amt - exp) * 100) / 100
+      const status = lookup.top_match.emi_match_status
+      if (status === 'exact_emi' || diff <= 0.05) {
+        return {
+          code: 'QB011',
+          field: 'amount',
+          severity: 'INFO',
+          status: 'pass',
+          message: `Amount $${amt.toFixed(2)} matches expected EMI $${exp.toFixed(2)} in LoanDisk`,
+        }
+      } else if (status === 'multiple_emi') {
+        return {
+          code: 'QB011',
+          field: 'amount',
+          severity: 'INFO',
+          status: 'pass',
+          message: `Amount $${amt.toFixed(2)} matches ${lookup.top_match.emi_multiple}x expected EMIs ($${exp.toFixed(2)} each)`,
+        }
+      } else if (status === 'fraction_emi') {
+        return {
+          code: 'QB011',
+          field: 'amount',
+          severity: 'INFO',
+          status: 'pass',
+          message: `Amount $${amt.toFixed(2)} matches installment fraction of expected EMI $${exp.toFixed(2)}`,
+        }
+      } else {
+        return {
+          code: 'QB011',
+          field: 'amount',
+          severity: 'WARNING',
+          status: 'fail',
+          message: `Amount $${amt.toFixed(2)} differs from expected EMI $${exp.toFixed(2)} (diff: $${(amt - exp).toFixed(2)}) — review recommended`,
+        }
+      }
+    }
+  }
+
+  return {
+    code: 'QB011',
+    field: 'amount',
+    severity: 'INFO',
+    status: 'pass',
+    message: 'EMI amount recorded',
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Run all rules for a transaction
 // ---------------------------------------------------------------------------
@@ -172,9 +311,10 @@ function ruleQB010_bankAccountForPayment(txn) {
  * @param {object} txn - qb_transactions row
  * @param {Array}  lines - qb_transaction_lines rows
  * @param {Set}    existingHashes - Set of known hashes (for duplicate check)
+ * @param {object} db - SQLite database (optional, for live LoanDisk validation)
  * @returns {{ results: Array, overallStatus: string }}
  */
-export function validateTransaction(txn, lines = [], existingHashes = new Set()) {
+export function validateTransaction(txn, lines = [], existingHashes = new Set(), db = null) {
   const results = [
     ruleQB001_referencePresent(txn),
     ruleQB002_amountPositive(txn),
@@ -184,8 +324,9 @@ export function validateTransaction(txn, lines = [], existingHashes = new Set())
     ruleQB006_duplicateHash(txn, existingHashes),
     ruleQB007_depositToPresent(txn),
     ruleQB008_confidenceCheck(txn),
-    ruleQB009_borrowerMatched(txn),
+    ruleQB009_borrowerMatched(txn, db),
     ruleQB010_bankAccountForPayment(txn),
+    ruleQB011_emiAmountValidation(txn, db),
   ]
 
   const blockingFail = results.some((r) => r.severity === 'BLOCKING' && r.status === 'fail')
@@ -206,3 +347,4 @@ export function validateTransaction(txn, lines = [], existingHashes = new Set())
 
   return { results, overallStatus }
 }
+

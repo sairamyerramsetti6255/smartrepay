@@ -373,3 +373,69 @@ test('text extraction parses tab-separated transaction rows accurately without A
   assert.equal(res.fields.deposit_to.value, 'General Bank Account')
 })
 
+test('matching algorithm validates borrower name, borrower ID, and EMI amount for receipts and payments', async () => {
+  const { createTransaction, getTransaction } = await import('../qbService.js')
+  const { lookupBorrower } = await import('../qbBorrowerResolver.js')
+  const db = fixture()
+
+  // Seed borrower with active loan and expected EMI
+  db.exec("insert into borrowers values('b_tarez', 'Tarez Lavana Ferguson', '6068266'); insert into loans values('l_tarez', 'b_tarez', '90007366', 'active');")
+  // Add emi column if not present in fixture
+  try { db.exec("alter table loans add column emi real;") } catch {}
+  db.exec("update loans set emi = 230.86 where id = 'l_tarez'")
+
+  // 1. Validate matching lookup returns exact name and exact EMI match
+  const lookup1 = lookupBorrower(db, 'Tarez Lavana Ferguson', 230.86)
+  assert.ok(lookup1.top_match)
+  assert.equal(lookup1.top_match.score, 100)
+  assert.equal(lookup1.top_match.loandisk_id, '6068266')
+  assert.equal(lookup1.top_match.loan_id, '90007366')
+  assert.equal(lookup1.top_match.emi_match_status, 'exact_emi')
+  assert.equal(lookup1.top_match.expected_emi, 230.86)
+
+  // 2. Transposed name matching ("Ferguson, Tarez")
+  const lookup2 = lookupBorrower(db, 'Ferguson, Tarez', 230.86)
+  assert.ok(lookup2.top_match)
+  assert.equal(lookup2.top_match.score, 98)
+
+  // 3. Create EMI Receipt with matching name and amount
+  const receiptTxn = createTransaction(db, {
+    template_type: 'emi_receipt',
+    customer_name: 'Tarez Lavana Ferguson',
+    amount: 230.86,
+    reference_number: 'REF-90007366',
+    transaction_date: '2026-07-03',
+  }, 'test')
+  assert.equal(receiptTxn.borrower_id, 'b_tarez')
+  assert.equal(receiptTxn.loan_id, '90007366')
+  assert.equal(receiptTxn.validation_status, 'valid')
+
+  // 4. Create Payment Disbursed with borrower matching
+  const paymentTxn = createTransaction(db, {
+    template_type: 'payment_disbursed',
+    vendor_name: 'Tarez Lavana Ferguson',
+    amount: 230.86,
+    reference_number: 'CHK-90007366',
+    bank_account: 'Operating Bank Account',
+    transaction_date: '2026-07-03',
+  }, 'test')
+  assert.equal(paymentTxn.borrower_id, 'b_tarez')
+  assert.equal(paymentTxn.loan_id, '90007366')
+
+  // 5. Provided mismatching Borrower ID raises validation warning
+  const mismatchTxn = createTransaction(db, {
+    template_type: 'emi_receipt',
+    customer_name: 'Tarez Lavana Ferguson',
+    borrower_id: 'WRONG_ID_9999',
+    amount: 230.86,
+    reference_number: 'REF-001',
+    transaction_date: '2026-07-03',
+  }, 'test')
+  const valRows = db.prepare('select * from qb_validation_results where transaction_id = ? and rule_code = ?').all(mismatchTxn.id, 'QB009')
+  assert.equal(valRows[0].status, 'fail')
+  assert.ok(valRows[0].message.includes('does not match'))
+
+  db.close()
+})
+
+

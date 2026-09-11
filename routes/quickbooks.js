@@ -136,6 +136,32 @@ router.get('/library/:id', (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
+// GET /api/quickbooks/match-lookup
+// Real-time Matching Algorithm validation for receipts and payments
+// ---------------------------------------------------------------------------
+
+router.get('/match-lookup', (req, res) => {
+  try {
+    const { name, amount, borrowerId, loanId, templateType } = req.query
+    const numAmount = amount ? parseFloat(amount) : null
+    const lookup = lookupBorrower(db, name || '', numAmount, borrowerId || null)
+
+    res.json({
+      success: true,
+      query_name: name || '',
+      query_amount: numAmount,
+      matched: Boolean(lookup.top_match),
+      top_match: lookup.top_match,
+      matches: lookup.matches,
+      match_count: lookup.match_count,
+    })
+  } catch (e) {
+    console.error('[QB] GET /match-lookup error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ---------------------------------------------------------------------------
 // POST /api/quickbooks/import/smartrepay
 // Seed QB EMI receipts from existing SmartRepay matched/posted transactions
 // ---------------------------------------------------------------------------
@@ -261,13 +287,13 @@ router.post('/import/text', async (req, res) => {
       }
     }
 
-    // Auto-resolve borrower from LoanDisk for EMI receipts
+    // Auto-resolve borrower from LoanDisk for receipts & payments
     let borrowerId = null
     let loanId = null
-    if (templateType === 'emi_receipt' && partyName) {
-      const borrowerLookup = lookupBorrower(db, partyName)
+    if (partyName) {
+      const borrowerLookup = lookupBorrower(db, partyName, amount)
       if (borrowerLookup.top_match) {
-        borrowerId = borrowerLookup.top_match.borrower_id
+        borrowerId = borrowerLookup.top_match.loandisk_id || borrowerLookup.top_match.borrower_id
         loanId = borrowerLookup.top_match.loan_id
       }
     }
@@ -277,6 +303,7 @@ router.post('/import/text', async (req, res) => {
       template_type: templateType,
       transaction_date: isoDate,
       customer_name: partyName,
+      vendor_name: partyName,
       reference_number: referenceNum,
       amount,
       deposit_to,
@@ -286,7 +313,7 @@ router.post('/import/text', async (req, res) => {
       loan_id: loanId,
       transaction_hash: hash,
     }
-    const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, new Set())
+    const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, new Set(), db)
 
     const mappedPayload = templateType === 'payment_disbursed'
       ? mapToPaymentDisbursed(txnForValidation, lines)
@@ -399,10 +426,10 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
 
         let borrowerId = null
         let loanId = null
-        if (templateType === 'emi_receipt' && partyName) {
-          const borrowerLookup = lookupBorrower(db, partyName)
+        if (partyName) {
+          const borrowerLookup = lookupBorrower(db, partyName, amount)
           if (borrowerLookup.top_match) {
-            borrowerId = borrowerLookup.top_match.borrower_id
+            borrowerId = borrowerLookup.top_match.loandisk_id || borrowerLookup.top_match.borrower_id
             loanId = borrowerLookup.top_match.loan_id
           }
         }
@@ -412,6 +439,7 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           template_type: templateType,
           transaction_date: isoDate,
           customer_name: partyName,
+          vendor_name: partyName,
           reference_number: refNum,
           amount: amount,
           deposit_to: 'General Bank Account',
@@ -422,7 +450,7 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           transaction_hash: hash,
         }
 
-        const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, new Set())
+        const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, new Set(), db)
 
         const mappedPayload = templateType === 'payment_disbursed'
           ? mapToPaymentDisbursed(txnForValidation, lines)

@@ -371,7 +371,7 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
         loan_id: loanId,
         transaction_hash: hash,
       }
-      const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes)
+      const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes, db)
       existingHashes.add(hash)
 
       // Insert transaction
@@ -436,7 +436,7 @@ export function runValidation(db, txnId) {
   ).all(txnId)
   const existingHashes = new Set(existingHashRows.map((r) => r.transaction_hash))
 
-  const { results, overallStatus } = validateTransaction(txn, lines, existingHashes)
+  const { results, overallStatus } = validateTransaction(txn, lines, existingHashes, db)
 
   // Clear old validation results
   db.prepare('delete from qb_validation_results where transaction_id = ?').run(txnId)
@@ -676,10 +676,10 @@ function createTransactionInternal(db, data, actor = 'system') {
   const bankAccount = data.bank_account || (templateType === 'payment_disbursed' ? 'Operating Bank Account' : null)
   let borrowerId = data.borrower_id ? String(data.borrower_id).trim() : null
   let loanId = data.loan_id ? String(data.loan_id).trim() : null
-  if (!borrowerId && templateType === 'emi_receipt' && customerName) {
-    const borrowerLookup = lookupBorrower(db, customerName)
+  if (customerName) {
+    const borrowerLookup = lookupBorrower(db, customerName, amount, borrowerId)
     if (borrowerLookup.top_match) {
-      borrowerId = borrowerLookup.top_match.borrower_id
+      borrowerId = borrowerId || borrowerLookup.top_match.borrower_id || borrowerLookup.top_match.loandisk_id
       loanId = loanId || borrowerLookup.top_match.loan_id
     }
   }
@@ -761,10 +761,11 @@ function createTransactionInternal(db, data, actor = 'system') {
     bank_account: bankAccount,
     ai_confidence: 1.0,
     borrower_id: borrowerId,
+    loan_id: loanId,
     transaction_hash: hash,
   }
 
-  const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes)
+  const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes, db)
 
   const mappedPayload = templateType === 'payment_disbursed'
     ? mapToPaymentDisbursed(txnForValidation, lines)
@@ -840,8 +841,15 @@ function updateTransactionInternal(db, id, data, actor = 'system') {
   const paymentMethod = data.payment_method || existing.payment_method || 'ACH'
   const depositTo = data.deposit_to !== undefined ? data.deposit_to : existing.deposit_to
   const bankAccount = data.bank_account !== undefined ? data.bank_account : existing.bank_account
-  const borrowerId = data.borrower_id !== undefined ? (data.borrower_id ? String(data.borrower_id).trim() : null) : existing.borrower_id
-  const loanId = data.loan_id !== undefined ? (data.loan_id ? String(data.loan_id).trim() : null) : existing.loan_id
+  let borrowerId = data.borrower_id !== undefined ? (data.borrower_id ? String(data.borrower_id).trim() : null) : existing.borrower_id
+  let loanId = data.loan_id !== undefined ? (data.loan_id ? String(data.loan_id).trim() : null) : existing.loan_id
+  if (customerName) {
+    const borrowerLookup = lookupBorrower(db, customerName, amount, borrowerId)
+    if (borrowerLookup.top_match) {
+      borrowerId = borrowerId || borrowerLookup.top_match.borrower_id || borrowerLookup.top_match.loandisk_id
+      loanId = loanId || borrowerLookup.top_match.loan_id
+    }
+  }
   const currency = data.currency || existing.currency || 'BSD'
   const memo = data.memo || (templateType === 'payment_disbursed' ? 'Disbursement Payment' : 'Customer EMI Payment')
 
@@ -881,10 +889,11 @@ function updateTransactionInternal(db, id, data, actor = 'system') {
     bank_account: bankAccount,
     ai_confidence: existing.ai_confidence || 1.0,
     borrower_id: borrowerId,
+    loan_id: loanId,
     transaction_hash: hash,
   }
 
-  const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes)
+  const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes, db)
 
   const mappedPayload = templateType === 'payment_disbursed'
     ? mapToPaymentDisbursed(txnForValidation, lines)
