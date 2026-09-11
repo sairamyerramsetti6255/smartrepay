@@ -262,15 +262,19 @@ function shapeMatchRow(r) {
   const confidence_score = r.ConfidenceScore != null ? Number(r.ConfidenceScore) : null
   const confidence_bucket = parseBucketFromReasoning(reasoning) || confidenceBucket(confidence_score ?? 0)
 
+  const fullParticulars = r.Particulars || parsed.full || null
+
   return {
     id: String(r.Id),
     bank_transaction_id: r.Id,
     date: r.TransDate,
     payer: parsed.borrowerName || r.BorrowerName || null,
-    transaction_description: parsed.description || null,
+    transaction_description: fullParticulars || parsed.description || null,
     amount: r.EmiPaidAmount != null ? Number(r.EmiPaidAmount) : null,
     reference: r.ReferenceNo,
-    description: r.Particulars,
+    description: fullParticulars,
+    particulars: fullParticulars,
+    raw_description: fullParticulars,
     source_filename: r.FileName,
     source_type: r.SourceType,
     employer_or_bank: r.EmployerOrBank,
