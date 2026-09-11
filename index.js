@@ -2029,10 +2029,15 @@ app.post('/api/demo/seed', authMiddleware, (req, res) => {
 })
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const distPath = path.resolve(__dirname, '..', 'dist')
-const indexHtml = path.join(distPath, 'index.html')
+const distCandidates = [
+  path.resolve(__dirname, 'dist'),
+  path.resolve(__dirname, '..', 'dist'),
+  path.resolve(__dirname, 'public'),
+]
+const distPath = distCandidates.find((d) => fs.existsSync(d) && fs.existsSync(path.join(d, 'index.html')))
 
-if (fs.existsSync(distPath)) {
+if (distPath) {
+  const indexHtml = path.join(distPath, 'index.html')
   app.use(express.static(distPath, { index: false, fallthrough: true }))
 
   // SPA fallback — refresh on /match, /settings/sla, etc. must return index.html

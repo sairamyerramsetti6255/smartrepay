@@ -1,0 +1,11 @@
+{
+  "apiUrl": "https://sswg4o008gcgc40okk8skcw8.api.pbshope.in/api",
+  "useApi": true,
+  "simplifiedApiUrl": "https://sswg4o008gcgc40okk8skcw8.api.pbshope.in/simplified-api",
+  "appUrl": "https://smartrepay.pbshope.in",
+  "appName": "SmartRepay AI",
+  "azureTenantId": "6263c342-495d-44b6-979d-edceaffad43b",
+  "azureClientId": "e8fb5423-7d61-4bc7-8f92-43c7160e56b6"
+}
+
+
