@@ -361,3 +361,15 @@ test('LoanDisk borrower validation checks borrower list on QB import and flags m
   db.close()
 })
 
+test('text extraction parses tab-separated transaction rows accurately without AI dependency', async () => {
+  const { extractFromText, heuristicExtractFromText } = await import('../qbAiExtract.js')
+  const rawText = "04/30/2026\t17128\tLonette Nekisha Penn\tGeneral Bank Account\t179.73\tLoans Receivable\t179.73\tEMI Payment"
+  
+  const res = await extractFromText(rawText, { templateType: 'emi_receipt' })
+  assert.equal(res.fields.customer_name.value, 'Lonette Nekisha Penn')
+  assert.equal(res.fields.reference_number.value, '17128')
+  assert.equal(res.fields.transaction_date.value, '2026-04-30')
+  assert.equal(res.fields.amount.value, 179.73)
+  assert.equal(res.fields.deposit_to.value, 'General Bank Account')
+})
+
