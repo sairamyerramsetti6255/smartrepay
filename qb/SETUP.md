@@ -90,7 +90,11 @@ References: [Intuit Desktop SDK guide](https://static.developer.intuit.com/resou
 
 Chat requests such as “open and fill it in Microsoft Excel” go through the AI model, which selects the `open_excel_workbook` tool. The tool enforces accounting permissions and approved records. If AI is unavailable, chat takes no action; it does not use a keyword fallback.
 
-When server-side Excel launching is unavailable, the browser downloads the populated workbook; open `smartrepay_review.xlsx` in Microsoft Excel. A website cannot automatically launch Excel on a remote browser user's PC.
+The QuickBooks Preview and RPA Excel buttons (including the AI Excel action) call the authenticated, accounting-role-only `POST /api/quickbooks/rpa/excel-link` endpoint. It generates a workbook snapshot and returns a signed link valid for 10 minutes. Excel reads that file through `GET /api/quickbooks-excel/:filename`, including HEAD and Range requests, without needing the browser’s login token. The signature only authorizes that workbook; it cannot authenticate other API calls. Responses are private and must not be cached. Treat these temporary links as credentials and avoid logging their query strings.
+
+The page attempts `ms-excel:ofv|u|https://...` and retains explicit Open in Microsoft Excel and Download workbook links. Excel must be installed with its protocol handler registered, and the browser may require the user to allow the launch or click Open again. The page reports a launch request, never confirmed application success. Fully silent desktop opening requires a separately installed, trusted local helper; this change does not install one. Links open a snapshot for review, with no live synchronization or write-back.
+
+Deploy the frontend and backend together. The reverse proxy must forward `/api/quickbooks-excel/` to Node without adding a browser-session login redirect, preserve query strings and Range headers, and serve a valid HTTPS certificate. All Node workers must use the same strong `JWT_SECRET` and shared `QB_EXPORT_DIR`, with synchronized clocks. Without `JWT_SECRET`, links use a process-local random key and expire on restart; this fallback is for local development. Regenerate expired links with the Excel button. Verify on the target Mac/Windows browser and installed Excel after deployment.
 
 On a trusted local Mac server with Excel installed, `QB_ALLOW_SERVER_APP_LAUNCH=true` permits opening the generated workbook on that server computer. Leave this disabled on hosted servers.
 

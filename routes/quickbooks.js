@@ -1,3 +1,5 @@
+import path from 'node:path'
+import { createExcelLink } from '../qb/qbExcelLinks.js'
 import { listReviewQueue, getReviewDetail, correctReviewRecord, reconciliationReport, approveReviewedRecord } from '../qb/qbOperationsService.js'
 import { lookupBorrower } from '../qb/qbBorrowerResolver.js'
 import { requireQuickBooksRole, canManageQuickBooks } from '../qb/qbGuards.js'
@@ -929,6 +931,17 @@ router.get('/rpa/apps-status', (req, res) => {
   }
 })
 
+// Authenticated, accounting-role-only preparation; the resulting link is file scoped.
+router.post('/rpa/excel-link', (req, res) => {
+  try {
+    const pkg = generateReconciliationPackage(db)
+    res.set('Cache-Control', 'no-store')
+    res.json(createExcelLink(pkg.excelFileName))
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 // POST /api/quickbooks/rpa/open-desktop
 router.post('/rpa/open-desktop', async (req, res) => {
   try {
@@ -960,7 +973,7 @@ router.get(['/rpa/download-file', '/rpa/excel/:filename'], (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
     res.setHeader('Accept-Ranges', 'bytes')
-    res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
+    res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader(
       'Content-Type',
       format === 'iif' ? 'text/plain' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'

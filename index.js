@@ -77,6 +77,7 @@ import {
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
 import quickbooksRouter from './routes/quickbooks.js'
+import { serveExcelLink } from './qb/qbExcelLinks.js'
 import { qbMigrateDb } from './qb/qbMigrate.js'
 
 ensureDataDirs()
@@ -2054,6 +2055,7 @@ if (distPath) {
 
 // QuickBooks Data module routes (additive — no existing routes affected)
 app.use('/api/quickbooks-connector', createConnectorRouter(db))
+app.get('/api/quickbooks-excel/:filename', serveExcelLink)
 app.use('/api/quickbooks', authMiddleware, quickbooksRouter)
 const stopQbScheduler = startRpaScheduler(db)
 
