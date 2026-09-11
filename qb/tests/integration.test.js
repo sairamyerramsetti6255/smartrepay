@@ -438,4 +438,34 @@ test('matching algorithm validates borrower name, borrower ID, and EMI amount fo
   db.close()
 })
 
+test('statement parsing extracts multi-row transactions and runs matching algorithm against LoanDisk', async () => {
+  const db = fixture()
+  try { db.exec('alter table loans add column emi real') } catch {}
+  db.exec(`
+    insert into borrowers (id, full_name, loandisk_id) values
+      ('b_lonette', 'Lonette Nekisha Penn', 'LD-17128'),
+      ('b_tarez', 'Tarez Lavana Ferguson', 'LD-88321');
+    insert into loans (id, borrower_id, loan_number, emi, status) values
+      ('l_lonette', 'b_lonette', '17128', 179.73, 'active'),
+      ('l_tarez', 'b_tarez', '90007366', 230.86, 'active');
+  `)
 
+  const { parseStatementBuffer } = await import('../../parseStatement.js')
+  const csvBuffer = Buffer.from(`Date,Name,Reference,Amount,Description\n2026-05-08,Lonette Penn,REF-17128,179.73,Salary deduction — Cable Bahamas\n2026-05-08,Tarez Ferguson,REF-88321,230.86,Salary deduction — Cable Bahamas`)
+  
+  const parsed = await parseStatementBuffer(csvBuffer, 'Cable Bahamas 8 May 2026.csv')
+  assert.equal(parsed.rows.length, 2)
+
+  // Verify borrower matching on parsed rows
+  const match1 = lookupBorrower(db, parsed.rows[0].payer, parsed.rows[0].amount)
+  assert.equal(match1.top_match.borrower_id, 'b_lonette')
+  assert.equal(match1.top_match.loan_id, '17128')
+  assert.equal(match1.top_match.emi_match_status, 'exact_emi')
+
+  const match2 = lookupBorrower(db, parsed.rows[1].payer, parsed.rows[1].amount)
+  assert.equal(match2.top_match.borrower_id, 'b_tarez')
+  assert.equal(match2.top_match.loan_id, '90007366')
+  assert.equal(match2.top_match.emi_match_status, 'exact_emi')
+
+  db.close()
+})

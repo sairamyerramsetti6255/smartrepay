@@ -4,6 +4,8 @@ import { listReviewQueue, getReviewDetail, correctReviewRecord, reconciliationRe
 import { lookupBorrower } from '../qb/qbBorrowerResolver.js'
 import { requireQuickBooksRole, canManageQuickBooks } from '../qb/qbGuards.js'
 import { listDeliveries, queueDesktopApproved, retryFailedDelivery, cancelUnsentDelivery } from '../qb/qbDesktopService.js'
+import { parseStatementBuffer } from '../parseStatement.js'
+import { resolveParticularsFields, isCompanyName } from '../particularsParse.js'
 import express from 'express'
 import { randomUUID } from 'crypto'
 import multer from 'multer'
@@ -362,6 +364,95 @@ router.post('/import/text', async (req, res) => {
   }
 })
 
+// Helper to extract rows from uploaded files (PDF, spreadsheet, image, text)
+async function extractTransactionsFromFile(file, templateType) {
+  const mime = file.mimetype || ''
+  const isImg = mime.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.originalname)
+  const isPdf = /\.pdf$/i.test(file.originalname) || mime === 'application/pdf'
+  const isSpreadsheet = /\.(xlsx?|csv|tsv)$/i.test(file.originalname)
+  const sourceType = isImg ? 'image' : (isSpreadsheet ? 'excel' : (isPdf ? 'pdf' : 'text'))
+
+  let extractedRows = []
+  let confidence = 0.95
+
+  // 1. Try structured statement / PDF / spreadsheet parser
+  if (!isImg) {
+    try {
+      const parsed = await parseStatementBuffer(file.buffer, file.originalname, {
+        documentType: templateType === 'payment_disbursed' ? 'bank' : undefined,
+      })
+      if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+        extractedRows = parsed.rows
+        confidence = parsed.method === 'ai' ? 0.85 : 0.95
+      }
+    } catch (err) {
+      console.warn(`[QB Import] parseStatementBuffer fallback for ${file.originalname}:`, err.message)
+    }
+  }
+
+  // 2. If image, or if structured parser didn't extract rows, try image/OCR
+  if (extractedRows.length === 0 && isImg) {
+    try {
+      const extraction = await extractFromImage(file.buffer, mime || 'image/jpeg')
+      if (extraction?.fields) {
+        const f = extraction.fields
+        extractedRows.push({
+          date: f.transaction_date?.value,
+          amount: f.amount?.value,
+          payer: f.customer_name?.value || f.vendor_name?.value || f.payee?.value,
+          reference: f.reference_number?.value || f.invoice_number?.value || f.check_number?.value,
+          description: f.bank_account?.value || 'Image extraction',
+          bank_account: f.bank_account?.value,
+          payment_method: f.payment_method?.value,
+        })
+        confidence = extraction.confidence || 0.85
+      }
+    } catch (err) {
+      console.warn(`[QB Import] extractFromImage fallback failed for ${file.originalname}:`, err.message)
+    }
+  }
+
+  // 3. Fallback: text extraction (including PDF text)
+  if (extractedRows.length === 0) {
+    try {
+      let text = ''
+      if (isPdf) {
+        const { PDFParse } = await import('pdf-parse')
+        const parser = new PDFParse({ data: file.buffer })
+        try {
+          const res = await parser.getText()
+          text = res.text || ''
+        } finally {
+          await parser.destroy()
+        }
+      } else if (!isImg) {
+        text = file.buffer.toString('utf-8')
+      }
+
+      if (text.trim()) {
+        const extraction = await extractFromText(text.slice(0, 10000), { documentType: sourceType })
+        if (extraction?.fields) {
+          const f = extraction.fields
+          extractedRows.push({
+            date: f.transaction_date?.value,
+            amount: f.amount?.value,
+            payer: f.customer_name?.value || f.vendor_name?.value || f.payee?.value,
+            reference: f.reference_number?.value || f.invoice_number?.value || f.check_number?.value,
+            description: f.bank_account?.value || 'Text extraction',
+            bank_account: f.bank_account?.value,
+            payment_method: f.payment_method?.value,
+          })
+          confidence = extraction.confidence || 0.80
+        }
+      }
+    } catch (err) {
+      console.warn(`[QB Import] extractFromText fallback failed for ${file.originalname}:`, err.message)
+    }
+  }
+
+  return { sourceType, extractedRows, confidence }
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/quickbooks/import/files
 // ---------------------------------------------------------------------------
@@ -380,40 +471,83 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
       values (?, 'files', ?, ?, 'processing', ?)
     `).run(batchId, `${templateType === 'payment_disbursed' ? 'Payment' : 'Receipt'} File Import`, files.length, actor)
 
+    const existingHashRows = db.prepare('select transaction_hash from qb_transactions where transaction_hash is not null').all()
+    const existingHashes = new Set(existingHashRows.map((r) => r.transaction_hash))
+
     const results = []
+    let totalTransactions = 0
     let validCount = 0
     let invalidCount = 0
 
     for (const file of files) {
       const inputId = randomUUID()
-      const mime = file.mimetype || ''
-      const isImg = mime.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.originalname)
-      const sourceType = isImg ? 'image' : (/\.xlsx?|\.csv$/i.test(file.originalname) ? 'excel' : 'pdf')
+      const { sourceType, extractedRows, confidence } = await extractTransactionsFromFile(file, templateType)
 
       db.prepare(`
         insert into qb_input_library (id, batch_id, source_type, original_filename, transaction_type, processing_status, created_by)
         values (?, ?, ?, ?, ?, 'processing', ?)
       `).run(inputId, batchId, sourceType, file.originalname, templateType, actor)
 
-      try {
-        let extraction = null
-        if (isImg) {
-          extraction = await extractFromImage(file.buffer, mime || 'image/jpeg')
-        } else {
-          const text = file.buffer.toString('utf-8').slice(0, 10000)
-          extraction = await extractFromText(text, { documentType: sourceType })
+      if (!extractedRows || extractedRows.length === 0) {
+        db.prepare(`update qb_input_library set processing_status = 'error' where id = ?`).run(inputId)
+        invalidCount++
+        totalTransactions++
+        results.push({ file: file.originalname, input_id: inputId, status: 'error', error: 'No transaction rows could be extracted from file' })
+        continue
+      }
+
+      let fileValidCount = 0
+      let fileInvalidCount = 0
+
+      for (let rowIndex = 0; rowIndex < extractedRows.length; rowIndex++) {
+        const row = extractedRows[rowIndex]
+        const rawAmount = row.amount ?? row.creditAmount ?? row.emiPaidAmount
+        const amount = normalizeAmount(rawAmount) || 0
+        const rawDate = row.date ?? row.transDate ?? row.datePosted ?? row.valueDate
+        const isoDate = normalizeDate(rawDate) || new Date().toISOString().slice(0, 10)
+        const refNum = normalizeReference(row.reference ?? row.referenceNo ?? row.reference_number ?? row.chequeNo ?? '')
+
+        const particularsText = String(row.particulars ?? row.description ?? row.remarks ?? row.transactionDescription ?? '').trim()
+        const rawPayer = String(row.payer ?? row.borrowerName ?? row.name ?? row.customer_name ?? row.vendor_name ?? '').trim()
+        const resolved = resolveParticularsFields({
+          particulars: particularsText,
+          borrowerName: rawPayer,
+          payer: rawPayer,
+          description: row.description,
+        })
+
+        let partyName = resolved.borrowerName || rawPayer
+        if (isCompanyName(partyName)) {
+          partyName = ''
         }
 
-        const fields = extraction?.fields || {}
-        const isoDate = normalizeDate(fields.transaction_date?.value) || new Date().toISOString().slice(0, 10)
-        const amount = normalizeAmount(fields.amount?.value) || 0
-        const partyName = normalizeName(
-          fields.customer_name?.value || fields.vendor_name?.value || fields.payee?.value || file.originalname.replace(/\.[^.]+$/, '')
-        ).raw || 'General Account'
-        const refNum = normalizeReference(
-          fields.reference_number?.value || fields.invoice_number?.value || fields.check_number?.value || ''
-        )
-        const hash = buildTransactionHash(templateType, isoDate, partyName, refNum, amount)
+        // Matching algorithm lookup against LoanDisk
+        let borrowerId = null
+        let loanId = null
+        let matchedCustomerName = partyName
+
+        const lookupQuery = partyName || particularsText
+        if (lookupQuery) {
+          const borrowerLookup = lookupBorrower(db, lookupQuery, amount)
+          if (borrowerLookup.top_match) {
+            borrowerId = borrowerLookup.top_match.loandisk_id || borrowerLookup.top_match.borrower_id
+            loanId = borrowerLookup.top_match.loan_id
+            if (!matchedCustomerName) {
+              matchedCustomerName = borrowerLookup.top_match.borrower_name
+            }
+          }
+        }
+
+        const finalPartyName = templateType === 'payment_disbursed'
+          ? (partyName || matchedCustomerName || 'Operating Vendor')
+          : (matchedCustomerName || partyName || 'Unknown Borrower')
+
+        const baseHash = buildTransactionHash(templateType, isoDate, finalPartyName, refNum, amount)
+        let hash = baseHash
+        if (existingHashes.has(hash)) {
+          hash = `${baseHash}_${rowIndex}_${randomUUID().slice(0, 8)}`
+        }
+        existingHashes.add(hash)
 
         const txnId = randomUUID()
         const lines = [
@@ -424,30 +558,21 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           }
         ]
 
-        let borrowerId = null
-        let loanId = null
-        if (partyName) {
-          const borrowerLookup = lookupBorrower(db, partyName, amount)
-          if (borrowerLookup.top_match) {
-            borrowerId = borrowerLookup.top_match.loandisk_id || borrowerLookup.top_match.borrower_id
-            loanId = borrowerLookup.top_match.loan_id
-          }
-        }
-
         const txnForValidation = {
           id: txnId,
           template_type: templateType,
           transaction_date: isoDate,
-          customer_name: partyName,
-          vendor_name: partyName,
+          customer_name: templateType === 'payment_disbursed' ? finalPartyName : (matchedCustomerName || partyName),
+          vendor_name: templateType === 'payment_disbursed' ? finalPartyName : undefined,
           reference_number: refNum,
           amount: amount,
           deposit_to: 'General Bank Account',
-          bank_account: fields.bank_account?.value || (templateType === 'payment_disbursed' ? 'Operating Bank Account' : null),
-          ai_confidence: extraction?.confidence || 0.85,
+          bank_account: row.bank_account || (templateType === 'payment_disbursed' ? 'Operating Bank Account' : null),
+          ai_confidence: confidence,
           borrower_id: borrowerId,
           loan_id: loanId,
           transaction_hash: hash,
+          memo: particularsText || undefined,
         }
 
         const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, new Set(), db)
@@ -458,15 +583,16 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
 
         db.prepare(`
           insert into qb_transactions
-          (id, input_id, batch_id, template_type, transaction_date, borrower_id, loan_id, customer_name, reference_number,
+          (id, input_id, batch_id, template_type, transaction_date, borrower_id, loan_id, customer_name, vendor_name, reference_number,
            amount, deposit_to, bank_account, payment_method, mapped_payload_json, validation_status, approval_status,
            transaction_hash, ai_confidence)
           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
         `).run(
-          txnId, inputId, batchId, templateType, isoDate, borrowerId, loanId, partyName, refNum,
+          txnId, inputId, batchId, templateType, isoDate, borrowerId, loanId,
+          txnForValidation.customer_name, txnForValidation.vendor_name || null, refNum,
           amount, txnForValidation.deposit_to, txnForValidation.bank_account,
-          fields.payment_method?.value || 'ACH', JSON.stringify(mappedPayload),
-          overallStatus, hash, extraction?.confidence || 0.85
+          row.payment_method || 'ACH', JSON.stringify(mappedPayload),
+          overallStatus, hash, confidence
         )
 
         lines.forEach((l, idx) => {
@@ -477,11 +603,14 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           db.prepare(`insert into qb_validation_results (id, transaction_id, rule_code, field_name, severity, status, message) values (?, ?, ?, ?, ?, ?, ?)`).run(randomUUID(), txnId, vr.code, vr.field, vr.severity, vr.status, vr.message)
         }
 
-        db.prepare(`update qb_input_library set processing_status = 'validated', extraction_confidence = ? where id = ?`)
-          .run(extraction?.confidence || 0.85, inputId)
-
-        if (overallStatus === 'valid') validCount++
-        else invalidCount++
+        totalTransactions++
+        if (overallStatus === 'valid') {
+          validCount++
+          fileValidCount++
+        } else {
+          invalidCount++
+          fileInvalidCount++
+        }
 
         results.push({
           file: file.originalname,
@@ -489,12 +618,14 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           transaction_id: txnId,
           template_type: templateType,
           status: overallStatus,
-          confidence: extraction?.confidence,
+          confidence,
+          customer_name: txnForValidation.customer_name,
+          amount,
         })
-      } catch (e) {
-        db.prepare(`update qb_input_library set processing_status = 'error' where id = ?`).run(inputId)
-        results.push({ file: file.originalname, input_id: inputId, status: 'error', error: e.message })
       }
+
+      db.prepare(`update qb_input_library set processing_status = 'validated', extraction_confidence = ? where id = ?`)
+        .run(confidence, inputId)
     }
 
     db.prepare(`
@@ -502,14 +633,15 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
         total_records = ?, valid_records = ?, invalid_records = ?,
         status = 'completed', completed_at = datetime('now')
       where id = ?
-    `).run(results.length, validCount, invalidCount, batchId)
+    `).run(totalTransactions, validCount, invalidCount, batchId)
 
     res.json({
       success: true,
       batch_id: batchId,
       template_type: templateType,
-      total: results.length,
+      total: totalTransactions,
       valid: validCount,
+      invalid: invalidCount,
       results,
     })
   } catch (e) {
