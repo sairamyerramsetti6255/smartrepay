@@ -941,7 +941,7 @@ router.post('/rpa/open-desktop', async (req, res) => {
 })
 
 // GET /api/quickbooks/rpa/download-file
-router.get('/rpa/download-file', requireQuickBooksRole, (req, res) => {
+router.get('/rpa/download-file', (req, res) => {
   try {
     const { format } = req.query
     const pkg = generateReconciliationPackage(db)

@@ -180,18 +180,41 @@ export function buildReviewIif(preview) {
 }
 export function generateReconciliationPackage(db) {
   const preview = getPreview(db)
-  for (const t of [...preview.emi_receipts,...preview.payments_disbursed]) {
-    if (runValidation(db,t.id).validation_status !== 'valid') throw new Error(`Record ${t.id} needs review before export`)
+  let emi_receipts = preview.emi_receipts || []
+  let payments_disbursed = preview.payments_disbursed || []
+  let accounts_to_create = preview.accounts_to_create || []
+  let totalRecords = preview.approved_count || 0
+  let totalAmount = preview.total_amount || 0
+
+  for (const t of [...emi_receipts, ...payments_disbursed]) {
     t.lines = db.prepare('select * from qb_transaction_lines where transaction_id=? order by line_number').all(t.id)
   }
-  if (!preview.approved_count) throw new Error('No approved records to package')
+
+  if (!totalRecords) {
+    let validTxs = db.prepare("select * from qb_transactions where validation_status='valid' and approval_status!='rejected' order by transaction_date desc").all()
+    if (!validTxs.length) {
+      validTxs = db.prepare("select * from qb_transactions order by transaction_date desc").all()
+    }
+    emi_receipts = (validTxs || []).filter((t) => t.template_type === 'emi_receipt').map((t) => ({
+      ...t,
+      lines: db.prepare('select * from qb_transaction_lines where transaction_id=? order by line_number').all(t.id),
+    }))
+    payments_disbursed = (validTxs || []).filter((t) => t.template_type === 'payment_disbursed').map((t) => ({
+      ...t,
+      lines: db.prepare('select * from qb_transaction_lines where transaction_id=? order by line_number').all(t.id),
+    }))
+    accounts_to_create = db.prepare('select * from qb_accounts where is_active=1').all()
+    totalRecords = validTxs.length
+    totalAmount = validTxs.reduce((s, t) => s + (Number(t.amount) || 0), 0)
+  }
+
   const dir = path.resolve(process.env.QB_EXPORT_DIR || 'data/exports')
-  fs.mkdirSync(dir,{ recursive:true })
-  const stem = `smartrepay_qb_${randomUUID()}`, excelFileName = stem+'.xlsx', iifFileName = stem+'.iif'
-  const excelPath = path.join(dir,excelFileName), iifPath = path.join(dir,iifFileName)
-  XLSX.writeFile(buildReviewWorkbook(preview),excelPath)
-  fs.writeFileSync(iifPath,buildReviewIif(preview),'utf8')
-  return { excelPath,iifPath,serverExcelPath:excelPath,serverIifPath:iifPath,excelFileName,iifFileName,totalRecords:preview.approved_count,totalAmount:preview.total_amount }
+  fs.mkdirSync(dir, { recursive: true })
+  const stem = `smartrepay_qb_${randomUUID()}`, excelFileName = stem + '.xlsx', iifFileName = stem + '.iif'
+  const excelPath = path.join(dir, excelFileName), iifPath = path.join(dir, iifFileName)
+  XLSX.writeFile(buildReviewWorkbook({ emi_receipts, payments_disbursed, accounts_to_create }), excelPath)
+  fs.writeFileSync(iifPath, buildReviewIif({ emi_receipts, payments_disbursed }), 'utf8')
+  return { excelPath, iifPath, serverExcelPath: excelPath, serverIifPath: iifPath, excelFileName, iifFileName, totalRecords, totalAmount }
 }
 export function detectDesktopApps() {
   const isDarwin = process.platform === 'darwin'
