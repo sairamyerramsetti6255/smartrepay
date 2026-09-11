@@ -940,17 +940,27 @@ router.post('/rpa/open-desktop', async (req, res) => {
   }
 })
 
-// GET /api/quickbooks/rpa/download-file
-router.get('/rpa/download-file', (req, res) => {
+// OPTIONS & HEAD & GET /api/quickbooks/rpa/download-file and /api/quickbooks/rpa/excel/:filename
+router.options(['/rpa/download-file', '/rpa/excel/:filename'], (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, X-Requested-With')
+  res.setHeader('Allow', 'GET, HEAD, OPTIONS')
+  res.status(200).end()
+})
+
+router.get(['/rpa/download-file', '/rpa/excel/:filename'], (req, res) => {
   try {
-    const { format } = req.query
+    const filename = req.params.filename || ''
+    const format = req.query.format || (filename.endsWith('.iif') ? 'iif' : 'excel')
     const pkg = generateReconciliationPackage(db)
     const filePath = format === 'iif' ? pkg.iifPath : pkg.excelPath
-    const fileName = format === 'iif' ? pkg.iifFileName : (pkg.excelFileName || 'smartrepay_reconciliation.xlsx')
+    const fileName = filename || (format === 'iif' ? pkg.iifFileName : (pkg.excelFileName || 'smartrepay_reconciliation.xlsx'))
     
     res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
     res.setHeader('Accept-Ranges', 'bytes')
-    res.setHeader('Cache-Control', 'no-cache, private')
+    res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
     res.setHeader(
       'Content-Type',
       format === 'iif' ? 'text/plain' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
