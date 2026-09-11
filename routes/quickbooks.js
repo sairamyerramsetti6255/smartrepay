@@ -356,6 +356,20 @@ router.post('/import/text', async (req, res) => {
       batch_id: batchId,
       template_type: templateType,
       validation_status: overallStatus,
+      status: overallStatus,
+      customer_name: txnForValidation.customer_name,
+      amount,
+      reference_number: referenceNum,
+      transaction_date: isoDate,
+      borrower_id: borrowerId,
+      loan_id: loanId,
+      validation_results: validationResults.map((vr) => ({
+        code: vr.code,
+        field: vr.field,
+        severity: vr.severity,
+        status: vr.status,
+        message: vr.message,
+      })),
       extraction,
     })
   } catch (e) {
@@ -621,6 +635,18 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           confidence,
           customer_name: txnForValidation.customer_name,
           amount,
+          reference_number: refNum,
+          transaction_date: isoDate,
+          borrower_id: borrowerId,
+          loan_id: loanId,
+          particulars: particularsText,
+          validation_results: validationResults.map((vr) => ({
+            code: vr.code,
+            field: vr.field,
+            severity: vr.severity,
+            status: vr.status,
+            message: vr.message,
+          })),
         })
       }
 
