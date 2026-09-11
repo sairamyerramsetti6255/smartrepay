@@ -946,8 +946,17 @@ router.get('/rpa/download-file', (req, res) => {
     const { format } = req.query
     const pkg = generateReconciliationPackage(db)
     const filePath = format === 'iif' ? pkg.iifPath : pkg.excelPath
-    const fileName = format === 'iif' ? pkg.iifFileName : pkg.excelFileName
-    res.download(filePath, fileName)
+    const fileName = format === 'iif' ? pkg.iifFileName : (pkg.excelFileName || 'smartrepay_reconciliation.xlsx')
+    
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Accept-Ranges', 'bytes')
+    res.setHeader('Cache-Control', 'no-cache, private')
+    res.setHeader(
+      'Content-Type',
+      format === 'iif' ? 'text/plain' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    res.setHeader('Content-Disposition', `inline; filename="${fileName}"`)
+    res.sendFile(path.resolve(filePath))
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
