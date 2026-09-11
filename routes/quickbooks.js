@@ -586,7 +586,7 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           (id, input_id, batch_id, template_type, transaction_date, borrower_id, loan_id, customer_name, vendor_name, reference_number,
            amount, deposit_to, bank_account, payment_method, mapped_payload_json, validation_status, approval_status,
            transaction_hash, ai_confidence)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
         `).run(
           txnId, inputId, batchId, templateType, isoDate, borrowerId, loanId,
           txnForValidation.customer_name, txnForValidation.vendor_name || null, refNum,
