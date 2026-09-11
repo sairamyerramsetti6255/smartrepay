@@ -312,3 +312,52 @@ test('read-only agent tools explain review issues and report measured totals',as
   assert.equal(report.result.data.totals[0].records,1);assert.equal(report.result.data.totals[0].posted,0)
   assert.equal(db.prepare("select approval_status from qb_transactions where id='read'").get().approval_status,'pending_review');db.close()
 })
+
+test('LoanDisk borrower validation checks borrower list on QB import and flags missing borrowers', async () => {
+  const { createTransaction, getTransaction } = await import('../qbService.js')
+  const db = fixture()
+
+  // 1. Existing LoanDisk borrower -> borrower_id auto-resolved, ruleQB009 passes
+  const matchedTxn = createTransaction(db, {
+    template_type: 'emi_receipt',
+    customer_name: 'Wellington Johnson - paid off',
+    amount: 100,
+    reference_number: 'REF-MATCH-01',
+    transaction_date: '2026-09-01',
+  }, 'test')
+  assert.equal(matchedTxn.borrower_id, 'b1')
+  assert.equal(matchedTxn.loan_id, 'LN1')
+  const valRows1 = db.prepare('select * from qb_validation_results where transaction_id = ? and rule_code = ?').all(matchedTxn.id, 'QB009')
+  assert.equal(valRows1.length, 1)
+  assert.equal(valRows1[0].status, 'pass')
+
+  // 2. Non-existent LoanDisk borrower -> borrower_id is null, ruleQB009 fails
+  const unmatchedTxn = createTransaction(db, {
+    template_type: 'emi_receipt',
+    customer_name: 'Nonexistent Unknown Person',
+    amount: 150,
+    reference_number: 'REF-UNMATCH-02',
+    transaction_date: '2026-09-01',
+  }, 'test')
+  assert.equal(unmatchedTxn.borrower_id, null)
+  const valRows2 = db.prepare('select * from qb_validation_results where transaction_id = ? and rule_code = ?').all(unmatchedTxn.id, 'QB009')
+  assert.equal(valRows2.length, 1)
+  assert.equal(valRows2[0].status, 'fail')
+  assert.ok(valRows2[0].message.includes('LoanDisk'))
+
+  // 3. Payment disbursement -> borrower check not required (passes)
+  const disburseTxn = createTransaction(db, {
+    template_type: 'payment_disbursed',
+    vendor_name: 'ABC Supplier LLC',
+    amount: 500,
+    reference_number: 'CHK-001',
+    bank_account: 'Operating Bank Account',
+    transaction_date: '2026-09-01',
+  }, 'test')
+  const valRows3 = db.prepare('select * from qb_validation_results where transaction_id = ? and rule_code = ?').all(disburseTxn.id, 'QB009')
+  assert.equal(valRows3.length, 1)
+  assert.equal(valRows3[0].status, 'pass')
+
+  db.close()
+})
+

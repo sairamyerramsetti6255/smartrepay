@@ -9,6 +9,7 @@ import {
   toQbDate,
 } from './qbNormalize.js'
 import { validateTransaction } from './qbValidation.js'
+import { lookupBorrower } from './qbBorrowerResolver.js'
 import { mapToEmiReceipt, mapToPaymentDisbursed, buildQbExportPayload } from './qbMapper.js'
 import { getSqlMatchResults } from '../stagingDb.js'
 
@@ -344,6 +345,17 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
         lines
       )
 
+      // Auto-resolve borrower from LoanDisk if not already set
+      let borrowerId = sr.matched_borrower_id || null
+      let loanId = sr.loan_id || null
+      if (!borrowerId && customerName) {
+        const borrowerLookup = lookupBorrower(db, customerName)
+        if (borrowerLookup.top_match) {
+          borrowerId = borrowerLookup.top_match.borrower_id
+          loanId = loanId || borrowerLookup.top_match.loan_id
+        }
+      }
+
       // Validate (existingHashes does not contain current hash yet)
       const txnForValidation = {
         id: txnId,
@@ -355,7 +367,8 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
         deposit_to: 'General Bank Account',
         bank_account: null,
         ai_confidence: confidence,
-        borrower_id: sr.matched_borrower_id || null,
+        borrower_id: borrowerId,
+        loan_id: loanId,
         transaction_hash: hash,
       }
       const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, existingHashes)
@@ -367,8 +380,8 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
         inputId,
         batchId,
         isoDate,
-        sr.matched_borrower_id || null,
-        sr.loan_id || null,
+        borrowerId,
+        loanId,
         customerName,
         referenceNum,
         amount,
@@ -661,8 +674,15 @@ function createTransactionInternal(db, data, actor = 'system') {
   const paymentMethod = data.payment_method || 'ACH'
   const depositTo = data.deposit_to || (templateType === 'emi_receipt' ? 'General Bank Account' : null)
   const bankAccount = data.bank_account || (templateType === 'payment_disbursed' ? 'Operating Bank Account' : null)
-  const borrowerId = data.borrower_id ? String(data.borrower_id).trim() : null
-  const loanId = data.loan_id ? String(data.loan_id).trim() : null
+  let borrowerId = data.borrower_id ? String(data.borrower_id).trim() : null
+  let loanId = data.loan_id ? String(data.loan_id).trim() : null
+  if (!borrowerId && templateType === 'emi_receipt' && customerName) {
+    const borrowerLookup = lookupBorrower(db, customerName)
+    if (borrowerLookup.top_match) {
+      borrowerId = borrowerLookup.top_match.borrower_id
+      loanId = loanId || borrowerLookup.top_match.loan_id
+    }
+  }
   const currency = data.currency || 'BSD'
   const memo = data.memo || (templateType === 'payment_disbursed' ? 'Disbursement Payment' : 'Customer EMI Payment')
 

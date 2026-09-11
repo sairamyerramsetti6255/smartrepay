@@ -128,13 +128,24 @@ function ruleQB008_confidenceCheck(txn) {
 }
 
 function ruleQB009_borrowerMatched(txn) {
-  const ok = !!txn.borrower_id
+  if (txn.template_type && txn.template_type !== 'emi_receipt') {
+    return {
+      code: 'QB009',
+      field: 'borrower_id',
+      severity: 'INFO',
+      status: 'pass',
+      message: 'Borrower matching not applicable for this template type',
+    }
+  }
+  const ok = !!txn.borrower_id && String(txn.borrower_id).trim().length > 0
   return {
     code: 'QB009',
     field: 'borrower_id',
     severity: 'INFO',
     status: ok ? 'pass' : 'fail',
-    message: ok ? `Borrower matched: ${txn.borrower_id}` : 'No borrower match found — transaction proceeds with customer name',
+    message: ok
+      ? `Borrower matched in LoanDisk: ${txn.borrower_id}`
+      : 'Borrower not found in LoanDisk active borrowers list — manual review required',
   }
 }
 

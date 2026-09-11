@@ -261,6 +261,17 @@ router.post('/import/text', async (req, res) => {
       }
     }
 
+    // Auto-resolve borrower from LoanDisk for EMI receipts
+    let borrowerId = null
+    let loanId = null
+    if (templateType === 'emi_receipt' && partyName) {
+      const borrowerLookup = lookupBorrower(db, partyName)
+      if (borrowerLookup.top_match) {
+        borrowerId = borrowerLookup.top_match.borrower_id
+        loanId = borrowerLookup.top_match.loan_id
+      }
+    }
+
     const txnForValidation = {
       id: txnId,
       template_type: templateType,
@@ -271,7 +282,8 @@ router.post('/import/text', async (req, res) => {
       deposit_to,
       bank_account,
       ai_confidence: extraction.confidence,
-      borrower_id: null,
+      borrower_id: borrowerId,
+      loan_id: loanId,
       transaction_hash: hash,
     }
     const { results: validationResults, overallStatus } = validateTransaction(txnForValidation, lines, new Set())
@@ -282,12 +294,12 @@ router.post('/import/text', async (req, res) => {
 
     db.prepare(`
       insert into qb_transactions
-      (id, input_id, batch_id, template_type, transaction_date, customer_name, reference_number,
+      (id, input_id, batch_id, template_type, transaction_date, borrower_id, loan_id, customer_name, reference_number,
        amount, deposit_to, bank_account, payment_method, mapped_payload_json, validation_status, approval_status,
        transaction_hash, ai_confidence)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
     `).run(
-      txnId, inputId, batchId, templateType, isoDate, partyName, referenceNum,
+      txnId, inputId, batchId, templateType, isoDate, borrowerId, loanId, partyName, referenceNum,
       amount, deposit_to, bank_account, fields.payment_method?.value || 'ACH',
       JSON.stringify(mappedPayload), overallStatus, hash, extraction.confidence || null
     )
@@ -385,6 +397,16 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           }
         ]
 
+        let borrowerId = null
+        let loanId = null
+        if (templateType === 'emi_receipt' && partyName) {
+          const borrowerLookup = lookupBorrower(db, partyName)
+          if (borrowerLookup.top_match) {
+            borrowerId = borrowerLookup.top_match.borrower_id
+            loanId = borrowerLookup.top_match.loan_id
+          }
+        }
+
         const txnForValidation = {
           id: txnId,
           template_type: templateType,
@@ -395,7 +417,8 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
           deposit_to: 'General Bank Account',
           bank_account: fields.bank_account?.value || (templateType === 'payment_disbursed' ? 'Operating Bank Account' : null),
           ai_confidence: extraction?.confidence || 0.85,
-          borrower_id: null,
+          borrower_id: borrowerId,
+          loan_id: loanId,
           transaction_hash: hash,
         }
 
@@ -407,12 +430,12 @@ router.post('/import/files', upload.array('files', 20), async (req, res) => {
 
         db.prepare(`
           insert into qb_transactions
-          (id, input_id, batch_id, template_type, transaction_date, customer_name, reference_number,
+          (id, input_id, batch_id, template_type, transaction_date, borrower_id, loan_id, customer_name, reference_number,
            amount, deposit_to, bank_account, payment_method, mapped_payload_json, validation_status, approval_status,
            transaction_hash, ai_confidence)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
         `).run(
-          txnId, inputId, batchId, templateType, isoDate, partyName, refNum,
+          txnId, inputId, batchId, templateType, isoDate, borrowerId, loanId, partyName, refNum,
           amount, txnForValidation.deposit_to, txnForValidation.bank_account,
           fields.payment_method?.value || 'ACH', JSON.stringify(mappedPayload),
           overallStatus, hash, extraction?.confidence || 0.85
