@@ -76,7 +76,8 @@ function testInitialLastName() {
 function testBuckets() {
   assert(confidenceBucket(100) === 'same_person', '100 -> same_person')
   assert(confidenceBucket(94) === 'very_likely_match', '94 -> very_likely_match')
-  assert(confidenceBucket(85) === 'possible_review', '85 -> possible_review')
+  assert(confidenceBucket(85) === 'very_likely_match', '85 -> very_likely_match')
+  assert(confidenceBucket(75) === 'possible_review', '75 -> possible_review')
   assert(confidenceBucket(0) === 'different_person', '0 -> different_person')
 }
 

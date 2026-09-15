@@ -137,7 +137,7 @@ test('disabled name signals cannot silently use employer description as a borrow
 })
 test('legacy settings cannot lower the identity threshold or ambiguity margin', () => {
   const c = buildEngineConfig({ thresholds: { autoMatchConfidence: 10, ambiguityConfidenceGap: 1 } })
-  assert.equal(c.AUTO_CONFIDENCE, 92); assert.equal(c.AMBIGUITY_GAP, 8)
+  assert.equal(c.AUTO_CONFIDENCE, 81); assert.equal(c.AMBIGUITY_GAP, 8)
 })
 test('multiple custom regex captures work without caller specifying global flag', () => {
   assert.deepEqual(extractIdsWithPatterns('ID123 ID456', [{ active: true, pattern: 'ID(\\d+)', flags: 'i' }]), ['123', '456'])
@@ -175,15 +175,14 @@ test('middle initials and a truncated surname with two full names remain strong'
   }
   assert.equal(resolve(tx('M Smith'),[loan('1','Martha Jane Smith',350)]).reviewStatus,'needs_review')
 })
-test('independent first + last + exact EMI needs review', () => {
+test('independent first + last + exact EMI is matched at 81%+', () => {
   const r = resolve(tx('Chewuakii Symon'), [loan('1', 'Chewuakii Mary T Symon', 350)])
-  assert.equal(r.reviewStatus, 'needs_review')
-  assert.ok(r.confidenceScore > 70 && r.confidenceScore <= 91, `review band, got ${r.confidenceScore}`)
-  assert.equal(r.confidenceBucket, 'possible_review')
+  assert.equal(r.reviewStatus, 'auto_matched')
+  assert.ok(r.confidenceScore >= 81 && r.confidenceScore <= 91, `matched band, got ${r.confidenceScore}`)
+  assert.equal(r.confidenceBucket, 'very_likely_match')
   assert.match(r.reasoning, /Independent first name, last name, and exact EMI/)
   const posted = classifyWithPolicy(tx('Chewuakii Symon'), buildBorrowerIndex(groupLoansByBorrower([loan('1', 'Chewuakii Mary T Symon', 350)]))).record
-  assert.equal(posted.reviewStatus, 'needs_review')
-  assert.equal(posted.matchType, 'review_required')
+  assert.equal(posted.reviewStatus, 'auto_matched')
   assert.equal(posted.borrowerId, '1')
 })
 test('first+last + credit matching historical repayments is a 100% match', () => {
@@ -228,16 +227,17 @@ test('different installment ratios on different loans still require review', () 
   assert.equal(r.reviewStatus,'needs_review');assert.equal(r.loanNumber,null)
 })
 
-test('requested matching cutoff is strictly above seventy', () => {
+test('requested matching cutoff is 81 percent and above', () => {
+  assert.equal(matchStatusFor(80.99),'unmatched')
+  assert.equal(matchStatusFor(81),'auto_matched')
+  assert.equal(matchStatusFor(81.01),'auto_matched')
   assert.equal(matchStatusFor(70),'unmatched')
-  assert.equal(matchStatusFor(70.01),'auto_matched')
-  assert.equal(matchStatusFor(71),'auto_matched')
   assert.equal(matchStatusFor(0),'unmatched')
 })
-test('above-seventy review candidates are matched but cannot bypass posting review', () => {
+test('scores at 81%+ are matched even when posting still needs a unique identity', () => {
   const index=buildBorrowerIndex(groupLoansByBorrower([loan('1','Michael Bowe',350),loan('2','Michael Smith',350)]))
   const r=classifyWithPolicy(tx('Michael'),index).record
-  assert.ok(r.confidenceScore>70)
+  assert.ok(r.confidenceScore >= 81)
   assert.equal(r.reviewStatus,'auto_matched')
   assert.equal(r.matchType,'review_required')
   assert.equal(r.emiCount,null)

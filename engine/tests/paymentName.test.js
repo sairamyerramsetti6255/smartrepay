@@ -14,8 +14,8 @@ test('first and last name match despite omitted middle name and payoff narration
     for (const row of [{BorrowerName:input,Particulars:`Direct Credit Employer - Salary | ${input}`}, {Particulars:input}]) {
       const r=classify({Id:1,EmiPaidAmount:350,...row},index).record
       assert.equal(r.borrowerId,'test')
-      assert.equal(r.reviewStatus,'needs_review')
-      assert.ok(r.confidenceScore > 70 && r.confidenceScore <= 91)
+      assert.equal(r.reviewStatus,'auto_matched')
+      assert.ok(r.confidenceScore >= 81 && r.confidenceScore <= 91)
     }
   }
 })

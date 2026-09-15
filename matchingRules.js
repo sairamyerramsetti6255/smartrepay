@@ -18,8 +18,8 @@ export const RULE_CATALOG = {
   /** Score cutoffs — independent limits (0–100 points), not part of the weight mix. */
   scoreLimits: [
     { key: 'nameMinScore', label: 'Minimum name score', hint: 'Below this, a borrower is not considered a candidate. Single names can produce review candidates; automatic matching requires a strong identity.', min: 0, max: 100, step: 1, default: 70, unit: 'points' },
-    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Minimum strong identity score. Amount agreement alone cannot establish identity.', min: 92, max: 100, step: 1, default: 92, unit: 'points' },
-    { key: 'autoMatchConfidence', label: 'Posting confidence', hint: 'Rows above 70% are matched. This higher threshold controls readiness for posting, alongside identity and allocation checks.', min: 92, max: 100, step: 1, default: 92, unit: 'points' },
+    { key: 'nameStrongScore', label: 'Strong name score', hint: 'Minimum strong identity score. Amount agreement alone cannot establish identity.', min: 81, max: 100, step: 1, default: 92, unit: 'points' },
+    { key: 'autoMatchConfidence', label: 'Posting confidence', hint: 'Rows at 81% and above are matched. This threshold also controls readiness for posting, alongside identity and allocation checks.', min: 81, max: 100, step: 1, default: 81, unit: 'points' },
     { key: 'ambiguityConfidenceGap', label: 'Ambiguity gap', hint: 'If top two candidates are within this gap, flag as ambiguous.', min: 8, max: 30, step: 1, default: 8, unit: 'points' },
   ],
   /** Only these two must sum to 100% — they blend name vs amount into the final confidence score. */
@@ -61,16 +61,16 @@ export const RULE_CATALOG = {
     ],
     tiers: [
       { range: '0', label: 'No name evidence', description: 'No qualifying person name; labelled references and cash amounts use separate paths.' },
-      { range: '70–91', label: 'Partial or fuzzy name', description: 'A candidate for review; initials and single names cannot auto-match.' },
-      { range: '92–99', label: 'Strong name', description: 'Still requires a unique identity and unambiguous payment allocation.' },
+      { range: '70–80', label: 'Partial or fuzzy name', description: 'A candidate for review; initials and single names cannot auto-match.' },
+      { range: '81–99', label: 'Matched name', description: 'Still requires a unique identity and unambiguous payment allocation.' },
       { range: '100', label: 'Exact labelled loan ID', description: 'Reference exists in the loan master. Posting still requires valid allocation and no conflicts.' },
     ],
   },
   confidenceBuckets: [
     { key: 'same_person', min: 98, label: 'Same person', hint: 'Exact / same person — full name strong and amount usually reconciles.' },
-    { key: 'very_likely_match', min: 92, max: 97, label: 'Very likely', hint: 'Likely same person; may lack perfect amount or full confidence.' },
-    { key: 'possible_review', min: 80, max: 91, label: 'Review', hint: 'Evidence suggests a candidate; manual review required.' },
-    { key: 'different_person', max: 79, label: 'Unmatched', hint: 'Insufficient evidence to assign a borrower.' },
+    { key: 'very_likely_match', min: 81, max: 97, label: 'Very likely', hint: 'Matched band; 81–97%.' },
+    { key: 'possible_review', min: 71, max: 80, label: 'Review', hint: 'Evidence suggests a candidate; manual review required.' },
+    { key: 'different_person', max: 70, label: 'Unmatched', hint: 'Insufficient evidence to assign a borrower.' },
   ],
 }
 
@@ -199,6 +199,11 @@ export function resolveMatchingRules(partial) {
     }
   }
   Object.assign(thresholds, normalizeConfidenceWeights(thresholds))
+
+  // Legacy default was 92; matched band now starts at 81 unless a higher custom value is stored.
+  if (thresholds.autoMatchConfidence === 92) {
+    thresholds.autoMatchConfidence = DEFAULT_MATCHING_RULES.thresholds.autoMatchConfidence
+  }
 
   const signals = { ...DEFAULT_MATCHING_RULES.signals }
   for (const s of RULE_CATALOG.signals) {

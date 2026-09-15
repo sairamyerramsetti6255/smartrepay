@@ -6,10 +6,10 @@ export const setMatchingEngineConfig = (value) => { runtimeConfig = value || bui
 export const getMatchingEngineConfig = () => runtimeConfig
 export const NAME_MIN = 70
 export const NAME_STRONG = 92
-export const AUTO_CONFIDENCE = 92
+export const AUTO_CONFIDENCE = 81
 export const CONFIDENCE_BUCKET_LABELS = { same_person: 'Same person', very_likely_match: 'Very likely', possible_review: 'Review', different_person: 'Unmatched' }
 export function confidenceBucket(value) {
-  return value >= 98 ? 'same_person' : value >= 92 ? 'very_likely_match' : value > 70 ? 'possible_review' : 'different_person'
+  return value >= 98 ? 'same_person' : value >= 81 ? 'very_likely_match' : value > 70 ? 'possible_review' : 'different_person'
 }
 export const formatReasoningWithBucket = (bucket, text) => `[${bucket || 'different_person'}] ${String(text || '').trim()}`
 export const parseBucketFromReasoning = (text) => String(text || '').match(/^\[([a-z_]+)\]/)?.[1] || null
@@ -168,7 +168,10 @@ function isIndependentFirstLast(cand) {
   const kind = String(cand?.nameKind || '')
   if (kind === 'exact_full' || kind.includes('+full')) return false
   if (cand?.strongIdentity) return false
-  return /^(first\+last|last\+first|exact_first_last)/.test(kind)
+  if (!/^(first\+last|last\+first|exact_first_last)/.test(kind)) return false
+  // Initials (M Smith) are not a first+last identity even when the surname matches.
+  if (cand?.nameBreakdown?.first?.initial || cand?.nameBreakdown?.last?.initial) return false
+  return true
 }
 
 function contextFor(cand, recon, tx, identity, historyId) {
@@ -242,8 +245,7 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     if (historyAuto) confidence = 100
     else if (!cand.hintedLoanNumber) confidence = Math.min(confidence, 99)
     if ((cand.partialIdentity || anonymousCash) && !historyAuto) confidence = Math.min(confidence, 91)
-    // Independent first + last + exact EMI is evidence to review, not auto-match —
-    // unless the credit also equals this loan's recurring historical repayments.
+    // Independent first + last is not a full identity; cap below exact/same-person.
     if (isIndependentFirstLast(cand) && reconciled(recon) && !historyAuto) confidence = Math.min(confidence, 91)
     return { cand, recon, context, confidence: round2(confidence), historyAuto }
   }).filter((s) => anonymousCash ? reconciled(s.recon) : s.cand.score >= c.NAME_MIN)
@@ -253,13 +255,16 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
   const gap = second ? round2(best.confidence - second.confidence) : 100
   const ambiguous = conflictingReference || nameConflict || gap < Math.max(8, c.AMBIGUITY_GAP)
   const { cand, recon, context, historyAuto } = best
-  const identityBlocked = ambiguous || unknownReference || !cand.group.borrowerId || !context.active || (cand.partialIdentity && !historyAuto) || anonymousCash
+  const identityBlocked = ambiguous || unknownReference || !cand.group.borrowerId || !context.active
+    || (cand.partialIdentity && !historyAuto && !isIndependentFirstLast(cand)) || anonymousCash
   const allocationBlocked = recon.ambiguous || recon.kind === 'none' || recon.kind === 'mismatch'
   // A uniquely identified loan can receive a partial repayment. Multiple loans
   // or unexplained overpayments still need allocation review.
   const blocked = identityBlocked || allocationBlocked
   const confidence = identityBlocked ? Math.min(best.confidence, 91) : best.confidence
-  const status = !blocked && confidence >= Math.max(92, c.AUTO_CONFIDENCE) && (cand.strongIdentity || cand.score >= Math.max(92, c.NAME_STRONG) || historyAuto)
+  const autoFloor = Math.max(AUTO_CONFIDENCE, Number(c.AUTO_CONFIDENCE) || AUTO_CONFIDENCE)
+  const identityOk = cand.strongIdentity || cand.score >= autoFloor || historyAuto || isIndependentFirstLast(cand)
+  const status = !blocked && confidence >= autoFloor && identityOk
     ? 'auto_matched' : confidence >= 80 || ambiguous ? 'needs_review' : 'unmatched'
   const bucket = confidenceBucket(confidence)
   const reasons = [
@@ -270,8 +275,11 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     recon.ambiguous && 'Multiple possible loan allocations — manual review', allocationBlocked && 'Borrower identified; payment allocation requires review; no fees inferred',
     recon.kind === 'partial' && !allocationBlocked && 'Partial repayment against the uniquely identified loan',
     historyAuto && 'First and last name match; credit equals historical repayment EMI — 100% match',
-    isIndependentFirstLast(cand) && reconciled(recon) && !historyAuto && 'Independent first name, last name, and exact EMI — needs review',
-    !context.active && 'Active loan status not established', cand.partialIdentity && !historyAuto && 'Insufficient full name tokens to auto-identify a borrower',
+    isIndependentFirstLast(cand) && reconciled(recon) && !historyAuto && (status === 'auto_matched'
+      ? 'Independent first name, last name, and exact EMI — matched (≥81%)'
+      : 'Independent first name, last name, and exact EMI — needs review'),
+    !context.active && 'Active loan status not established',
+    cand.partialIdentity && !historyAuto && !isIndependentFirstLast(cand) && 'Insufficient full name tokens to auto-identify a borrower',
     context.employer && 'Employer agrees', context.history && 'Previously confirmed name and employer agree', context.due && 'Current amount due agrees', context.pendingCount && 'Pending EMI count agrees',
   ].filter(Boolean).join('. ')
   const assigned = status !== 'unmatched'
@@ -290,20 +298,24 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
   return { record, needsAi: false, candidates: scored.slice(0, 8).map((s) => ({ ...s.cand, confidence: s.confidence })) }
 }
 
-/** User policy: a score strictly above 70 is matched; posting readiness is separate. */
+/** User policy: 81% and above is matched; posting readiness is separate. */
 export function matchStatusFor(confidence) {
-  return Number(confidence) > 70 ? 'auto_matched' : 'unmatched'
+  return Number(confidence) >= AUTO_CONFIDENCE ? 'auto_matched' : 'unmatched'
 }
 
 export function classify(tx, index, c = runtimeConfig) {
   const result = classifyEvidence(tx, index, c)
   const original = result.record
   const anonymous = result.candidates[0]?.nameKind === 'cash_amount'
-  const independentReview = original.independentFirstLast && original.reviewStatus === 'needs_review'
-  const status = anonymous || independentReview ? 'needs_review' : matchStatusFor(original.confidenceScore)
+  const score = Number(original.confidenceScore)
+  const status = anonymous
+    ? 'needs_review'
+    : score >= AUTO_CONFIDENCE
+      ? 'auto_matched'
+      : original.reviewStatus
   const ready = original.reviewStatus === 'auto_matched'
   const candidate = result.candidates[0]
-  const keepSuggestion = status === 'auto_matched' || independentReview
+  const keepSuggestion = status !== 'unmatched'
   result.record = {
     ...original,
     reviewStatus: status,
@@ -314,7 +326,7 @@ export function classify(tx, index, c = runtimeConfig) {
     matchType: !ready && status !== 'unmatched' ? 'review_required' : original.matchType,
     emiCount: ready ? original.emiCount : null,
     reasoning: status === 'auto_matched' && !ready
-      ? original.reasoning.replace(/^(\[[^\]]+\] )/, '$1Matched by >70% rule; review required before posting. ').slice(0, 1000)
+      ? original.reasoning.replace(/^(\[[^\]]+\] )/, '$1Matched by ≥81% rule; review required before posting. ').slice(0, 1000)
       : original.reasoning,
   }
   return result
