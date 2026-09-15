@@ -1,6 +1,6 @@
 import * as XLSX from 'xlsx'
 import { createHash } from 'crypto'
-import { extractWithAI, extractFromImageWithAI } from './openrouter.js'
+import { extractFromImageWithAI } from './openrouter.js'
 import { parsePdfBuffer } from './parsePdfStatement.js'
 import { parsePipeParticulars } from './particularsParse.js'
 
@@ -9,7 +9,8 @@ const EXCEL_EXT = /\.(xlsx|xls|xlsm|csv)$/i
 const IMAGE_EXT = /\.(png|jpe?g|webp)$/i
 
 const HEADER_ALIASES = {
-  date: ['date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date', 'date posted'],
+  date: ['date posted', 'posting date', 'transaction date', 'date', 'transaction date', 'txn date', 'posting date', 'value date', 'trans date', 'date posted'],
+  valueDate: ['value date'],
   payer: [
     'payer', 'payor', 'name', 'borrower', 'employer', 'customer', 'from', 'sender',
     'beneficiary', 'remitter', 'originator', 'paid by', 'account name', 'employee', 'payee',
@@ -34,18 +35,18 @@ function parseAmount(val) {
 
 function normalizeDate(val) {
   if (val == null || val === '') return ''
-  if (val instanceof Date && !isNaN(val)) return val.toISOString().slice(0, 10)
+  if (val instanceof Date && !isNaN(val)) return `${val.getFullYear()}-${String(val.getMonth()+1).padStart(2,'0')}-${String(val.getDate()).padStart(2,'0')}`
   if (typeof val === 'number') {
     const parsed = XLSX.SSF.parse_date_code(val)
     if (parsed) return `${parsed.y}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`
   }
-  const d = new Date(val)
-  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10)
-  const parts = String(val).split(/[/-]/)
-  if (parts.length === 3) {
-    const [a, b, c] = parts.map(Number)
-    if (a > 31) return `${a}-${String(b).padStart(2, '0')}-${String(c).padStart(2, '0')}`
-    return `${c}-${String(a).padStart(2, '0')}-${String(b).padStart(2, '0')}`
+  const text = String(val).trim()
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`
+  const parts = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})$/)
+  if (parts) {
+    const year = parts[3].length === 2 ? `20${parts[3]}` : parts[3]
+    return `${year}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`
   }
   return String(val).trim()
 }
@@ -61,7 +62,7 @@ function mapHeaders(rawRow) {
     normalized[normalizeKey(key)] = val
   }
   const mapped = {}
-  for (const col of ['date', 'payer', 'description', 'amount', 'credit', 'debit', 'reference', 'type']) {
+  for (const col of ['date', 'valueDate', 'payer', 'description', 'amount', 'credit', 'debit', 'reference', 'type']) {
     const aliases = HEADER_ALIASES[col] || [col]
     const found = aliases.find((a) => normalized[a] !== undefined)
     if (found) mapped[col] = normalized[found]
@@ -97,7 +98,9 @@ function extractCreditAmount(mapped) {
   const hasSingle = !isNaN(singleAmt) && singleAmt !== 0
 
   // Row has a debit column value but no credit — skip (withdrawal / payment out)
-  if (hasDebit && !hasSingle && (isNaN(creditAmt) || creditAmt <= 0)) return null
+  if (hasDebit) return null
+
+  if (mapped.credit !== undefined || mapped.debit !== undefined) return null
 
   if (hasSingle) {
     // Signed amount column: positive = credit, negative = debit
@@ -114,17 +117,19 @@ function extractCreditAmount(mapped) {
 
 function normalizeRows(rawRows) {
   const out = []
-  for (const rawRow of rawRows) {
+  for (const [sourceIndex, rawRow] of rawRows.entries()) {
     if (isEmptyRow(rawRow)) continue
     const m = mapHeaders(rawRow)
     const amount = extractCreditAmount(m)
     if (amount == null) continue
     const date = normalizeDate(m.date)
-    if (!date) continue
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0,10) !== date) continue
     const descriptionRaw = String(m.description ?? '').trim()
     const parsed = parsePipeParticulars(descriptionRaw)
     const payer = String(m.payer ?? parsed.borrowerName ?? '').trim()
     out.push({
+      sourceSerial: sourceIndex+1,
+      datePosted: date, valueDate: normalizeDate(m.valueDate) || date, direction: 'credit',
       date,
       payer: payer || parsed.borrowerName,
       description: parsed.full || descriptionRaw || payer,
@@ -141,7 +146,7 @@ function getColumnKeys(rawRows) {
   return Object.keys(rawRows[0]).map(normalizeKey)
 }
 
-const REQUIRED_COLUMNS = ['date', 'payer', 'amount']
+const REQUIRED_COLUMNS = ['date', 'amount']
 
 function missingColumns(keys) {
   return REQUIRED_COLUMNS.filter((col) => {
@@ -173,17 +178,9 @@ function parseExcelBuffer(buffer) {
 }
 
 function parseCsvText(text) {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim())
-  if (!lines.length) return { rawRows: [], sheetRows: [] }
-  const headers = lines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, ''))
-  const sheetRows = [headers, ...lines.slice(1).map((l) => l.split(',').map((c) => c.trim().replace(/^"|"$/g, '')))]
-  const rawRows = lines.slice(1).map((line) => {
-    const vals = line.split(',').map((c) => c.trim().replace(/^"|"$/g, ''))
-    const row = {}
-    headers.forEach((h, i) => { row[h] = vals[i] ?? '' })
-    return row
-  })
-  return { rawRows, sheetRows }
+  const workbook = XLSX.read(text, { type: 'string', raw: true })
+  const sheet = workbook.Sheets[workbook.SheetNames[0]]
+  return { rawRows: XLSX.utils.sheet_to_json(sheet, { defval: '' }), sheetRows: XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) }
 }
 
 export function rowHash(row) {
@@ -209,6 +206,8 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
 
   const { documentType, fileParticulars } = options
   const isImage = documentType === 'image' || IMAGE_EXT.test(filename)
+
+  if (isImage && documentType !== 'employer') return { method: 'image', source: 'bank', documentType: 'bank', rows: [], creditRows: [], diagnostics: { complete: false, warnings: ['Bank image requires verified debit/credit columns. Please provide a searchable PDF or bank CSV.'] } }
 
   if (isImage) {
     const mimeType =
@@ -256,6 +255,8 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
       { documentType: pdf.documentType || documentType, fileParticulars }
     )
     return {
+      diagnostics: pdf.diagnostics,
+      extractedRows: pdf.extractedRows,
       method: pdf.method,
       source: pdf.source,
       documentType: pdf.documentType || documentType,
@@ -270,6 +271,13 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
     ? parseExcelBuffer(buffer)
     : parseCsvText(buffer.toString('utf8'))
 
+  if (documentType === 'bank') {
+    const uncertain = rawRows.filter(r => !isEmptyRow(r)).filter(r => {
+      const m = mapHeaders(r)
+      return m.credit === undefined && m.debit === undefined && creditTypeVerdict(m.type) === null
+    })
+    if (uncertain.length) return { method: 'standard', source: 'bank', documentType: 'bank', rows: [], creditRows: [], diagnostics: { complete: false, warnings: [`${uncertain.length} rows lack explicit credit/debit direction. Map the bank direction column before import.`] } }
+  }
   let cleaned = filterCreditRows(rawRows.filter((row) => !isEmptyRow(row)))
   let method = 'standard'
   let rows = normalizeRows(cleaned)
@@ -278,15 +286,7 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
   const missing = missingColumns(keys)
 
   if (!rows.length && process.env.OPENROUTER_API_KEY) {
-    const headerRow = sheetRows.find((r) => Array.isArray(r) && r.some((c) => String(c).trim())) || []
-    const dataSamples = sheetRows
-      .filter((r) => Array.isArray(r) && r.some((c) => String(c).trim()))
-      .slice(1, 8)
-      .map((r) => (Array.isArray(r) ? r : []))
-
-    rows = await extractWithAI(headerRow, dataSamples, { documentType, fileParticulars })
-    method = 'ai'
-    cleaned = rows
+    return { method: 'standard', source: documentType || 'spreadsheet', documentType, rows: [], creditRows: [], diagnostics: { complete: false, warnings: ['Spreadsheet columns could not be mapped. No sample-only import was performed. Supply date, description and explicit credit/debit columns.'] } }
   } else if (missing.length) {
     throw new Error(`Missing columns: ${missing.join(', ')}. Found: ${keys.join(', ')}`)
   }
@@ -299,6 +299,7 @@ export async function parseStatementBuffer(buffer, filename, options = {}) {
   )
 
   return {
+    diagnostics: { complete: enriched.length === cleaned.length, warnings: enriched.length === cleaned.length ? [] : ['Some credit rows could not be normalized. Review dates and amounts.'], debitCount: rawRows.filter(r => { const m=mapHeaders(r); return creditTypeVerdict(m.type) === false || parseAmount(m.debit)>0 }).length },
     method,
     source: documentType === 'employer' ? 'employer' : 'spreadsheet',
     documentType: documentType || 'spreadsheet',

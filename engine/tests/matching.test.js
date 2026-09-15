@@ -175,9 +175,40 @@ test('middle initials and a truncated surname with two full names remain strong'
   }
   assert.equal(resolve(tx('M Smith'),[loan('1','Martha Jane Smith',350)]).reviewStatus,'needs_review')
 })
-test('missing middle name and unexpected payment retain strong identity for review', () => {
+test('independent first + last + exact EMI needs review', () => {
+  const r = resolve(tx('Chewuakii Symon'), [loan('1', 'Chewuakii Mary T Symon', 350)])
+  assert.equal(r.reviewStatus, 'needs_review')
+  assert.ok(r.confidenceScore > 70 && r.confidenceScore <= 91, `review band, got ${r.confidenceScore}`)
+  assert.equal(r.confidenceBucket, 'possible_review')
+  assert.match(r.reasoning, /Independent first name, last name, and exact EMI/)
+  const posted = classifyWithPolicy(tx('Chewuakii Symon'), buildBorrowerIndex(groupLoansByBorrower([loan('1', 'Chewuakii Mary T Symon', 350)]))).record
+  assert.equal(posted.reviewStatus, 'needs_review')
+  assert.equal(posted.matchType, 'review_required')
+  assert.equal(posted.borrowerId, '1')
+})
+test('first+last + credit matching historical repayments is a 100% match', () => {
+  const histLoan = loan('1', 'Chewuakii Mary T Symon', 413.72, { HistoricalPaymentCents: [10343] })
+  const r = resolve(tx('Chewuakii Symon', 103.43), [histLoan])
+  assert.equal(r.reviewStatus, 'auto_matched')
+  assert.equal(r.confidenceScore, 100)
+  assert.equal(r.confidenceBucket, 'same_person')
+  assert.equal(r.loanNumber, 'LN1')
+  assert.equal(r.historyMatched, true)
+  assert.match(r.reasoning, /historical repayment EMI/)
+  const posted = classifyWithPolicy(tx('Chewuakii Symon', 103.43), buildBorrowerIndex(groupLoansByBorrower([histLoan]))).record
+  assert.equal(posted.reviewStatus, 'auto_matched')
+  assert.equal(posted.confidenceScore, 100)
+  assert.equal(posted.matchType, 'name_and_amount')
+})
+test('first+last + contractual EMI + matching history is a 100% match', () => {
+  const r = resolve(tx('Chewuakii Symon', 350), [loan('1', 'Chewuakii Mary T Symon', 350, { HistoricalPaymentCents: [35000] })])
+  assert.equal(r.reviewStatus, 'auto_matched')
+  assert.equal(r.confidenceScore, 100)
+  assert.equal(r.historyMatched, true)
+})
+test('missing middle name and unexpected payment retain first+last for review', () => {
   const r=resolve(tx('Martha Smith',402.45),[loan('1','Martha Jane Smith',222.99)])
-  assert.equal(r.borrowerId,'1'); assert.ok(r.confidenceScore>=92); assert.equal(r.reviewStatus,'needs_review')
+  assert.equal(r.borrowerId,'1'); assert.ok(r.confidenceScore>70 && r.confidenceScore<=91); assert.equal(r.reviewStatus,'needs_review')
 })
 test('duplicate loan rows never erase a clear borrower or silently pick a loan', () => {
   const r=resolve(tx('Martha Jane Smith',208.69),[loan('1','Martha Jane Smith',834.75),loan('1','Martha Jane Smith',834.75,{LoanNumber:'LN99'})])

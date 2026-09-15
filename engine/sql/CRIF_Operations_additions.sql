@@ -18,7 +18,7 @@
 	BEGIN
 		SELECT 'True' AS Result, 'Details found' AS Message,
 			Id, FileName, FileType, SourceType, EmployerOrBank, TransDate, ReferenceNo,
-			Particulars, BorrowerName, NormalizedName, EmiPaidAmount, UploadedDate, ImportedAt
+			Particulars, BorrowerName, NormalizedName, EmiPaidAmount, Remarks, UploadedDate, ImportedAt
 		FROM Staging_BankTransactions
 		ORDER BY ImportedAt DESC, Id DESC;
 	END
@@ -28,12 +28,26 @@
 	BEGIN
 		SELECT 'True' AS Result, 'Details found' AS Message,
 			bt.Id, bt.TransDate, bt.BorrowerName, bt.EmiPaidAmount, bt.ReferenceNo,
-			bt.Particulars, bt.FileName, bt.SourceType, bt.EmployerOrBank,
+			bt.Particulars, bt.FileName, bt.SourceType, bt.EmployerOrBank, bt.Remarks,
 			m.LoanDiskBorrowerName, m.BorrowerId, m.LoanNumber, m.MatchedLoanNumbers,
 			m.LoanCount, m.SummedExpectedEMI, m.AmountDiff, m.MatchType, m.AmountMatchKind,
-			m.NameScore, m.ConfidenceScore, m.MatchMethod, m.ReviewStatus, m.Reasoning
+			m.NameScore, m.ConfidenceScore, m.MatchMethod, m.ReviewStatus, m.Reasoning,
+			COALESCE(d.BranchName, l.BranchName, bl.BranchName, b.BranchName) AS BranchName,
+			COALESCE(CAST(l.LoanApplicationId AS NVARCHAR(100)), bl.LoanApplicationId, d.LoanNumber, m.LoanNumber) AS LoanApplicationId,
+			b.UniqueNumber AS BorrowerUniqueNumber
 		FROM Staging_BankTransactions bt
 		LEFT JOIN Staging_TransactionMatches m ON m.BankTransactionId = bt.Id
+		LEFT JOIN Staging_LoandiskDueRecords d ON d.LoanNumber = m.LoanNumber
+		LEFT JOIN dbo.SILLoans l ON CAST(l.LoanId AS VARCHAR(100)) = m.LoanNumber
+		LEFT JOIN dbo.SILBorrowers b ON CAST(b.BorrowerId AS VARCHAR(50)) = m.BorrowerId
+		OUTER APPLY (
+			SELECT TOP 1
+				CAST(sl.LoanApplicationId AS NVARCHAR(100)) AS LoanApplicationId,
+				sl.BranchName
+			FROM dbo.SILLoans sl
+			WHERE CAST(sl.BorrowerId AS VARCHAR(50)) = m.BorrowerId
+			ORDER BY CASE WHEN sl.LoanStatusId = '1' THEN 0 WHEN sl.LoanStatusId = '18' THEN 1 ELSE 2 END, sl.LoanId DESC
+		) bl
 		ORDER BY bt.ImportedAt DESC, bt.Id DESC;
 	END
 
@@ -212,6 +226,19 @@
 		SELECT 'True' AS Result, 'Updated' AS Message;
 	END
 
+	-- Exec CRIF_Operations '{"BankTransactionId":1,"Remarks":"Close-out cheque — not a borrower EMI"}','Update_BankTransactionRemarks',''
+	ELSE IF (@Condition = 'Update_BankTransactionRemarks')
+	BEGIN
+		DECLARE @rm_btid INT = TRY_CAST(JSON_VALUE(@Json,'$.BankTransactionId') AS INT);
+		DECLARE @rm_text NVARCHAR(500) = LEFT(LTRIM(RTRIM(JSON_VALUE(@Json,'$.Remarks'))), 500);
+
+		UPDATE dbo.Staging_BankTransactions
+		SET Remarks = NULLIF(@rm_text, '')
+		WHERE Id = @rm_btid;
+
+		SELECT 'True' AS Result, 'Updated' AS Message, @@ROWCOUNT AS Affected;
+	END
+
 	-- Exec CRIF_Operations '{"BorrowerId":"12345"}','Get_LoansByBorrowerId',''
 	ELSE IF (@Condition = 'Get_LoansByBorrowerId')
 	BEGIN
@@ -219,7 +246,9 @@
 
 		SELECT 'True' AS Result, 'Details found' AS Message,
 			CAST(l.LoanId AS NVARCHAR(100)) AS LoanNumber,
+			COALESCE(CAST(l.LoanApplicationId AS NVARCHAR(100)), CAST(l.LoanId AS NVARCHAR(100))) AS LoanApplicationId,
 			CAST(l.BorrowerId AS VARCHAR(50)) AS BorrowerId,
+			b.UniqueNumber AS BorrowerUniqueNumber,
 			COALESCE(
 				NULLIF(LTRIM(RTRIM(CONCAT(b.FirstName, ' ', b.LastName))), ''),
 				NULLIF(LTRIM(RTRIM(b.FullName)), ''),

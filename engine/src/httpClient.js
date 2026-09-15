@@ -32,14 +32,37 @@ export function branchUrl(branchId, path) {
 /**
  * Perform a LoanDisk request with timeout, retry and JSON parsing.
  * Returns parsed JSON, or null when `allowEmpty` and the resource is missing.
+ *
+ * `maxRetries` can be overridden per-call (e.g. 0 for search-page fetches where
+ * the caller's own retry loop handles failures — avoids compounding 4 × 180s waits).
  */
-export async function loandiskRequest(url, { method = 'GET', body = null, allowEmpty = false, timeoutMs } = {}) {
+export async function loandiskRequest(url, { method = 'GET', body = null, allowEmpty = false, timeoutMs, signal: externalSignal, maxRetries: callMaxRetries } = {}) {
   let lastError
   const effectiveTimeout = timeoutMs || requestTimeoutMs
+  const effectiveMaxRetries = callMaxRetries !== undefined ? Math.max(0, Number(callMaxRetries)) : maxRetries
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  for (let attempt = 0; attempt <= effectiveMaxRetries; attempt++) {
+    // If global user cancel fired, stop immediately
+    if (externalSignal?.aborted) throw new DOMException('Sync cancelled by user', 'AbortError')
+
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), effectiveTimeout)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { controller.abort('timeout') } catch {}
+    }, effectiveTimeout)
+
+    const onExternalAbort = () => {
+      try { controller.abort(externalSignal.reason || 'user_cancel') } catch {}
+    }
+
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        clearTimeout(timer)
+        throw new DOMException('Sync cancelled by user', 'AbortError')
+      }
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+    }
 
     try {
       const init = { method, headers: { ...baseHeaders }, signal: controller.signal }
@@ -52,9 +75,9 @@ export async function loandiskRequest(url, { method = 'GET', body = null, allowE
 
       if (!res.ok) {
         if (allowEmpty && (res.status === 404 || res.status === 204)) return null
-        if (isTransient(res.status) && attempt < maxRetries) {
+        if (isTransient(res.status) && attempt < effectiveMaxRetries) {
           lastError = new Error(`HTTP ${res.status} from ${url}`)
-          await sleep(250 * 2 ** attempt)
+          await sleep(500 * (attempt + 1))
           continue
         }
         throw new Error(`LoanDisk request failed: HTTP ${res.status} from ${url}`)
@@ -65,9 +88,6 @@ export async function loandiskRequest(url, { method = 'GET', body = null, allowE
 
       const data = JSON.parse(text)
 
-      // LoanDisk returns HTTP 200 even for failures, with an { error: {...} }
-      // envelope. Without this check those failures look like "empty results"
-      // and get silently swallowed (the original 0-borrowers-no-errors bug).
       if (data && data.error && (data.error.message || data.error.code)) {
         const err = new Error(`LoanDisk API error ${data.error.code ?? ''}: ${data.error.message ?? 'unknown'} (${url})`)
         err.loandiskCode = data.error.code
@@ -76,15 +96,35 @@ export async function loandiskRequest(url, { method = 'GET', body = null, allowE
 
       return data
     } catch (e) {
+      // If the user cancelled, propagate AbortError immediately without retry
+      if (externalSignal?.aborted) {
+        throw new DOMException('Sync cancelled by user', 'AbortError')
+      }
+
+      // Check if this was an internal timeout
+      if (timedOut || e.name === 'AbortError' || e.code === 'ETIMEDOUT') {
+        const timeoutErr = new Error(`LoanDisk request timed out after ${effectiveTimeout}ms (${url})`)
+        timeoutErr.isTimeout = true
+        lastError = timeoutErr
+        if (attempt < effectiveMaxRetries) {
+          await sleep(1000 * (attempt + 1))
+          continue
+        }
+        throw timeoutErr
+      }
+
       lastError = e
-      const retryable = e.name === 'AbortError' || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || /fetch failed/i.test(e.message)
-      if (retryable && attempt < maxRetries) {
-        await sleep(250 * 2 ** attempt)
+      const retryable = e.code === 'ECONNRESET' || /fetch failed/i.test(e.message)
+      if (retryable && attempt < effectiveMaxRetries) {
+        await sleep(1000 * (attempt + 1))
         continue
       }
       throw e
     } finally {
       clearTimeout(timer)
+      if (externalSignal) {
+        externalSignal.removeEventListener('abort', onExternalAbort)
+      }
     }
   }
 

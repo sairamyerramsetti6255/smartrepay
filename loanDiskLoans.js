@@ -140,19 +140,20 @@ export function parseOperationsLoanRows(data, borrowerId, normalizedBorrower = n
 
 export function upsertLoansForBorrower(db, localBorrowerId, loanRows) {
   const saved = []
+  const now = new Date().toISOString()
   for (const row of loanRows) {
     const loanNum = row.loan_number || row.loandisk_loan_id || `LD-${localBorrowerId}`
     const existing = db.prepare('select id from loans where loan_number = ?').get(loanNum)
     if (existing) {
       db.prepare(
-        `update loans set outstanding_balance = coalesce(?, outstanding_balance), emi = coalesce(?, emi), status = coalesce(?, status) where id = ?`
-      ).run(row.outstanding_balance, row.emi, row.status, existing.id)
+        `update loans set outstanding_balance = coalesce(?, outstanding_balance), emi = coalesce(?, emi), status = coalesce(?, status), synced_at = ? where id = ?`
+      ).run(row.outstanding_balance, row.emi, row.status, now, existing.id)
       saved.push(db.prepare('select * from loans where id = ?').get(existing.id))
     } else {
       const id = randomUUID()
       db.prepare(
-        `insert into loans (id, borrower_id, loan_number, outstanding_balance, emi, status) values (?, ?, ?, ?, ?, ?)`
-      ).run(id, localBorrowerId, loanNum, row.outstanding_balance, row.emi, row.status || 'active')
+        `insert into loans (id, borrower_id, loan_number, outstanding_balance, emi, status, synced_at) values (?, ?, ?, ?, ?, ?, ?)`
+      ).run(id, localBorrowerId, loanNum, row.outstanding_balance, row.emi, row.status || 'active', now)
       saved.push(db.prepare('select * from loans where id = ?').get(id))
     }
   }

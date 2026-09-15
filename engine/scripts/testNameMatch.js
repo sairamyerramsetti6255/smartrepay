@@ -31,14 +31,15 @@ function testWilberson() {
   assert(annalisa.score === 0, `Annalisa should score 0, got ${annalisa.score}`)
 
   const wilberson = scoreNameMatch('Wilberson Smith', 'Wilberson Wilberforce Smith')
-  assert(wilberson.score >= 90, `Wilberson full name should be 90+, got ${wilberson.score}`)
+  assert(wilberson.score >= 70 && wilberson.score < 90, `Wilberson first+last only 70–89, got ${wilberson.score}`)
+  assert(!wilberson.kind.includes('full'), `Extra middle name is not full identity, got ${wilberson.kind}`)
 }
 
 function testJamaal() {
   const clifford = scoreNameMatch('Jamaal Moss', 'Clifford Jamaal Moss')
   const lamar = scoreNameMatch('Jamaal Moss', 'Jamaal Lamar Moss')
   assert(clifford.score === 0, `Clifford should score 0, got ${clifford.score}`)
-  assert(lamar.score >= 90, `Jamaal Lamar should be 90+, got ${lamar.score}`)
+  assert(lamar.score >= 70 && lamar.score < 90, `Jamaal Lamar first+last 70–89, got ${lamar.score}`)
 }
 
 function testFirstLastOnlyTier() {
@@ -80,7 +81,14 @@ function testBuckets() {
 }
 
 function testFullNameHelper() {
-  assert(isFullNameMatch(nameTokens('Jamaal Moss'), nameTokens('Jamaal Lamar Moss')), 'subset full name')
+  assert(!isFullNameMatch(nameTokens('Jamaal Moss'), nameTokens('Jamaal Lamar Moss')), 'subset is first+last, not full')
+  assert(isFullNameMatch(nameTokens('Jamaal Lamar Moss'), nameTokens('Jamaal Lamar Moss')), 'same tokens are full')
+}
+
+function testChewuakiiFirstLastOnly() {
+  const m = scoreNameMatch('Chewuakii Symon', 'Chewuakii Mary T Symon')
+  assert(m.score >= 70 && m.score < 90, `Chewuakii first+last 70–89, got ${m.score}`)
+  assert(!m.kind.includes('full'), `Middle names block full identity, got ${m.kind}`)
 }
 
 const tests = [
@@ -94,6 +102,7 @@ const tests = [
   ['initial last name (K → Knowles)', testInitialLastName],
   ['confidence buckets', testBuckets],
   ['full name helper', testFullNameHelper],
+  ['Chewuakii first+last only', testChewuakiiFirstLastOnly],
 ]
 
 let passed = 0

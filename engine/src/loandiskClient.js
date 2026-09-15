@@ -153,3 +153,120 @@ export async function fetchLatestLoanAndRepayment(branchId, borrowerId) {
 
   return { loanJson: JSON.stringify(loanPayload), repaymentJson, loanId }
 }
+
+/** Fetch every receipt for the selected loan, not merely the newest receipt. */
+export async function fetchLoanReceiptHistory(branchId, loanNumber, request = loandiskRequest) {
+  const rows = [], seen = new Set(), size = 100
+  // Always query by LoanDisk loan_id (numeric), not loan_application_id.
+  const loanKey = encodeURIComponent(String(loanNumber).trim())
+  for (let page = 0; page < 100; page++) {
+    const payload = await request(
+      branchUrl(branchId, `repayment/loan/${loanKey}/from/${page * size + 1}/count/${size}?sort_by=repayment_id&sort_direction=desc`),
+      { timeoutMs: config.loandisk?.sync?.searchTimeoutMs || 120_000, maxRetries: 1 }
+    )
+    const node = getResponseNode(payload)
+    // Empty book: { Results: [[]], TotalResults: 0 }
+    if (!node) return rows
+    const batch = flattenResults(node)
+    const total = Number(node.TotalResults ?? node.totalResults)
+    if (!batch.length) {
+      if (!Number.isFinite(total) || total === 0 || rows.length >= total) return rows
+      throw new Error('Repayment history response incomplete')
+    }
+    for (const row of batch) {
+      const id = String(row.repayment_id || '')
+      if (!id) continue
+      if (seen.has(id)) continue
+      seen.add(id)
+      rows.push(row)
+    }
+    if ((Number.isFinite(total) && rows.length >= total) || batch.length < size) return rows
+  }
+  throw new Error('Repayment history exceeded page limit; review required')
+}
+
+/**
+ * Bulk repayments for a branch via advanced_search_repayments (API docs §26).
+ * Docs allow count=500; one page ≈12s vs one HTTP call per loan.
+ * Filter by loan_status_id (e.g. "18||1" = Current||Open) — required search param.
+ */
+export async function fetchBranchRepaymentsBulk(
+  branchId,
+  {
+    statusIds = [18, 1],
+    pageSize = 500,
+    pageConcurrency = 3,
+    onProgress = null,
+  } = {},
+  request = loandiskRequest
+) {
+  const size = Math.min(500, Math.max(50, Number(pageSize) || 500))
+  const concurrency = Math.max(1, Number(pageConcurrency) || 3)
+  const statusParam = (Array.isArray(statusIds) ? statusIds : [statusIds])
+    .filter((n) => n != null && String(n).trim() !== '')
+    .map(String)
+    .join('||')
+  if (!statusParam) throw new Error('fetchBranchRepaymentsBulk requires at least one loan_status_id')
+
+  const url = branchUrl(branchId, 'advanced_search_repayments')
+  const timeoutMs = config.loandisk?.sync?.searchTimeoutMs || 120_000
+
+  const fetchPage = async (page) => {
+    const data = await request(url, {
+      method: 'POST',
+      body: { from: page, count: size, loan_status_id: statusParam },
+      timeoutMs,
+      maxRetries: 1,
+    })
+    const node = getResponseNode(data)
+    return {
+      rows: flattenResults(node),
+      total: getTotalResults(node),
+      returned: Number(node?.ReturnResults ?? node?.returnResults) || 0,
+    }
+  }
+
+  const page1 = await fetchPage(1)
+  const seen = new Set()
+  const all = []
+  for (const row of page1.rows) {
+    const id = String(row.repayment_id || '')
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    all.push(row)
+  }
+
+  const total = page1.total
+  const totalPages = Math.max(1, Math.ceil((total || all.length) / size))
+  onProgress?.({ phase: 'repayments-page', page: 1, totalPages, count: all.length, claimedTotal: total })
+
+  if (totalPages <= 1 || all.length < size) return all
+
+  let nextPage = 2
+  while (nextPage <= totalPages) {
+    const wave = []
+    for (let i = 0; i < concurrency && nextPage + i <= totalPages; i++) wave.push(nextPage + i)
+    const results = await mapWithConcurrency(wave, concurrency, async (page) => {
+      const res = await fetchPage(page)
+      return { page, rows: res.rows }
+    })
+    for (const r of results) {
+      if (!r.ok) throw r.error
+      for (const row of r.value.rows) {
+        const id = String(row.repayment_id || '')
+        if (!id || seen.has(id)) continue
+        seen.add(id)
+        all.push(row)
+      }
+    }
+    nextPage += wave.length
+    onProgress?.({
+      phase: 'repayments-page',
+      page: Math.min(totalPages, nextPage - 1),
+      totalPages,
+      count: all.length,
+      claimedTotal: total,
+    })
+  }
+  return all
+}

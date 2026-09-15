@@ -1,7 +1,9 @@
+import { orderStoredStatements } from './statementOrder.js'
 import path from 'path'
 import { crif } from './crifClient.js'
 import { resolveParticularsFields } from './particularsParse.js'
 import { parseBucketFromReasoning, confidenceBucket } from './engine/src/matchingEngine.js'
+import db from './db.js'
 
 /**
  * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations over HTTP
@@ -77,7 +79,7 @@ function transactionSignature({ transDate, referenceNo, normalizedName, amount }
 function signatureForParsedRow(r) {
   const borrowerName = r.borrowerName || r.name || r.payer || null
   const transDate = (() => {
-    const d = toDateOrNull(r.transDate || r.date || r.valueDate || r.datePosted)
+    const d = toDateOrNull(r.datePosted || r.transDate || r.date || r.valueDate)
     return d ? d.toISOString().slice(0, 10) : null
   })()
   const referenceNo =
@@ -151,7 +153,7 @@ export async function insertBankTransactions(records, { fileName, uploadedDate }
     const sourceType = r.sourceType || r.documentType || (r.employer ? 'employer' : 'bank')
     const employerOrBank =
       r.employerOrBank || r.employer || (sourceType === 'bank' ? r.bank || null : null)
-    const transDate = isoDate(r.transDate || r.date || r.valueDate || r.datePosted)
+    const transDate = isoDate(r.datePosted || r.transDate || r.date || r.valueDate)
     const referenceNo =
       r.referenceNo || r.reference ? String(r.referenceNo || r.reference).slice(0, 100) : null
     const normalizedName = normalizeNameKey(borrowerName).slice(0, 255) || null
@@ -240,7 +242,7 @@ export async function getBankTransactions({ search = '' } = {}) {
   const q = String(search || '').trim().toLowerCase()
   if (!q) return shaped
   return shaped.filter((r) =>
-    [r.BorrowerName, r.TransactionDescription, r.Particulars, r.FileName, r.EmployerOrBank, r.ReferenceNo]
+    [r.BorrowerName, r.TransactionDescription, r.Particulars, r.FileName, r.EmployerOrBank, r.ReferenceNo, r.Remarks]
       .some((v) => String(v ?? '').toLowerCase().includes(q))
   )
 }
@@ -267,6 +269,8 @@ function shapeMatchRow(r) {
   return {
     id: String(r.Id),
     bank_transaction_id: r.Id,
+    source_serial: r.SourceSerial,
+    order_source: r.OrderSource,
     date: r.TransDate,
     payer: parsed.borrowerName || r.BorrowerName || null,
     transaction_description: fullParticulars || parsed.description || null,
@@ -286,7 +290,10 @@ function shapeMatchRow(r) {
     matched_borrower_id: r.BorrowerId || null,
     matched_borrower_name: r.LoanDiskBorrowerName || null,
     borrower_loandisk_id: r.BorrowerId || null,
+    borrower_unique_number: r.BorrowerUniqueNumber || r.UniqueNumber || null,
+    branch_name: r.BranchName || null,
     loan_number: r.LoanNumber || null,
+    loan_application_id: r.LoanApplicationId ? String(r.LoanApplicationId) : null,
     matched_loan_numbers: r.MatchedLoanNumbers || null,
     loan_count: r.LoanCount != null ? Number(r.LoanCount) : null,
     summed_expected_emi: r.SummedExpectedEMI != null ? Number(r.SummedExpectedEMI) : null,
@@ -296,6 +303,7 @@ function shapeMatchRow(r) {
     name_score: r.NameScore != null ? Number(r.NameScore) : null,
     match_method: r.MatchMethod || null,
     reasoning: r.Reasoning || null,
+    remarks: r.Remarks != null ? String(r.Remarks) : '',
   }
 }
 
@@ -305,12 +313,12 @@ function shapeMatchRow(r) {
  * screen — truncating the staging tables empties the screen.
  */
 export async function getSqlMatchResults({ search = '' } = {}) {
-  const rows = await execCrif('{}', 'Get_TransactionMatches')
+  const rows = orderStoredStatements(await execCrif('{}', 'Get_TransactionMatches'))
   const q = String(search || '').trim().toLowerCase()
   const filtered = !q
     ? rows
     : rows.filter((r) =>
-        [r.BorrowerName, r.FileName, r.ReferenceNo, r.LoanDiskBorrowerName]
+        [r.BorrowerName, r.FileName, r.ReferenceNo, r.LoanDiskBorrowerName, r.Remarks]
           .some((v) => String(v ?? '').toLowerCase().includes(q))
       )
 
@@ -357,6 +365,15 @@ export async function updateSqlMatchReview({
   }
   await execCrif(payload, 'Update_MatchReview')
   return true
+}
+
+/** Persist operator remarks on the bank credit. Survives rematch. */
+export async function updateSqlTransactionRemarks({ bankTransactionId, remarks }) {
+  const id = Number(bankTransactionId)
+  if (!Number.isFinite(id) || id <= 0) throw new Error('A valid bank transaction is required')
+  const text = remarks == null ? '' : String(remarks).slice(0, 500)
+  await execCrif({ BankTransactionId: id, Remarks: text }, 'Update_BankTransactionRemarks')
+  return { ok: true, remarks: text.trim() }
 }
 
 /** Lightweight counts for dashboard tiles (via CRIF_Operations / Get_MatchSummary). */
@@ -803,8 +820,11 @@ function shapeLoanForReceipt(r) {
         : 0
 
   return {
-    loanNumber: String(r.LoanNumber ?? ''),
+    loanNumber: String(r.LoanNumber ?? r.LoanApplicationId ?? r.LoanId ?? ''),
+    loanApplicationId: r.LoanApplicationId ? String(r.LoanApplicationId) : null,
+    loanId: r.LoanId ? String(r.LoanId) : null,
     borrowerId: String(r.BorrowerId ?? ''),
+    borrowerUniqueNumber: r.BorrowerUniqueNumber || r.UniqueNumber || null,
     borrowerName: r.BorrowerFullName ?? null,
     principalAmount: r.PrincipalAmount != null ? Number(r.PrincipalAmount) : null,
     disbursedAmount:
@@ -970,11 +990,54 @@ export async function deleteManualReceipt(id) {
  * Unified repayment ledger for one loan: synced LoanDisk repayments + manual
  * receipts entered in SmartRepay (newest first). Returns rows plus an analysis
  * summary so the UI can render detailed analytics without a second round-trip.
+ *
+ * Source priority:
+ *  1. Local SQLite loan_repayments (populated by borrowerBulkRefreshService)
+ *  2. CRIF SQL Server Get_LoanRepayments (may lag by weeks/months)
+ * Both sources are merged and de-duplicated by entryId so the caller always
+ * gets the freshest available data even if CRIF hasn't synced recently.
  */
 export async function getLoanRepayments(loanNumber) {
   const loan = String(loanNumber || '').trim()
   if (!loan) return { rows: [], summary: emptyRepaymentSummary() }
 
+  // --- Source 1: local SQLite (always fresh after borrower bulk refresh) ---
+  let localRows = []
+  try {
+    const raw = db
+      .prepare(
+        `SELECT repayment_id_ext, date, amount, reference, source, synced_at
+         FROM loan_repayments
+         WHERE loan_number = ?
+         ORDER BY date DESC, rowid DESC`
+      )
+      .all(loan)
+    localRows = raw.map((r) => ({
+      entryId: r.repayment_id_ext,
+      source: r.source || 'loandisk',
+      loanNumber: loan,
+      branchId: null,
+      branchName: null,
+      date: r.date,
+      amount: r.amount != null ? Number(r.amount) : null,
+      principalAmount: null,
+      interestAmount: null,
+      feesAmount: null,
+      penaltyAmount: null,
+      method: null,
+      description: null,
+      sourceChannel: null,
+      particulars: null,
+      receiptFileName: null,
+      receiptDocumentId: null,
+      enteredBy: null,
+      createdAt: r.synced_at,
+    }))
+  } catch {
+    localRows = []
+  }
+
+  // --- Source 2: CRIF SQL Server ---
   let raw = []
   try {
     raw = await execCrif({ LoanNumber: loan }, 'Get_LoanRepayments')
@@ -982,7 +1045,7 @@ export async function getLoanRepayments(loanNumber) {
     raw = []
   }
 
-  const rows = raw
+  const crifRows = raw
     .filter((r) => r.EntryId != null || r.Amount != null)
     .map((r) => ({
       entryId: r.EntryId != null ? String(r.EntryId) : null,
@@ -1006,7 +1069,31 @@ export async function getLoanRepayments(loanNumber) {
       createdAt: r.CreatedAt ?? null,
     }))
 
-  return { rows, summary: summarizeRepayments(rows) }
+  // --- Merge: local SQLite wins over CRIF for the same entryId ---
+  const seenIds = new Set()
+  const merged = []
+
+  for (const r of localRows) {
+    const key = r.entryId
+    if (key) seenIds.add(key)
+    merged.push(r)
+  }
+
+  for (const r of crifRows) {
+    const key = r.entryId
+    if (key && seenIds.has(key)) continue  // already have it from SQLite
+    if (key) seenIds.add(key)
+    merged.push(r)
+  }
+
+  // Sort newest first
+  merged.sort((a, b) => {
+    const da = a.date || ''
+    const db_ = b.date || ''
+    return da < db_ ? 1 : da > db_ ? -1 : 0
+  })
+
+  return { rows: merged, summary: summarizeRepayments(merged) }
 }
 
 function emptyRepaymentSummary() {

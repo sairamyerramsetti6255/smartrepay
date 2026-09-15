@@ -145,7 +145,8 @@ const DUE_MERGE_TAIL = `
     T.TotalLoanAmount = S.TotalLoanAmount, T.InterestAmount = S.InterestAmount,
     T.InterestRate = S.InterestRate, T.TotalDue = S.TotalDue, T.TotalPaid = S.TotalPaid,
     T.LoanBalanceAmount = S.LoanBalanceAmount, T.BorrowerEmail = S.BorrowerEmail,
-    T.BorrowerPhone = S.BorrowerPhone, T.EMILastPaidDate = S.EMILastPaidDate,
+    T.BorrowerPhone = S.BorrowerPhone,
+    T.EMILastPaidDate = COALESCE(S.EMILastPaidDate, T.EMILastPaidDate),
     T.LoanStatus = S.LoanStatus, T.BranchId = S.BranchId, T.BranchName = S.BranchName,
     T.SyncedAt = GETUTCDATE()
   WHEN NOT MATCHED BY TARGET THEN INSERT
@@ -232,6 +233,114 @@ export async function bulkInsertStagingRecords(records) {
   }
 }
 
+/**
+ * Upsert LoanDisk repayment history into dbo.SILLoanRepayments (MERGE on RepaymentId).
+ * This is what Get_LoanRepayments reads — Staging_LoandiskDueRecords does NOT store repayments.
+ */
+export async function bulkUpsertSilLoanRepayments(rows) {
+  if (!rows?.length) return { upserted: 0, inserted: 0, updated: 0 }
+
+  const byKey = new Map()
+  for (const r of rows) {
+    const id = r.repaymentId != null ? String(r.repaymentId) : null
+    if (!id) continue
+    byKey.set(id, r)
+  }
+  const unique = [...byKey.values()]
+  if (!unique.length) return { upserted: 0, inserted: 0, updated: 0 }
+
+  const pool = await getPool()
+  const tx = new sql.Transaction(pool)
+  await tx.begin()
+
+  const BATCH = 80
+  let inserted = 0
+  let updated = 0
+
+  try {
+    for (let i = 0; i < unique.length; i += BATCH) {
+      const batch = unique.slice(i, i + BATCH)
+      const req = new sql.Request(tx)
+      const values = batch.map((r, idx) => {
+        const p = (name) => `r${idx}_${name}`
+        req.input(p('RepaymentId'), sql.BigInt, String(r.repaymentId))
+        req.input(p('LoanId'), sql.BigInt, String(r.loanId))
+        req.input(p('BranchId'), sql.VarChar(50), r.branchId != null ? String(r.branchId) : null)
+        req.input(p('BranchName'), sql.NVarChar(300), r.branchName ?? null)
+        req.input(p('Amount'), sql.Decimal(18, 2), r.amount ?? null)
+        req.input(p('Principal'), sql.Decimal(18, 2), r.principalAmount ?? null)
+        req.input(p('Interest'), sql.Decimal(18, 2), r.interestAmount ?? null)
+        req.input(p('Fees'), sql.Decimal(18, 2), r.feesAmount ?? null)
+        req.input(p('Penalty'), sql.Decimal(18, 2), r.penaltyAmount ?? null)
+        req.input(p('Method'), sql.VarChar(50), r.method != null ? String(r.method).slice(0, 50) : null)
+        req.input(p('Collector'), sql.VarChar(50), r.collectorId != null ? String(r.collectorId).slice(0, 50) : null)
+        req.input(p('CollectedDate'), sql.VarChar(50), r.collectedDate != null ? String(r.collectedDate).slice(0, 50) : null)
+        req.input(p('SystemDate'), sql.VarChar(50), r.systemDate != null ? String(r.systemDate).slice(0, 50) : null)
+        req.input(p('Description'), sql.NVarChar(500), r.description ?? null)
+        return `(@${p('RepaymentId')}, @${p('LoanId')}, @${p('BranchId')}, @${p('BranchName')}, @${p('Amount')}, @${p('Principal')}, @${p('Interest')}, @${p('Fees')}, @${p('Penalty')}, @${p('Method')}, @${p('Collector')}, @${p('CollectedDate')}, @${p('SystemDate')}, @${p('Description')})`
+      })
+
+      const sqlText = `
+        DECLARE @R TABLE (
+          RepaymentId BIGINT,
+          LoanId BIGINT,
+          BranchId VARCHAR(50),
+          BranchName NVARCHAR(300),
+          RepaymentAmount DECIMAL(18,2),
+          PrincipalRepaymentAmount DECIMAL(18,2),
+          InterestRepaymentAmount DECIMAL(18,2),
+          FeesRepaymentAmount DECIMAL(18,2),
+          PenaltyRepaymentAmount DECIMAL(18,2),
+          RepaymentMethodId VARCHAR(50),
+          CollectorId VARCHAR(50),
+          RepaymentCollectedDate VARCHAR(50),
+          LoandiskSystemDate VARCHAR(50),
+          RepaymentDescription NVARCHAR(500)
+        );
+        INSERT INTO @R VALUES ${values.join(', ')};
+        MERGE dbo.SILLoanRepayments AS T
+        USING @R AS S ON T.RepaymentId = S.RepaymentId
+        WHEN MATCHED AND (T.EntryType IS NULL OR T.EntryType <> 'manual') THEN UPDATE SET
+          T.LoanId = S.LoanId,
+          T.BranchId = S.BranchId,
+          T.BranchName = COALESCE(S.BranchName, T.BranchName),
+          T.RepaymentAmount = S.RepaymentAmount,
+          T.PrincipalRepaymentAmount = S.PrincipalRepaymentAmount,
+          T.InterestRepaymentAmount = S.InterestRepaymentAmount,
+          T.FeesRepaymentAmount = S.FeesRepaymentAmount,
+          T.PenaltyRepaymentAmount = S.PenaltyRepaymentAmount,
+          T.RepaymentMethodId = S.RepaymentMethodId,
+          T.CollectorId = S.CollectorId,
+          T.RepaymentCollectedDate = S.RepaymentCollectedDate,
+          T.LoandiskSystemDate = S.LoandiskSystemDate,
+          T.RepaymentDescription = S.RepaymentDescription,
+          T.SyncedAt = GETUTCDATE()
+        WHEN NOT MATCHED BY TARGET THEN INSERT (
+          RepaymentId, LoanId, BranchId, BranchName, RepaymentAmount,
+          PrincipalRepaymentAmount, InterestRepaymentAmount, FeesRepaymentAmount, PenaltyRepaymentAmount,
+          RepaymentMethodId, CollectorId, RepaymentCollectedDate, LoandiskSystemDate, RepaymentDescription, SyncedAt
+        ) VALUES (
+          S.RepaymentId, S.LoanId, S.BranchId, S.BranchName, S.RepaymentAmount,
+          S.PrincipalRepaymentAmount, S.InterestRepaymentAmount, S.FeesRepaymentAmount, S.PenaltyRepaymentAmount,
+          S.RepaymentMethodId, S.CollectorId, S.RepaymentCollectedDate, S.LoandiskSystemDate, S.RepaymentDescription, GETUTCDATE()
+        )
+        OUTPUT $action AS Action;`
+
+      const result = await req.query(sqlText)
+      for (const a of result.recordset || []) {
+        if (a.Action === 'INSERT') inserted++
+        else if (a.Action === 'UPDATE') updated++
+      }
+    }
+
+    await tx.commit()
+    return { upserted: inserted + updated, inserted, updated }
+  } catch (e) {
+    await tx.rollback().catch(() => {})
+    throw e
+  }
+}
+
 const cut = (v, n) => (v == null ? null : String(v).slice(0, n))
 
 /**
@@ -277,6 +386,36 @@ export async function getBankTransactions() {
 /** LoanDisk due loans to match against (via CRIF_Operations). */
 export async function getMatchHistory() {
   return execCrif('{}', 'Get_TransactionMatches')
+}
+
+/**
+ * Recurring repayment amounts per loan (cents), from the synced LoanDisk ledger.
+ * An amount that appears at least twice is treated as the observed EMI.
+ */
+export async function getTypicalRepaymentAmounts() {
+  try {
+    const pool = await getPool()
+    const result = await pool.request().query(`
+      SELECT CAST(LoanId AS NVARCHAR(100)) AS LoanNumber,
+             CAST(RepaymentAmount AS DECIMAL(18,2)) AS Amount
+      FROM dbo.SILLoanRepayments
+      WHERE RepaymentAmount IS NOT NULL AND RepaymentAmount > 0
+        AND (EntryType IS NULL OR EntryType <> 'manual')
+      GROUP BY LoanId, CAST(RepaymentAmount AS DECIMAL(18,2))
+      HAVING COUNT(*) >= 2
+    `)
+    const map = new Map()
+    for (const row of result.recordset || []) {
+      const id = String(row.LoanNumber || '').trim()
+      const cents = Math.round(Number(row.Amount) * 100)
+      if (!id || !Number.isFinite(cents) || cents <= 0) continue
+      if (!map.has(id)) map.set(id, [])
+      map.get(id).push(cents)
+    }
+    return map
+  } catch {
+    return new Map()
+  }
 }
 
 export async function getLoanDiskDueRecords() {
@@ -332,4 +471,47 @@ export async function closePool() {
     poolPromise = null
     if (pool) await pool.close().catch(() => {})
   }
+}
+
+/**
+ * Mark loans in a branch as 'inactive' if they are no longer returned by LoanDisk's
+ * Active/Current API call.  This prevents paid-off or status-changed loans from
+ * lingering indefinitely with stale 'active'/'current' labels.
+ *
+ * Uses STRING_SPLIT (SQL Server 2016+). All LoanDisk loan_ids are numeric so a
+ * comma delimiter is safe.
+ *
+ * @param {string|number} branchId
+ * @param {string[]} activeLoanNumbers  All loan numbers currently returned by LoanDisk
+ *   for this branch (both Active and Current statuses combined).
+ */
+export async function markStaleLoansInBranch(branchId, activeLoanNumbers) {
+  if (!branchId || !activeLoanNumbers?.length) return { deactivated: 0 }
+
+  const pool = await getPool()
+
+  // Deduplicate and build the comma-separated list.
+  const unique = [...new Set(activeLoanNumbers.map(String).filter(Boolean))]
+  if (!unique.length) return { deactivated: 0 }
+
+  // Pass the list as a single NVarChar(MAX) parameter — avoids parameter-count
+  // limits that a per-row approach would hit for large branches (e.g. E&S: 2931).
+  const req = pool.request()
+  req.input('BranchId', sql.VarChar(50), String(branchId))
+  req.input('LoanList', sql.NVarChar(sql.MAX), unique.join(','))
+
+  const result = await req.query(`
+    UPDATE dbo.Staging_LoandiskDueRecords
+    SET    LoanStatus = 'inactive',
+           SyncedAt   = GETUTCDATE()
+    WHERE  BranchId   = @BranchId
+      AND  LoanStatus IN ('active', 'current')
+      AND  LoanNumber NOT IN (
+             SELECT LTRIM(RTRIM(value))
+             FROM   STRING_SPLIT(@LoanList, ',')
+             WHERE  LTRIM(RTRIM(value)) <> ''
+           )
+  `)
+
+  return { deactivated: result.rowsAffected?.[0] ?? 0 }
 }

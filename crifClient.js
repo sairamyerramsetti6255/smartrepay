@@ -20,6 +20,33 @@ import { backfillMonthlyBulkBorrowerUniqueNumber } from './monthlyBulkSql.js'
 const API_BASE = (process.env.LOANDISK_API_URL || 'https://simplifiedapi.meanhost.in/v1/api').replace(/\/+$/, '')
 const CRIF_TIMEOUT_MS = Number(process.env.CRIF_TIMEOUT_MS) || 120_000
 
+// In-memory cache for read operations
+const crifCache = new Map()
+const inFlightRequests = new Map()
+
+// Default TTLs in milliseconds for read queries
+const QUERY_TTLS = {
+  Get_MatchSummary: 20_000,
+  Get_Documents: 30_000,
+  Get_TransactionMatches: 60_000,
+  Get_BankTransactions: 60_000,
+  Get_LoandiskDueRecords: 300_000,
+  Get_MigrationLogs: 30_000,
+  Get_MigrationFailedRecords: 30_000,
+  Get_NodeCrifData: 30_000,
+}
+
+/** Invalidate cached queries by condition prefix or all if no pattern is given. */
+export function invalidateCrifCache(pattern = '') {
+  if (!pattern) {
+    crifCache.clear()
+    return
+  }
+  for (const key of crifCache.keys()) {
+    if (key.includes(pattern)) crifCache.delete(key)
+  }
+}
+
 function isSuccess(code) {
   return code === undefined || code === 'SUCCESS' || code === 'success' || code === 1
 }
@@ -29,31 +56,89 @@ function isSuccess(code) {
  * @param {object|array|string} json  payload (object/array is stringified)
  * @param {string} condition          condition selector (e.g. 'Get_Documents')
  * @param {string} [type]
+ * @param {object} [options]          { force: boolean, ttl: number }
  * @returns {Promise<object[]>}
  */
-export async function crif(json, condition, type = '') {
-  const token = await getLoanDiskToken()
+export async function crif(json, condition, type = '', options = {}) {
   const payload = typeof json === 'string' ? json : JSON.stringify(json ?? {})
+  const isRead = String(condition).startsWith('Get_')
+  const isWrite = String(condition).startsWith('Save_') ||
+    String(condition).startsWith('Update_') ||
+    String(condition).startsWith('Delete_') ||
+    String(condition).startsWith('Insert_')
 
-  const res = await fetch(`${API_BASE}/SP/CRIF_Operations`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ Json: payload, Condition: condition, Type: type }),
-    signal: AbortSignal.timeout(CRIF_TIMEOUT_MS),
-  })
-
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.message || data.title || `CRIF ${condition} HTTP ${res.status}`)
-  if (!isSuccess(data.code)) throw new Error(data.message || `CRIF ${condition} failed`)
-
-  let table = []
-  try {
-    const doc = typeof data.document === 'string' ? JSON.parse(data.document) : data.document
-    table = doc?.Table ?? []
-  } catch {
-    table = []
+  // Invalidate cache on write operations
+  if (isWrite) {
+    if (condition.includes('Bank') || condition.includes('Match') || condition.includes('Document')) {
+      invalidateCrifCache('Get_Match')
+      invalidateCrifCache('Get_Doc')
+      invalidateCrifCache('Get_Bank')
+      invalidateCrifCache('Get_Trans')
+    } else if (condition.includes('Loan') || condition.includes('Borrower')) {
+      invalidateCrifCache('Get_Loan')
+      invalidateCrifCache('Get_Borr')
+    } else {
+      invalidateCrifCache()
+    }
   }
-  return Array.isArray(table) ? table : []
+
+  const cacheKey = `${condition}|${type}|${payload}`
+  const ttl = options.ttl ?? QUERY_TTLS[condition] ?? 0
+
+  // Check cache for read queries
+  if (isRead && !options.force && ttl > 0) {
+    const cached = crifCache.get(cacheKey)
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data
+    }
+  }
+
+  // Request coalescing for identical in-flight read operations
+  if (isRead && inFlightRequests.has(cacheKey)) {
+    return inFlightRequests.get(cacheKey)
+  }
+
+  const execPromise = (async () => {
+    try {
+      const token = await getLoanDiskToken()
+      const res = await fetch(`${API_BASE}/SP/CRIF_Operations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Json: payload, Condition: condition, Type: type }),
+        signal: AbortSignal.timeout(CRIF_TIMEOUT_MS),
+      })
+
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.message || data.title || `CRIF ${condition} HTTP ${res.status}`)
+      if (!isSuccess(data.code)) throw new Error(data.message || `CRIF ${condition} failed`)
+
+      let table = []
+      try {
+        const doc = typeof data.document === 'string' ? JSON.parse(data.document) : data.document
+        table = doc?.Table ?? []
+      } catch {
+        table = []
+      }
+      const rows = Array.isArray(table) ? table : []
+
+      if (isRead && ttl > 0) {
+        crifCache.set(cacheKey, {
+          data: rows,
+          expiresAt: Date.now() + ttl,
+        })
+      }
+
+      return rows
+    } finally {
+      inFlightRequests.delete(cacheKey)
+    }
+  })()
+
+  if (isRead) {
+    inFlightRequests.set(cacheKey, execPromise)
+  }
+
+  return execPromise
 }
 
 function pickField(row, ...keys) {

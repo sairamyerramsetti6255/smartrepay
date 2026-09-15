@@ -30,15 +30,20 @@ export function groupLoansByBorrower(loans) {
     const key = id ? `id:${id}` : `unknown:${row}`
     if (!groups.has(key)) groups.set(key, { key, borrowerId: id, borrowerName: loan.BorrowerFullName || '', names: [], employers: [], loans: [] })
     const g = groups.get(key)
-    g.names = [...new Set([...g.names, loan.BorrowerFullName, ...aliases(loan.Aliases)].filter(Boolean))]
+    const rawFullName = String(loan.BorrowerFullName || '').trim()
+    g.names = [...new Set([...g.names, rawFullName, ...aliases(loan.Aliases)].filter(Boolean))]
     g.employers = [...new Set([...g.employers, loan.EmployerName, loan.Employer].filter(Boolean))]
-    if (!loan.LoanNumber || g.loans.some((l) => l.loanNumber === String(loan.LoanNumber))) continue
+    if (!loan.LoanNumber || g.loans.some((l) => l.loanNumber === String(loan.LoanNumber) && l.branch === loan.BranchName)) continue
     g.loans.push({ loanNumber: String(loan.LoanNumber), expectedEMI: number(loan.ExpectedEMIAmount),
+      frequency: loan.RepaymentFrequency || loan.PaymentFrequency || null, syncedAt: loan.SyncedAt || null,
       status: loan.LoanStatus, balance: number(loan.LoanBalanceAmount), branch: loan.BranchName,
       // TotalDue in existing staging is lifetime contractual due, NOT current arrears.
       currentDue: number(loan.TotalAmountDue ?? loan.CurrentAmountDue), pendingEMIs: number(loan.PendingEMICount),
       dueDate: loan.NextDueDate || loan.ExpectedPaymentDate || null,
       charges: number(loan.LateFeeAmount ?? loan.ChargesDue),
+      historicalPaymentCents: Array.isArray(loan.HistoricalPaymentCents)
+        ? loan.HistoricalPaymentCents.filter((n) => Number.isFinite(n) && n > 0)
+        : [],
     })
   }
   for (const g of groups.values()) g.totalEMI = round2(g.loans.reduce((sum, l) => sum + (l.expectedEMI || 0), 0))
@@ -68,26 +73,60 @@ export function findBorrowerIdHints(tx, groups, patterns = []) {
   return [...groups.values()].filter((g) => g.borrowerId && ids.has(g.borrowerId)).map((group) => ({ group, score: 99, nameKind: 'exact_borrower_id', strongIdentity: true }))
 }
 
+function typicalHistoryCents(loan) {
+  return (loan.historicalPaymentCents || []).filter((n) => Number.isFinite(n) && n > 0)
+}
+
+/** Unique loan whose recurring historical repayments equal the credit. */
+function uniqueHistoryAllocation(cents, loans, c) {
+  const hits = []
+  for (const loan of loans) {
+    if (!loan.loanNumber) continue
+    for (const hist of typicalHistoryCents(loan)) {
+      if (Math.abs(cents - hist) <= Math.round(tolerance(hist / 100, c) * 100)) {
+        hits.push({ loan, hist })
+        break
+      }
+    }
+  }
+  const ids = [...new Set(hits.map((h) => h.loan.loanNumber))]
+  if (ids.length !== 1) return null
+  const { hist } = hits[0]
+  return {
+    kind: 'history_installment',
+    loanNumbers: ids,
+    summedExpected: hist / 100,
+    diff: (cents - hist) / 100,
+    ambiguous: false,
+    frequency: 'historical installment',
+    emiCount: 1,
+    historyMatched: true,
+  }
+}
+
 /** Allocate only inside one borrower. Integer cents and all plausible allocations prevent first-hit bias. */
 export function reconcileAmount(paid, loans, c = runtimeConfig) {
   const amt = number(paid)
-  const list = loans.map((l) => ({ ...l, expectedEMI: number(l.expectedEMI) })).filter((l) => Number.isFinite(l.expectedEMI) && l.expectedEMI > 0 && l.loanNumber)
+  const list = loans.map((l) => ({ ...l, expectedEMI: number(l.expectedEMI) })).filter((l) => l.loanNumber)
   const none = { kind: 'none', loanNumbers: [], summedExpected: null, diff: null, ambiguous: false, frequency: null, emiCount: null }
   if (!Number.isFinite(amt) || amt <= 0 || !list.length) return none
   const cents = Math.round(amt * 100)
-  const subsets = list.map((l) => [l])
+  const hist = uniqueHistoryAllocation(cents, list, c)
+  const emiList = list.filter((l) => Number.isFinite(l.expectedEMI) && l.expectedEMI > 0)
+  if (!emiList.length) return hist || none
+  const subsets = emiList.map((l) => [l])
   // Bounded search. If the book is too large, do not claim a unique allocation.
-  const truncated = c.useSubsetSum && list.length > 12
-  if (c.useSubsetSum && list.length <= 12) {
-    for (let mask = 1; mask < (1 << list.length); mask++) {
+  const truncated = c.useSubsetSum && emiList.length > 12
+  if (c.useSubsetSum && emiList.length <= 12) {
+    for (let mask = 1; mask < (1 << emiList.length); mask++) {
       if ((mask & (mask - 1)) === 0) continue
-      subsets.push(list.filter((_, i) => mask & (1 << i)))
+      subsets.push(emiList.filter((_, i) => mask & (1 << i)))
     }
   }
   const possibilities = []
   for (const subset of subsets) {
     const base = subset.reduce((sum, l) => sum + Math.round(l.expectedEMI * 100), 0)
-    const scales = [{ scale: 1, freq: 'monthly' }, ...(c.installmentScales || []).filter((s) => s.scale > 0 && s.scale < 1)]
+    const scales = [{ scale: 1, freq: 'base installment' }, ...(c.installmentScales || []).filter((s) => s.scale > 0 && s.scale < 1)]
     // Include every count within the tolerance window, not just the rounded ratio.
     const pct = c.AMOUNT_TOL_PCT
     const floorTolerance = c.AMOUNT_TOL_MIN * 100
@@ -98,7 +137,7 @@ export function reconcileAmount(paid, loans, c = runtimeConfig) {
       const expected = Math.round(base * scale)
       const diff = cents - expected
       if (Math.abs(diff) > Math.round(tolerance(expected / 100, c) * 100)) continue
-      possibilities.push({ kind: scale > 1 ? 'emi_multiple' : subset.length === 1 ? 'exact_single' : subset.length === list.length ? 'sum_all' : 'subset',
+      possibilities.push({ kind: scale > 1 ? 'emi_multiple' : subset.length === 1 ? 'exact_single' : subset.length === emiList.length ? 'sum_all' : 'subset',
         loanNumbers: subset.map((l) => l.loanNumber), summedExpected: base / 100, diff: diff / 100, frequency: freq, emiCount: scale })
     }
     if (subset.length === 1 && Number.isFinite(subset[0].charges) && subset[0].charges > 0) {
@@ -111,13 +150,26 @@ export function reconcileAmount(paid, loans, c = runtimeConfig) {
     }
   }
   possibilities.sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff) || a.loanNumbers.length - b.loanNumbers.length || a.emiCount - b.emiCount)
-  if (possibilities.length) return { ...possibilities[0], ambiguous: truncated || possibilities.length > 1, alternatives: possibilities.slice(0, 5) }
-  const closest = list.map((l) => ({ l, diff: round2(amt - l.expectedEMI) })).sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff))[0]
+  if (possibilities.length) {
+    const best = { ...possibilities[0], ambiguous: truncated || possibilities.length > 1, alternatives: possibilities.slice(0, 5) }
+    if (hist && hist.loanNumbers[0] === best.loanNumbers[0]) best.historyMatched = true
+    return best
+  }
+  if (hist) return hist
+  const closest = emiList.map((l) => ({ l, diff: round2(amt - l.expectedEMI) })).sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff))[0]
   // A residual is evidence for review; never invent late fees or infer a schedule.
   return { kind: amt < closest.l.expectedEMI ? 'partial' : 'mismatch', loanNumbers: [closest.l.loanNumber], summedExpected: closest.l.expectedEMI,
-    diff: closest.diff, ambiguous: list.length > 1, frequency: null, emiCount: null }
+    diff: closest.diff, ambiguous: emiList.length > 1, frequency: null, emiCount: null }
 }
-const reconciled = (r) => ['exact_single', 'sum_all', 'subset', 'emi_multiple', 'emi_with_charges'].includes(r.kind)
+const reconciled = (r) => ['exact_single', 'sum_all', 'subset', 'emi_multiple', 'emi_with_charges', 'history_installment'].includes(r.kind)
+
+/** First and last tokens match independently, but the full name is not confirmed. */
+function isIndependentFirstLast(cand) {
+  const kind = String(cand?.nameKind || '')
+  if (kind === 'exact_full' || kind.includes('+full')) return false
+  if (cand?.strongIdentity) return false
+  return /^(first\+last|last\+first|exact_first_last)/.test(kind)
+}
 
 function contextFor(cand, recon, tx, identity, historyId) {
   const employer = !!identity.employer && cand.group.employers.some((e) => compactName(e) === compactName(identity.employer))
@@ -149,8 +201,12 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
   const descName = c.signals?.useDescription?.enabled !== false ? identity.descriptionName : ''
   let candidates = mergeNameDescriptionCandidates(inputName ? nameCandidates(inputName, index, c.TYPO_FLOOR) : [],
     descName ? nameCandidates(descName, index, c.TYPO_FLOOR).map((v) => ({ ...v, matchedFrom: 'description' })) : [], Infinity)
-  const hints = c.signals?.useLoanNumberHint?.enabled !== false ? findLoanNumberHints(`${identity.full} ${tx.ReferenceNo || ''}`, index.groups) : []
-  const referencedIds = c.signals?.useLoanNumberHint?.enabled !== false ? extractLoanIds(`${identity.full} ${tx.ReferenceNo || ''}`) : []
+  const hints = c.signals?.useLoanNumberHint?.enabled !== false
+    ? findLoanNumberHints([identity.full, tx.ReferenceNo].filter(Boolean).join(' '), index.groups)
+    : []
+  const referencedIds = c.signals?.useLoanNumberHint?.enabled !== false
+    ? [...new Set([...extractLoanIds(identity.full), ...extractLoanIds(tx.ReferenceNo)])]
+    : []
   const unknownReference = referencedIds.some((id) => !hints.some((h) => normalizeLoanId(h.hintedLoanNumber) === id))
   const conflictingReference = hints.length > 1
   const nameConflict = hints.length === 1 && candidates.some((v) => v.score >= 92 && v.group.key !== hints[0].group.key)
@@ -166,7 +222,13 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     const amountScore = reconciled(recon) ? 100 : c.amountComponents?.[recon.kind] ?? 0
     let confidence
     if (cand.hintedLoanNumber) confidence = 100
-    else if (anonymousCash) confidence = reconciled(recon) ? 80 + (context.due ? 5 : 0) + (context.nearDue ? 3 : 0) + (context.pendingCount ? 3 : 0) : 0
+    else if (anonymousCash) {
+      // Cash deposits (no payer name) can only be matched on amount alone.
+      // Only surface for review when the amount is an EXACT single-loan match —
+      // partial fractions, multi-EMI guesses, and mismatches are pure coincidence.
+      const exactCash = recon.kind === 'exact_single' || recon.kind === 'emi_multiple'
+      confidence = exactCash ? 80 + (context.due ? 5 : 0) + (context.nearDue ? 3 : 0) + (context.pendingCount ? 3 : 0) : 0
+    }
     else if (cand.partialIdentity) confidence = cand.score + (reconciled(recon) ? 10 : 0) + (context.employer ? 5 : 0) + (context.history ? 10 : 0)
     else {
       // The score describes borrower identity. A partial credit cannot make
@@ -176,23 +238,28 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
       if (cand.nameKind === 'exact_full') confidence = Math.max(confidence, 98)
       confidence += (context.employer ? 3 : 0) + (context.history ? 5 : 0)
     }
-    if (!cand.hintedLoanNumber) confidence = Math.min(confidence, 99)
-    if (cand.partialIdentity || anonymousCash) confidence = Math.min(confidence, 91)
-    return { cand, recon, context, confidence: round2(confidence) }
+    const historyAuto = isIndependentFirstLast(cand) && recon.historyMatched && reconciled(recon)
+    if (historyAuto) confidence = 100
+    else if (!cand.hintedLoanNumber) confidence = Math.min(confidence, 99)
+    if ((cand.partialIdentity || anonymousCash) && !historyAuto) confidence = Math.min(confidence, 91)
+    // Independent first + last + exact EMI is evidence to review, not auto-match —
+    // unless the credit also equals this loan's recurring historical repayments.
+    if (isIndependentFirstLast(cand) && reconciled(recon) && !historyAuto) confidence = Math.min(confidence, 91)
+    return { cand, recon, context, confidence: round2(confidence), historyAuto }
   }).filter((s) => anonymousCash ? reconciled(s.recon) : s.cand.score >= c.NAME_MIN)
     .sort((a, b) => b.confidence - a.confidence || b.cand.score - a.cand.score || a.cand.group.key.localeCompare(b.cand.group.key))
   if (!scored.length) return { record: { ...base, reasoning: '[different_person] No qualifying borrower candidate; cash credits require an active loan and a reconcilable EMI amount.' }, needsAi: false, candidates: [] }
   const best = scored[0], second = scored[1]
   const gap = second ? round2(best.confidence - second.confidence) : 100
   const ambiguous = conflictingReference || nameConflict || gap < Math.max(8, c.AMBIGUITY_GAP)
-  const { cand, recon, context } = best
-  const identityBlocked = ambiguous || unknownReference || !cand.group.borrowerId || !context.active || cand.partialIdentity || anonymousCash
+  const { cand, recon, context, historyAuto } = best
+  const identityBlocked = ambiguous || unknownReference || !cand.group.borrowerId || !context.active || (cand.partialIdentity && !historyAuto) || anonymousCash
   const allocationBlocked = recon.ambiguous || recon.kind === 'none' || recon.kind === 'mismatch'
   // A uniquely identified loan can receive a partial repayment. Multiple loans
   // or unexplained overpayments still need allocation review.
   const blocked = identityBlocked || allocationBlocked
   const confidence = identityBlocked ? Math.min(best.confidence, 91) : best.confidence
-  const status = !blocked && confidence >= Math.max(92, c.AUTO_CONFIDENCE) && (cand.strongIdentity || cand.score >= Math.max(92, c.NAME_STRONG))
+  const status = !blocked && confidence >= Math.max(92, c.AUTO_CONFIDENCE) && (cand.strongIdentity || cand.score >= Math.max(92, c.NAME_STRONG) || historyAuto)
     ? 'auto_matched' : confidence >= 80 || ambiguous ? 'needs_review' : 'unmatched'
   const bucket = confidenceBucket(confidence)
   const reasons = [
@@ -202,7 +269,9 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     ambiguous && 'Ambiguous or conflicting identities — manual review', unknownReference && 'Labelled loan reference not found — manual review',
     recon.ambiguous && 'Multiple possible loan allocations — manual review', allocationBlocked && 'Borrower identified; payment allocation requires review; no fees inferred',
     recon.kind === 'partial' && !allocationBlocked && 'Partial repayment against the uniquely identified loan',
-    !context.active && 'Active loan status not established', cand.partialIdentity && 'Insufficient full name tokens to auto-identify a borrower',
+    historyAuto && 'First and last name match; credit equals historical repayment EMI — 100% match',
+    isIndependentFirstLast(cand) && reconciled(recon) && !historyAuto && 'Independent first name, last name, and exact EMI — needs review',
+    !context.active && 'Active loan status not established', cand.partialIdentity && !historyAuto && 'Insufficient full name tokens to auto-identify a borrower',
     context.employer && 'Employer agrees', context.history && 'Previously confirmed name and employer agree', context.due && 'Current amount due agrees', context.pendingCount && 'Pending EMI count agrees',
   ].filter(Boolean).join('. ')
   const assigned = status !== 'unmatched'
@@ -212,6 +281,9 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     expectedEmiAmount: recon.loanNumbers.length === 1 ? recon.summedExpected : null, summedExpectedEmi: recon.summedExpected, amountDiff: recon.diff,
     matchType: status === 'unmatched' ? 'unmatched' : cand.hintedLoanNumber ? 'loan_id' : anonymousCash ? 'cash_amount' : reconciled(recon) ? 'name_and_amount' : 'name_only',
     amountMatchKind: recon.kind, nameScore: cand.score, confidenceScore: confidence, confidenceBucket: bucket, reviewStatus: status,
+    nameKind: cand.nameKind || null,
+    independentFirstLast: isIndependentFirstLast(cand),
+    historyMatched: !!recon.historyMatched,
     reasoning: formatReasoningWithBucket(bucket, reasons).slice(0, 1000),
     emiCount: status === 'auto_matched' ? recon.emiCount : null, candidateCount: scored.length,
   }
@@ -226,15 +298,20 @@ export function matchStatusFor(confidence) {
 export function classify(tx, index, c = runtimeConfig) {
   const result = classifyEvidence(tx, index, c)
   const original = result.record
-  const status = matchStatusFor(original.confidenceScore)
+  const anonymous = result.candidates[0]?.nameKind === 'cash_amount'
+  const independentReview = original.independentFirstLast && original.reviewStatus === 'needs_review'
+  const status = anonymous || independentReview ? 'needs_review' : matchStatusFor(original.confidenceScore)
   const ready = original.reviewStatus === 'auto_matched'
   const candidate = result.candidates[0]
+  const keepSuggestion = status === 'auto_matched' || independentReview
   result.record = {
     ...original,
     reviewStatus: status,
-    borrowerId: status === 'auto_matched' ? original.borrowerId || candidate?.group.borrowerId || null : null,
-    loanDiskBorrowerName: status === 'auto_matched' ? original.loanDiskBorrowerName || candidate?.group.borrowerName || null : null,
-    matchType: status === 'auto_matched' && !ready ? 'review_required' : original.matchType,
+    borrowerId: keepSuggestion ? original.borrowerId || candidate?.group.borrowerId || null : null,
+    loanDiskBorrowerName: keepSuggestion ? original.loanDiskBorrowerName || candidate?.group.borrowerName || null : null,
+    loanNumber: anonymous ? null : original.loanNumber,
+    matchedLoanNumbers: anonymous ? [] : original.matchedLoanNumbers,
+    matchType: !ready && status !== 'unmatched' ? 'review_required' : original.matchType,
     emiCount: ready ? original.emiCount : null,
     reasoning: status === 'auto_matched' && !ready
       ? original.reasoning.replace(/^(\[[^\]]+\] )/, '$1Matched by >70% rule; review required before posting. ').slice(0, 1000)

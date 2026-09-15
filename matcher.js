@@ -11,14 +11,16 @@ function normalizeName(s) {
 export function parsePayerName(payer) {
   const clean = String(payer || '').trim().replace(/\s+/g, ' ')
   if (!clean) return { first: '', last: '', full: '' }
-  const parts = clean.split(' ')
+  const parts = clean.split(' ').filter(Boolean)
   if (parts.length === 1) return { first: parts[0], last: '', full: clean }
-  return { first: parts[0], last: parts.slice(1).join(' '), full: clean }
+  return { first: parts[0], last: parts[parts.length - 1], full: clean }
 }
 
 function borrowerNames(b) {
-  const first = b.first_name || String(b.full_name || '').split(' ')[0] || ''
-  const last = b.last_name || String(b.full_name || '').split(' ').slice(1).join(' ') || ''
+  const parts = String(b.full_name || '').trim().split(/\s+/).filter(Boolean)
+  const first = b.first_name || parts[0] || ''
+  // Ignore middle name in loans: consider only first name and last name
+  const last = b.last_name || (parts.length > 1 ? parts[parts.length - 1] : '')
   return { first, last, full: b.full_name || `${first} ${last}`.trim() }
 }
 
@@ -34,7 +36,7 @@ export function extractBorrowerIdsFromTx(tx) {
   return extractBorrowerIdsFromText(`${tx.reference || ''} ${tx.description || ''} ${tx.payer || ''}`)
 }
 
-/** Priority 1: first name + last name (space-separated). No EMI matching. */
+/** Priority 1: first name + last name (space-separated). Middle names ignored. */
 export function firstLastNameScore(payer, borrower) {
   const p = parsePayerName(payer)
   const b = borrowerNames(borrower)
@@ -44,9 +46,11 @@ export function firstLastNameScore(payer, borrower) {
   const bf = normalizeName(b.first)
   const bl = normalizeName(b.last)
 
-  if (p.last && pf && pl && bf && bl && pf === bf && pl === bl) return 100
-  if (p.last && pf && pl && bf && bl && pf === bf && (bl.includes(pl) || pl.includes(bl))) return 96
-  if (!p.last && pf && bf === pf) return 78
+  if (p.last && pf && pl && bf && bl) {
+    if ((pf === bf && pl === bl) || (pf === bl && pl === bf)) return 100
+    if ((pf === bf && (bl.includes(pl) || pl.includes(bl))) || (pf === bl && (bf.includes(pl) || pl.includes(bf)))) return 96
+  }
+  if (!p.last && pf && (bf === pf || bl === pf)) return 78
   return 0
 }
 
@@ -84,13 +88,21 @@ function buildNameIndex(candidates) {
   const firstOnly = new Map()
   for (const b of candidates) {
     const n = borrowerNames(b)
-    const fk = `${normalizeName(n.first)}|${normalizeName(n.last)}`
-    if (!exact.has(fk)) exact.set(fk, [])
-    exact.get(fk).push(b)
+    const fk1 = `${normalizeName(n.first)}|${normalizeName(n.last)}`
+    const fk2 = `${normalizeName(n.last)}|${normalizeName(n.first)}`
+    for (const fk of [fk1, fk2]) {
+      if (!exact.has(fk)) exact.set(fk, [])
+      exact.get(fk).push(b)
+    }
     if (n.first) {
       const fKey = normalizeName(n.first)
       if (!firstOnly.has(fKey)) firstOnly.set(fKey, [])
       firstOnly.get(fKey).push(b)
+    }
+    if (n.last) {
+      const lKey = normalizeName(n.last)
+      if (!firstOnly.has(lKey)) firstOnly.set(lKey, [])
+      firstOnly.get(lKey).push(b)
     }
   }
   return { exact, firstOnly }

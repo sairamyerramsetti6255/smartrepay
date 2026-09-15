@@ -396,8 +396,13 @@ function tokenMatchesAny(token, others, typoFloor) {
 }
 
 export function isFullNameMatch(bankTokens, borrowerTokens, typoFloor = TYPO_FLOOR) {
-  if (!bankTokens.length) return false
-  return bankTokens.every((t) => tokenMatchesAny(t, borrowerTokens, typoFloor))
+  if (!bankTokens.length || !borrowerTokens.length) return false
+  // Both directions: extra middle names on either side are first+last only,
+  // not a full identity match (e.g. Chewuakii Symon vs Chewuakii Mary T Symon).
+  return (
+    bankTokens.every((t) => tokenMatchesAny(t, borrowerTokens, typoFloor)) &&
+    borrowerTokens.every((t) => tokenMatchesAny(t, bankTokens, typoFloor))
+  )
 }
 
 function tieredNameScore(firstLastQuality, fullName) {
@@ -490,6 +495,7 @@ export function scoreNameMatch(a, b, opts = {}) {
   const orient = orientationScore(activeTa, tb, typoFloor)
   if (!orient) return { score: 0, kind: 'none', breakdown: null }
 
+  // Extra middles on the loan name are first+last only — not a full identity.
   const fullName = isFullNameMatch(activeTa, tb, typoFloor)
   const kind = fullName ? `${orient.kind}+full` : orient.kind
   const score = tieredNameScore(orient.quality, fullName)

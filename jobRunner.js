@@ -72,6 +72,17 @@ function cleanup() {
   activeJobName = null
 }
 
+export function cancelHeavyJob(reason = 'Job cancelled by user') {
+  if (activeWorker) {
+    try {
+      activeWorker.terminate()
+    } catch {}
+    cleanup()
+    return true
+  }
+  return false
+}
+
 export function isHeavyJobRunning() {
   return !!activeWorker
 }

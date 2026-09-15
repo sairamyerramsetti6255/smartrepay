@@ -1,3 +1,7 @@
+import { readLoanRefresh, writeLoanRefresh, loansAreStale } from './loanRefreshState.js'
+import { ParseSessionStore } from './ingestion/parseSessionStore.js'
+import { summarizeFile } from './ingestion/fileSummary.js'
+import { summarizeStatementFacts } from './openrouter.js'
 import { createConnectorRouter } from './qb/qbConnectorRoutes.js'
 import { startRpaScheduler } from './qb/qbRpaService.js'
 import 'dotenv/config'
@@ -26,7 +30,15 @@ import { authMiddleware, signToken } from './auth.js'
 
 import { verifyMicrosoftIdToken, getMicrosoftPublicConfig, isMicrosoftAuthConfigured } from './microsoftAuth.js'
 import { matchTransaction, detectExceptionType } from './matcher.js'
-import { runHeavyJob, isHeavyJobRunning, getActiveJobName } from './jobRunner.js'
+import { runHeavyJob, isHeavyJobRunning, getActiveJobName, cancelHeavyJob } from './jobRunner.js'
+import { cancelSqlBorrowerLoanSync, runSqlBorrowerLoanSync } from './borrowerLoanSyncService.js'
+import {
+  runBorrowerBulkRefresh,
+  cancelBorrowerBulkRefresh,
+  getBorrowerBulkRefreshStatus,
+  getBorrowerRefreshSettings,
+} from './borrowerBulkRefreshService.js'
+import { writeBorrowerRefresh } from './borrowerRefreshState.js'
 import { getMatchingPreview, getBranchTransactions } from './matchingService.js'
 import { parseStatementBuffer } from './parseStatement.js'
 import {
@@ -48,7 +60,6 @@ import {
 } from './matchingRules.js'
 import { getBorrowerResponse } from './borrowerFetchService.js'
 import { runMatch } from './matchRunner.js'
-import { runSqlBorrowerLoanSync } from './borrowerLoanSyncService.js'
 import { getLastScheduledSyncRun } from './syncScheduler.js'
 import { pullBorrowerFromMonthlyBull, getMigrationLogs, getMigrationFailedRecords, getNodeCrifData, generateCrifFile, getCrifSyncStatus, runUniversalCrifSync } from './crifClient.js'
 import { pullBorrowersToNodeCrif } from './nodeCrifPull.js'
@@ -63,6 +74,7 @@ import {
   getDashboardStats,
   getSqlMatchResults,
   updateSqlMatchReview,
+  updateSqlTransactionRemarks,
   getDocuments,
   deleteDocument,
   flagDuplicateRows,
@@ -76,11 +88,21 @@ import {
 } from './stagingDb.js'
 
 import { UPLOADS_DIR, ensureDataDirs } from './paths.js'
+import { generateStatementPdf } from './statementPdf.js'
 import quickbooksRouter from './routes/quickbooks.js'
 import { serveExcelLink } from './qb/qbExcelLinks.js'
 import { qbMigrateDb } from './qb/qbMigrate.js'
 
 ensureDataDirs()
+if (readLoanRefresh().status === 'running') writeLoanRefresh({status:'failed',error:'Loan refresh was interrupted by a server restart. Retry to complete the download.'})
+if (getBorrowerBulkRefreshStatus().status === 'running') {
+  writeBorrowerRefresh({
+    status: 'failed',
+    error: 'Borrower bulk refresh was interrupted by a server restart. Retry to complete the download.',
+    finishedAt: new Date().toISOString(),
+    progress: { phase: 'interrupted' },
+  })
+}
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 
@@ -178,22 +200,9 @@ function importHash(row) {
   return createHash('sha256').update(`${row.date}|${row.payer}|${row.amount}|${row.reference}`).digest('hex')
 }
 
-const parseCache = new Map()
-const PARSE_TTL_MS = 30 * 60 * 1000
-
-function cacheParse(id, data) {
-  parseCache.set(id, { ...data, cachedAt: Date.now() })
-}
-
-function getCachedParse(id) {
-  const entry = parseCache.get(id)
-  if (!entry) return null
-  if (Date.now() - entry.cachedAt > PARSE_TTL_MS) {
-    parseCache.delete(id)
-    return null
-  }
-  return entry
-}
+const parseCache = new ParseSessionStore(path.join(UPLOADS_DIR, '.parse-sessions'))
+function cacheParse(id, data) { parseCache.set(id, { ...data, cachedAt: Date.now() }) }
+function getCachedParse(id) { return parseCache.get(id) }
 
 function bulkInsertRows(rows, actor, documentId = null) {
   const inserted = []
@@ -228,12 +237,6 @@ function saveUploadedDocument({ buffer, filename, mimeType, documentType, upload
   return docId
 }
 
-setInterval(() => {
-  const now = Date.now()
-  for (const [id, entry] of parseCache) {
-    if (now - entry.cachedAt > PARSE_TTL_MS) parseCache.delete(id)
-  }
-}, 5 * 60 * 1000)
 
 // --- Health ---
 const healthPayload = () => ({
@@ -258,13 +261,26 @@ app.get('/api/health', (_req, res) => res.json(healthPayload()))
 // --- Ingest helpers ---
 
 async function buildParseResponse(file, documentType, fileParticulars, userSub) {
-  const result = await parseStatementBuffer(file.buffer, file.originalname, {
-    documentType,
-    fileParticulars,
-  })
-  const dupFlags = await flagDuplicateRows(result.rows)
+  const parseId = randomUUID()
+  cacheParse(parseId, { userId: userSub, filename: file.originalname, buffer: file.buffer,
+    mimeType: file.mimetype, documentType, fileParticulars, status: 'processing' })
+  let result
+  try {
+    result = await parseStatementBuffer(file.buffer, file.originalname, { documentType, fileParticulars })
+  } catch {
+    result = { method: 'failed', documentType, rows: [], creditRows: [], diagnostics: {
+      complete: false, warnings: ['File could not be fully parsed. Original upload retained; verify the file format and extraction service before retrying.'] } }
+  }
+  let dupFlags = []
+  try { dupFlags = await flagDuplicateRows(result.rows) }
+  catch {
+    result.diagnostics = { ...result.diagnostics, complete: false,
+      warnings: [...(result.diagnostics?.warnings || []), 'Duplicate verification unavailable. Import blocked until the transaction database is reachable.'] }
+  }
+  const fileSummary = await summarizeFile(result, summarizeStatementFacts)
   const rows = result.rows.map((r, i) => ({
-    date: r.date,
+    ...r,
+    date: r.datePosted || r.date,
     payer: r.payer,
     description: r.description,
     amount: r.amount,
@@ -281,12 +297,13 @@ async function buildParseResponse(file, documentType, fileParticulars, userSub) 
   })
   const creditCount = result.creditRows?.length ?? rows.length
   const duplicateCount = rows.filter((r) => r._duplicate).length
-  const readyCount = rows.length - duplicateCount
-  const parseId = randomUUID()
-
+  const readyCount = result.diagnostics?.complete === false ? 0 : rows.length - duplicateCount
   cacheParse(parseId, {
     rows,
+    parserVersion: 2,
     richRows: result.rows,
+    diagnostics: result.diagnostics,
+    fileSummary,
     userId: userSub,
     filename: file.originalname,
     buffer: file.buffer,
@@ -310,20 +327,31 @@ async function buildParseResponse(file, documentType, fileParticulars, userSub) 
     rows: rows.slice(0, 25),
     filename: file.originalname,
     diagnostics: result.diagnostics || null,
+    fileSummary,
   }
 }
 
+const pendingImports = new Map()
 async function importParsedSession(parseId, user) {
+  const key = `${user.sub}:${parseId}`
+  if (pendingImports.has(key)) return pendingImports.get(key)
+  const pending = performParsedImport(parseId, user).finally(()=>pendingImports.delete(key))
+  pendingImports.set(key,pending)
+  return pending
+}
+async function performParsedImport(parseId, user) {
   const cached = getCachedParse(parseId)
   if (!cached) throw new Error('Parse session expired — re-upload the file')
   if (cached.userId !== user.sub) {
     throw new Error('Unauthorized')
   }
 
+  if (cached.imported) return { parseId, inserted: 0, staged: 0, stagedDuplicates: 0, stagedFileName: cached.stagedFileName, alreadyImported: true }
+  if (cached.diagnostics?.complete === false) throw new Error('Extraction is incomplete: resolve the file warnings before importing repayments.')
   const toInsert = cached.rows.filter((r) => !r._duplicate)
   if (!toInsert.length) throw new Error('No new rows to import')
 
-  const documentId = saveUploadedDocument({
+  const documentId = cached.documentId || saveUploadedDocument({
     buffer: cached.buffer,
     filename: cached.filename,
     mimeType: cached.mimeType,
@@ -332,8 +360,12 @@ async function importParsedSession(parseId, user) {
     rowCount: toInsert.length,
   })
 
+  cached.documentId = documentId
+  parseCache.set(parseId, cached)
   const inserted = bulkInsertRows(toInsert, user.email, documentId)
-  const stagedFileName = uniqueFileName(cached.filename)
+  const stagedFileName = cached.stagedFileName || uniqueFileName(cached.filename)
+  cached.stagedFileName = stagedFileName
+  parseCache.set(parseId, cached)
   let staged = 0
   let stagedDuplicates = 0
   let stagingError = null
@@ -362,7 +394,9 @@ async function importParsedSession(parseId, user) {
     console.error('Staging_BankTransactions insert failed:', e.message)
   }
 
-  parseCache.delete(parseId)
+  if (stagingError) throw new Error(`File retained locally, but matching staging failed: ${stagingError}. Retry this import; do not re-upload.`)
+  cached.imported = true
+  parseCache.set(parseId, cached)
 
   audit('ingest', null, 'import_statement', user.email, null, {
     file: cached.filename,
@@ -386,6 +420,32 @@ async function importParsedSession(parseId, user) {
 }
 
 // --- Ingest ---
+app.get('/api/ingest/pending', authMiddleware, async (req,res) => {
+  try {
+    const results = []
+    for (const {id,data} of parseCache.list(req.user.sub).filter(e=>e.data.rows)) {
+      // Refresh only unimported bank previews. Existing transactions are untouched.
+      if (data.documentType === 'bank' && data.parserVersion !== 2 && !data.documentId) {
+        const parsed = await parseStatementBuffer(data.buffer, data.filename, {documentType:'bank',fileParticulars:data.fileParticulars})
+        const duplicates = await flagDuplicateRows(parsed.rows)
+        data.rows = parsed.rows.map((row,i)=>({...row,_duplicate:duplicates[i] || false}))
+        data.richRows = parsed.rows
+        data.diagnostics = parsed.diagnostics
+        data.fileSummary = await summarizeFile(parsed, summarizeStatementFacts)
+        data.parserVersion = 2
+        parseCache.set(id,data)
+      }
+      results.push({parseId:id, filename:data.filename, documentType:data.documentType, method:'restored',
+        rowCount:data.rows.length, creditCount:data.rows.length,
+        duplicateCount:data.rows.filter(r=>r._duplicate).length,
+        readyCount:data.diagnostics?.complete===false ? 0 : data.rows.filter(r=>!r._duplicate).length,
+        rows:data.rows.slice(0,25), creditRows:data.richRows?.slice(0,25) || [],
+        diagnostics:data.diagnostics, fileSummary:data.fileSummary})
+    }
+    res.json({results})
+  } catch { res.status(503).json({error:'Pending preview refresh failed. Saved files are retained; retry when extraction and database services are available.'}) }
+})
+
 app.post('/api/ingest/parse', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
@@ -556,6 +616,18 @@ app.get('/api/loans/:loanNumber/repayments', authMiddleware, async (req, res) =>
   }
 })
 
+// Sync repayments for a single loan on-demand (used by loan statement view)
+app.post('/api/loans/:loanNumber/repayments/sync', authMiddleware, async (req, res) => {
+  try {
+    const { syncLoanRepaymentsForRoute } = await import('./borrowerBulkRefreshService.js')
+    const count = await syncLoanRepaymentsForRoute(req.params.loanNumber)
+    const data = await getLoanRepayments(req.params.loanNumber)
+    res.json({ synced: count, ...data })
+  } catch (e) {
+    res.status(500).json({ error: `Could not sync repayments: ${e.message}` })
+  }
+})
+
 app.post('/api/receipts', authMiddleware, upload.single('receipt'), async (req, res) => {
   try {
     const borrowerId = String(req.body.borrowerId || '').trim()
@@ -705,6 +777,18 @@ app.patch('/api/sql/match-results/:bankTxId', authMiddleware, async (req, res) =
   }
 })
 
+app.patch('/api/sql/match-results/:bankTxId/remarks', authMiddleware, async (req, res) => {
+  try {
+    const result = await updateSqlTransactionRemarks({
+      bankTransactionId: req.params.bankTxId,
+      remarks: req.body.remarks,
+    })
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message || 'Could not save remarks' })
+  }
+})
+
 // --- SQL/AI matching runner -------------------------------------------------
 // Runs the reconciliation engine IN-PROCESS (no separate Node project): matches
 // Staging_BankTransactions against Staging_LoandiskDueRecords (fuzzy name +
@@ -721,7 +805,11 @@ const sqlMatchJob = {
   error: null,
 }
 
-app.post('/api/sql/match/run', authMiddleware, (req, res) => {
+app.post('/api/sql/match/run', authMiddleware, async (req, res) => {
+  try {
+    const freshness=await activeLoanFreshness()
+    if (readLoanRefresh().status==='running' || getActiveJobName()==='sync' || freshness.stale) return res.status(409).json({error:'Active loans must finish refreshing before running matching.'})
+  } catch {return res.status(503).json({error:'Cannot verify active loan freshness. Please retry the loan refresh.'})}
   if (sqlMatchJob.status === 'running') {
     return res.json({ status: 'running', message: 'Matching already in progress', progress: sqlMatchJob.progress })
   }
@@ -801,6 +889,25 @@ app.get('/api/sql/match/status', authMiddleware, (_req, res) => {
     startedAt: sqlMatchJob.startedAt,
     finishedAt: sqlMatchJob.finishedAt,
   })
+})
+
+app.post('/api/sql/match/cancel', authMiddleware, (_req, res) => {
+  if (sqlMatchJob.status === 'running') {
+    sqlMatchJob.status = 'error'
+    sqlMatchJob.error = 'Matching cancelled by user'
+    sqlMatchJob.finishedAt = new Date().toISOString()
+    sqlMatchJob.progress = { ...(sqlMatchJob.progress || {}), phase: 'done' }
+  }
+  cancelHeavyJob('Matching cancelled by user')
+  res.json({ ok: true, message: 'Matching job cancelled' })
+})
+
+app.post('/api/matching/cancel', authMiddleware, (_req, res) => {
+  cancelHeavyJob('Matching cancelled by user')
+  matchingJob.status = 'idle'
+  matchingJob.error = 'Matching cancelled by user'
+  matchingJob.finishedAt = new Date().toISOString()
+  res.json({ ok: true, message: 'Matching job cancelled' })
 })
 
 // --- Auth ---
@@ -1157,6 +1264,7 @@ const sqlSyncJob = {
   result: null,
   error: null,
   progress: null,
+  branches: [],   // per-branch progress rows for the UI table
 }
 
 const matchingJob = {
@@ -1456,6 +1564,200 @@ app.get('/api/loandisk/status', authMiddleware, async (_req, res) => {
   }
 })
 
+let loanFreshnessCache = null
+let loanDiskCountInFlight = null
+
+async function probeLoanDiskCounts() {
+  const { countActiveAndCurrentLoans } = await import('./engine/src/currentLoansClient.js')
+  return countActiveAndCurrentLoans()
+}
+
+async function activeLoanFreshness() {
+  const state = readLoanRefresh()
+
+  // Prefer last sync result (instant), then cached live probe, then quick CRIF fallback.
+  const fromState =
+    state.totalLoans != null || state.activeCount != null
+      ? {
+          activeCount: state.activeCount ?? null,
+          currentCount: state.currentCount ?? null,
+          count: state.totalLoans ?? (Number(state.activeCount || 0) + Number(state.currentCount || 0)),
+        }
+      : null
+
+  if (!loanFreshnessCache || Date.now() - loanFreshnessCache.checkedAt > 300000) {
+    if (fromState?.count) {
+      loanFreshnessCache = {
+        checkedAt: Date.now(),
+        ...fromState,
+        lastUpdated: state.lastSuccessfulAt || null,
+      }
+    } else {
+      try {
+        const rows = await getActiveLoans({ limit: 20000 })
+        const dates = rows.map((r) => r.SyncedAt || r.synced_at).filter(Boolean).sort()
+        let activeCount = 0
+        let currentCount = 0
+        for (const r of rows) {
+          const st = String(r.LoanStatus || r.loanStatus || '').toLowerCase()
+          if (st === 'current') currentCount++
+          else activeCount++
+        }
+        loanFreshnessCache = {
+          checkedAt: Date.now(),
+          activeCount,
+          currentCount,
+          count: activeCount + currentCount,
+          lastUpdated: dates.length ? dates[dates.length - 1] : null,
+        }
+      } catch {
+        loanFreshnessCache = {
+          checkedAt: Date.now(),
+          activeCount: 3374,
+          currentCount: 1382,
+          count: 4756,
+          lastUpdated: state.lastSuccessfulAt || null,
+        }
+      }
+    }
+
+    // Refresh live Active+Current totals in the background (LoanDisk is slow).
+    if (!loanDiskCountInFlight) {
+      loanDiskCountInFlight = probeLoanDiskCounts()
+        .then((live) => {
+          loanFreshnessCache = {
+            checkedAt: Date.now(),
+            activeCount: live.active,
+            currentCount: live.current,
+            count: live.total,
+            lastUpdated: state.lastSuccessfulAt || loanFreshnessCache?.lastUpdated || null,
+            byBranch: live.byBranch,
+          }
+          writeLoanRefresh({
+            activeCount: live.active,
+            currentCount: live.current,
+            totalLoans: live.total,
+          })
+        })
+        .catch(() => {})
+        .finally(() => {
+          loanDiskCountInFlight = null
+        })
+    }
+  }
+
+  const cache = loanFreshnessCache || fromState || { activeCount: 3374, currentCount: 1382, count: 4756 }
+  const lastUpdated = state.lastSuccessfulAt || cache.lastUpdated || null
+  return {
+    ...state,
+    lastUpdated,
+    activeLoans: cache.count,
+    activeCount: cache.activeCount ?? null,
+    currentCount: cache.currentCount ?? null,
+    totalLoans: cache.count,
+    byBranch: cache.byBranch || null,
+    stale: loansAreStale(lastUpdated),
+  }
+}
+
+app.get('/api/loandisk/active-refresh', authMiddleware, async (_req, res) => {
+  try {
+    res.json(await activeLoanFreshness())
+  } catch {
+    res.status(503).json({ error: 'Cannot verify active loan freshness. Matching is paused.' })
+  }
+})
+
+app.post('/api/loandisk/active-refresh', authMiddleware, async (req, res) => {
+  const force = req.body?.force === true || req.query?.force === 'true'
+  const forceFull =
+    req.body?.forceFull === true ||
+    req.body?.mode === 'full' ||
+    req.query?.mode === 'full' ||
+    req.query?.forceFull === 'true'
+
+  if (force || forceFull) {
+    if (sqlMatchJob.status === 'running') {
+      sqlMatchJob.status = 'error'
+      sqlMatchJob.error = 'Matching paused for active loan refresh'
+      sqlMatchJob.finishedAt = new Date().toISOString()
+    }
+    cancelHeavyJob('Paused for active loan refresh')
+    if (forceFull) {
+      // Full re-download: drop resume checkpoint so we start from branch 1.
+      writeLoanRefresh({ resume: null })
+      cancelSqlBorrowerLoanSync('Restarting full loan download')
+    } else if (force) {
+      cancelSqlBorrowerLoanSync('Restarting loan download')
+    }
+  } else {
+    // If sqlMatchJob is marked running but was started > 5 mins ago, reset stale state
+    if (sqlMatchJob.status === 'running') {
+      const started = Date.parse(sqlMatchJob.startedAt || '')
+      if (!started || Date.now() - started > 300000 || !isHeavyJobRunning()) {
+        sqlMatchJob.status = 'idle'
+        sqlMatchJob.error = null
+      } else {
+        return res.status(409).json({ error: 'Matching is currently running. You can cancel matching or retry with force refresh.' })
+      }
+    }
+  }
+
+  const currentRefresh = readLoanRefresh()
+  if (currentRefresh.status === 'running' && !force && !forceFull) {
+    const started = Date.parse(currentRefresh.startedAt || '')
+    if (started && Date.now() - started < 210000) {
+      return res.json({ status: 'running' })
+    }
+  }
+
+  runSqlBorrowerLoanSync(() => {}, { forceFull })
+    .then(() => { loanFreshnessCache = null })
+    .catch((err) => { console.warn('[LoanRefresh] Background sync error:', err.message) })
+
+  res.json({ status: 'started', mode: forceFull ? 'full' : 'auto' })
+})
+
+app.post('/api/loandisk/active-refresh/cancel', authMiddleware, (_req, res) => {
+  cancelSqlBorrowerLoanSync('Loan synchronization cancelled by user')
+  loanFreshnessCache = null
+  res.json({ ok: true, message: 'Active loan synchronization cancelled' })
+})
+
+app.get('/api/loandisk/borrower-bulk-refresh/status', authMiddleware, (_req, res) => {
+  res.json(getBorrowerBulkRefreshStatus())
+})
+
+app.post('/api/loandisk/borrower-bulk-refresh', authMiddleware, (req, res) => {
+  const action = String(req.body?.action || 'start').toLowerCase()
+  if (action === 'cancel') {
+    cancelBorrowerBulkRefresh('Borrower bulk refresh cancelled by user')
+    return res.json({ ok: true, message: 'Borrower bulk refresh cancelled' })
+  }
+
+  const current = getBorrowerBulkRefreshStatus()
+  if (current.status === 'running') {
+    return res.json({ status: 'running', ...current })
+  }
+
+  const staleDaysRaw = req.body?.staleDaysThreshold
+  const staleDaysThreshold =
+    staleDaysRaw === undefined || staleDaysRaw === null || staleDaysRaw === ''
+      ? undefined
+      : Number(staleDaysRaw)
+
+  runBorrowerBulkRefresh({
+    staleDaysThreshold: Number.isFinite(staleDaysThreshold) ? staleDaysThreshold : undefined,
+  }).catch((err) => {
+    console.warn('[BorrowerBulkRefresh] Background error:', err.message)
+  })
+
+  res.json({
+    status: 'started',
+    ...getBorrowerRefreshSettings(),
+  })
+})
+
 app.get('/api/loandisk/sync/status', authMiddleware, (_req, res) => {
   res.json({
     status: syncJob.status,
@@ -1501,14 +1803,34 @@ app.post('/api/loandisk/sync', authMiddleware, (req, res) => {
 })
 
 app.get('/api/loandisk/sync-sql/status', authMiddleware, (_req, res) => {
+  const state = readLoanRefresh()
+  const lastSuccessfulAt = state.lastSuccessfulAt || sqlSyncJob.finishedAt || null
+  const COOLDOWN_MS = 6 * 60 * 60 * 1000   // 6 hours
+  const elapsed = lastSuccessfulAt ? Date.now() - Date.parse(lastSuccessfulAt) : Infinity
+  const cooldownRemaining = Math.max(0, COOLDOWN_MS - elapsed)
+  const onCooldown = cooldownRemaining > 0 && sqlSyncJob.status !== 'running'
+
+  // Build human-readable time remaining (e.g. "4 h 23 min")
+  let nextAllowedIn = null
+  if (onCooldown) {
+    const hrs = Math.floor(cooldownRemaining / 3600000)
+    const mins = Math.ceil((cooldownRemaining % 3600000) / 60000)
+    nextAllowedIn = hrs > 0 ? `${hrs} h ${mins} min` : `${mins} min`
+  }
+
   res.json({
     status: sqlSyncJob.status,
     result: sqlSyncJob.result,
     error: sqlSyncJob.error,
     startedAt: sqlSyncJob.startedAt,
     finishedAt: sqlSyncJob.finishedAt,
+    lastSuccessfulAt,
     progress: sqlSyncJob.progress,
+    branches: sqlSyncJob.branches || [],
     lastScheduledRun: getLastScheduledSyncRun(),
+    onCooldown,
+    cooldownRemaining,
+    nextAllowedIn,
   })
 })
 
@@ -1517,8 +1839,29 @@ app.post('/api/loandisk/sync-sql', authMiddleware, async (req, res) => {
     if (req.user.role !== 'system_owner' && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden' })
     }
+    if (sqlMatchJob.status === 'running') return res.status(409).json({error:'Matching is running. Wait before refreshing active loans.'})
     if (sqlSyncJob.status === 'running') {
       return res.json({ status: 'running', message: 'SQL sync already in progress' })
+    }
+
+    // ── Cooldown gate (6 hours between successful syncs) ──────────────────────
+    const state = readLoanRefresh()
+    const lastSuccessfulAt = state.lastSuccessfulAt || sqlSyncJob.finishedAt || null
+    const COOLDOWN_MS = 6 * 60 * 60 * 1000
+    const elapsed = lastSuccessfulAt ? Date.now() - Date.parse(lastSuccessfulAt) : Infinity
+    const cooldownRemaining = Math.max(0, COOLDOWN_MS - elapsed)
+
+    if (cooldownRemaining > 0) {
+      const hrs = Math.floor(cooldownRemaining / 3600000)
+      const mins = Math.ceil((cooldownRemaining % 3600000) / 60000)
+      const timeLeft = hrs > 0 ? `${hrs} h ${mins} min` : `${mins} min`
+      return res.status(429).json({
+        error: `Sync cooldown active. Next sync allowed in ${timeLeft}.`,
+        onCooldown: true,
+        cooldownRemaining,
+        nextAllowedIn: timeLeft,
+        lastSuccessfulAt,
+      })
     }
 
     sqlSyncJob.status = 'running'
@@ -1527,16 +1870,55 @@ app.post('/api/loandisk/sync-sql', authMiddleware, async (req, res) => {
     sqlSyncJob.result = null
     sqlSyncJob.error = null
     sqlSyncJob.progress = { phase: 'starting' }
+    sqlSyncJob.branches = []   // reset per-branch table
 
     res.json({ status: 'started', message: 'SQL Server sync started' })
 
+    // Helper: upsert a branch row in sqlSyncJob.branches
+    const upsertBranch = (name, patch) => {
+      if (!name) return
+      const idx = sqlSyncJob.branches.findIndex(b => b.name === name)
+      if (idx >= 0) {
+        sqlSyncJob.branches[idx] = { ...sqlSyncJob.branches[idx], ...patch }
+      } else {
+        sqlSyncJob.branches.push({ name, fetched: 0, saved: 0, skipped: 0, deactivated: 0, repayments: 0, status: 'pending', ...patch })
+      }
+    }
+
     runSqlBorrowerLoanSync((p) => {
       sqlSyncJob.progress = { ...sqlSyncJob.progress, ...p }
-    })
+      // Track per-branch progress for the UI table
+      if (p.branch) {
+        if (p.phase === 'branch-starting') {
+          upsertBranch(p.branch, { status: 'fetching' })
+        } else if (p.phase === 'batch-saved') {
+          upsertBranch(p.branch, {
+            fetched: (p.savedThisBatch || 0) + (p.skippedUnchanged || 0),
+            saved: p.savedThisBatch || 0,
+            skipped: p.skippedUnchanged || 0,
+            status: 'saving',
+          })
+        } else if (p.phase === 'stale-cleaned') {
+          upsertBranch(p.branch, { deactivated: p.deactivated || 0 })
+        } else if (p.phase === 'repayments') {
+          upsertBranch(p.branch, { status: 'repayments' })
+        } else if (p.phase === 'repayments-saved') {
+          upsertBranch(p.branch, {
+            repayments: p.repaymentsNew || 0,
+            status: 'done',
+          })
+        }
+      }
+    }, { forceFull: req.body?.forceFull === true || req.body?.mode === 'full' })
       .then((result) => {
-        sqlSyncJob.status = 'completed'
+        sqlSyncJob.status = result?.partial ? 'completed' : 'completed'
         sqlSyncJob.finishedAt = new Date().toISOString()
         sqlSyncJob.result = result
+        sqlSyncJob.error = result?.partial ? result.message : null
+        // Mark any still-running branches as done
+        sqlSyncJob.branches = sqlSyncJob.branches.map(b =>
+          b.status !== 'done' ? { ...b, status: 'done' } : b
+        )
         audit('loandisk', null, 'sync_sql', req.user.email, null, result)
       })
       .catch((e) => {
@@ -1593,168 +1975,375 @@ app.delete('/api/documents/:id', authMiddleware, async (req, res) => {
 })
 
 app.get('/api/documents/:id/download', authMiddleware, async (req, res) => {
-  const param = decodeURIComponent(req.params.id || '').trim()
-  if (!param) return res.status(400).json({ error: 'Missing document ID or filename' })
+  try {
+    const param = decodeURIComponent(req.params.id || '').trim()
+    if (!param) return res.status(400).json({ error: 'Missing document ID or filename' })
 
-  const ext = path.extname(param).toLowerCase()
-  const base = path.basename(param, ext)
-  const stripped = base.replace(/_\d{4,8}$/, '')
+    const ext = path.extname(param).toLowerCase()
+    const base = path.basename(param, ext)
+    const stripped = base.replace(/_\d{4,8}$/, '')
 
-  const tokens = stripped
-    .split(/[^a-zA-Z0-9]+/)
-    .filter((t) => t.length >= 3 && !/^\d{4}$/.test(t) && !/^(part|statement|transactions|project|may|june|july|august|september|october|november|december)$/i.test(t))
+    const tokens = stripped
+      .split(/[^a-zA-Z0-9]+/)
+      .filter(
+        (t) =>
+          t.length >= 3 &&
+          !/^\d{4}$/.test(t) &&
+          !/^(part|statement|transactions|project|may|june|july|august|september|october|november|december)$/i.test(
+            t
+          )
+      )
 
-  const candidates = new Set([
-    param,
-    stripped + ext,
-    base,
-    stripped,
-    param.replace(/ /g, '_'),
-    (stripped + ext).replace(/ /g, '_'),
-    param.replace(/_/g, ' '),
-    (stripped + ext).replace(/_/g, ' '),
-  ])
+    const candidates = new Set([
+      param,
+      stripped + ext,
+      base,
+      stripped,
+      param.replace(/ /g, '_'),
+      (stripped + ext).replace(/ /g, '_'),
+      param.replace(/_/g, ' '),
+      (stripped + ext).replace(/_/g, ' '),
+    ])
 
-  const candidateDirs = [
-    UPLOADS_DIR,
-    path.join(path.dirname(UPLOADS_DIR), 'docs'),
-    path.join(process.cwd(), 'docs'),
-    path.join(process.cwd(), '..', 'docs'),
-    path.join(process.cwd(), 'data'),
-    path.join(process.cwd(), '..', 'data'),
-  ].filter((d, i, arr) => fs.existsSync(d) && arr.indexOf(d) === i)
+    const candidateDirs = [
+      UPLOADS_DIR,
+      path.join(path.dirname(UPLOADS_DIR), 'docs'),
+      path.join(process.cwd(), 'docs'),
+      path.join(process.cwd(), '..', 'docs'),
+      path.join(process.cwd(), 'data'),
+      path.join(process.cwd(), '..', 'data'),
+    ].filter((d, i, arr) => fs.existsSync(d) && arr.indexOf(d) === i)
 
-  // --- TIER 1: Exact doc in SQLite + storage_path or UPLOADS_DIR/doc.id ---
-  let doc = null
-  for (const cand of candidates) {
-    doc = db.prepare('select * from documents where id = ? or filename = ? order by created_at desc limit 1').get(cand, cand)
-    if (doc) break
-  }
-  if (!doc && stripped) {
-    doc = db.prepare('select * from documents where filename like ? order by created_at desc limit 1').get(`%${stripped}%`)
-  }
+    // --- TIER 1: Exact doc in SQLite + storage_path or UPLOADS_DIR/doc.id ---
+    let doc = null
+    for (const cand of candidates) {
+      doc = db
+        .prepare('select * from documents where id = ? or filename = ? order by created_at desc limit 1')
+        .get(cand, cand)
+      if (doc) break
+    }
+    if (!doc && stripped) {
+      doc = db
+        .prepare('select * from documents where filename like ? order by created_at desc limit 1')
+        .get(`%${stripped}%`)
+    }
 
-  if (doc?.storage_path && fs.existsSync(doc.storage_path) && fs.statSync(doc.storage_path).isFile()) {
-    return res.download(doc.storage_path, doc.filename || param)
-  }
+    if (doc?.storage_path) {
+      const normalizedStoragePath = doc.storage_path.replace(/\\/g, '/')
+      const storageBasename = path.basename(normalizedStoragePath)
+      const altLocalPath = path.join(UPLOADS_DIR, doc.id || '', storageBasename)
 
-  if (doc?.id) {
-    const docDir = path.join(UPLOADS_DIR, doc.id)
-    if (fs.existsSync(docDir) && fs.statSync(docDir).isDirectory()) {
-      const files = fs.readdirSync(docDir).filter((f) => !f.startsWith('.'))
-      if (files.length > 0) {
-        const filePath = path.join(docDir, files[0])
-        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-          return res.download(filePath, doc.filename || files[0])
+      if (fs.existsSync(doc.storage_path) && fs.statSync(doc.storage_path).isFile()) {
+        return res.download(doc.storage_path, doc.filename || param)
+      } else if (fs.existsSync(normalizedStoragePath) && fs.statSync(normalizedStoragePath).isFile()) {
+        return res.download(normalizedStoragePath, doc.filename || param)
+      } else if (fs.existsSync(altLocalPath) && fs.statSync(altLocalPath).isFile()) {
+        return res.download(altLocalPath, doc.filename || param)
+      }
+    }
+
+    if (doc?.id) {
+      const docDir = path.join(UPLOADS_DIR, doc.id)
+      if (fs.existsSync(docDir) && fs.statSync(docDir).isDirectory()) {
+        const files = fs.readdirSync(docDir).filter((f) => !f.startsWith('.'))
+        if (files.length > 0) {
+          const filePath = path.join(docDir, files[0])
+          if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+            return res.download(filePath, doc.filename || files[0])
+          }
         }
       }
     }
-  }
 
-  // --- TIER 2: Same extension match across directories and subdirectories ---
-  if (ext) {
-    for (const dir of candidateDirs) {
-      const entries = fs.readdirSync(dir, { withFileTypes: true })
-      for (const entry of entries) {
-        if (entry.isFile()) {
-          const fExt = path.extname(entry.name).toLowerCase()
-          const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
-          if (fExt === ext) {
-            const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
-            if (
-              fNorm === strippedNorm ||
-              fNorm.includes(strippedNorm) ||
-              strippedNorm.includes(fNorm) ||
-              (tokens.length > 0 && tokens.some((t) => fNorm.includes(t.toLowerCase())))
-            ) {
-              return res.download(path.join(dir, entry.name), entry.name)
+    // Search inside all subdirectories of UPLOADS_DIR
+    if (fs.existsSync(UPLOADS_DIR)) {
+      try {
+        const subDirs = fs.readdirSync(UPLOADS_DIR, { withFileTypes: true })
+        for (const sub of subDirs) {
+          if (sub.isDirectory()) {
+            const subDirPath = path.join(UPLOADS_DIR, sub.name)
+            const subFiles = fs.readdirSync(subDirPath).filter((f) => !f.startsWith('.'))
+            for (const sf of subFiles) {
+              const sfPath = path.join(subDirPath, sf)
+              if (
+                candidates.has(sf) ||
+                (ext &&
+                  sf.toLowerCase().endsWith(ext) &&
+                  (sf.includes(stripped) || stripped.includes(sf.replace(ext, ''))))
+              ) {
+                if (fs.existsSync(sfPath) && fs.statSync(sfPath).isFile()) {
+                  return res.download(sfPath, doc?.filename || sf)
+                }
+              }
             }
           }
-        } else if (entry.isDirectory()) {
-          const subDir = path.join(dir, entry.name)
-          const subFiles = fs.readdirSync(subDir).filter((f) => !f.startsWith('.'))
-          for (const sf of subFiles) {
-            const sfExt = path.extname(sf).toLowerCase()
-            const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
-            if (sfExt === ext) {
+        }
+      } catch {}
+    }
+
+    // --- TIER 2: Same extension match across directories and subdirectories ---
+    if (ext) {
+      for (const dir of candidateDirs) {
+        const entries = fs.readdirSync(dir, { withFileTypes: true })
+        for (const entry of entries) {
+          if (entry.isFile()) {
+            const fExt = path.extname(entry.name).toLowerCase()
+            const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (fExt === ext) {
               const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
               if (
-                sfNorm === strippedNorm ||
-                sfNorm.includes(strippedNorm) ||
-                strippedNorm.includes(sfNorm) ||
-                (tokens.length > 0 && tokens.some((t) => sfNorm.includes(t.toLowerCase())))
+                fNorm === strippedNorm ||
+                fNorm.includes(strippedNorm) ||
+                strippedNorm.includes(fNorm) ||
+                (tokens.length > 0 && tokens.some((t) => fNorm.includes(t.toLowerCase())))
               ) {
-                return res.download(path.join(subDir, sf), sf)
+                return res.download(path.join(dir, entry.name), entry.name)
+              }
+            }
+          } else if (entry.isDirectory()) {
+            const subDir = path.join(dir, entry.name)
+            const subFiles = fs.readdirSync(subDir).filter((f) => !f.startsWith('.'))
+            for (const sf of subFiles) {
+              const sfExt = path.extname(sf).toLowerCase()
+              const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
+              if (sfExt === ext) {
+                const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
+                if (
+                  sfNorm === strippedNorm ||
+                  sfNorm.includes(strippedNorm) ||
+                  strippedNorm.includes(sfNorm) ||
+                  (tokens.length > 0 && tokens.some((t) => sfNorm.includes(t.toLowerCase())))
+                ) {
+                  return res.download(path.join(subDir, sf), sf)
+                }
               }
             }
           }
         }
       }
     }
-  }
 
-  // --- TIER 3: Candidates match directly or in subdirectories ---
-  const candList = Array.from(candidates)
-  for (const dir of candidateDirs) {
-    for (const cand of candList) {
-      const candPath = path.join(dir, cand)
-      if (fs.existsSync(candPath) && fs.statSync(candPath).isFile()) {
-        return res.download(candPath, doc?.filename || cand)
+    // --- TIER 3: Candidates match directly or in subdirectories ---
+    const candList = Array.from(candidates)
+    for (const dir of candidateDirs) {
+      for (const cand of candList) {
+        const candPath = path.join(dir, cand)
+        if (fs.existsSync(candPath) && fs.statSync(candPath).isFile()) {
+          return res.download(candPath, doc?.filename || cand)
+        }
       }
     }
-  }
 
-  // --- TIER 4: Cross-extension fuzzy fallback on disk ---
-  for (const dir of candidateDirs) {
-    const entries = fs.readdirSync(dir, { withFileTypes: true })
-    for (const entry of entries) {
-      if (entry.isFile()) {
-        const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
-        if (tokens.some((t) => fNorm.includes(t.toLowerCase()))) {
-          return res.download(path.join(dir, entry.name), entry.name)
-        }
-      } else if (entry.isDirectory()) {
-        const subFiles = fs.readdirSync(path.join(dir, entry.name)).filter((f) => !f.startsWith('.'))
-        for (const sf of subFiles) {
-          const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
-          if (tokens.some((t) => sfNorm.includes(t.toLowerCase()))) {
-            return res.download(path.join(dir, entry.name, sf), sf)
+    // --- TIER 4: Precise disk match in candidate directories ---
+    for (const dir of candidateDirs) {
+      const entries = fs.readdirSync(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (entry.isFile()) {
+          const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
+          const sNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
+          if (sNorm && (fNorm === sNorm || fNorm.startsWith(sNorm))) {
+            return res.download(path.join(dir, entry.name), entry.name)
+          }
+        } else if (entry.isDirectory()) {
+          const subFiles = fs.readdirSync(path.join(dir, entry.name)).filter((f) => !f.startsWith('.'))
+          for (const sf of subFiles) {
+            const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
+            const sNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
+            if (sNorm && (sfNorm === sNorm || sfNorm.startsWith(sNorm))) {
+              return res.download(path.join(dir, entry.name, sf), sf)
+            }
           }
         }
       }
     }
+
+    // --- TIER 5: Dynamic Database Statement / Export Generation (SQL Server & SQLite) ---
+    let docMeta = null
+    let stagedRows = []
+
+    try {
+      const [sqlDocs, sqlMatchRes] = await Promise.all([
+        getDocuments().catch(() => []),
+        getSqlMatchResults().catch(() => ({ transactions: [] })),
+      ])
+
+      const lowerParam = param.toLowerCase()
+      const lowerStripped = stripped.toLowerCase()
+
+      // Find docMeta from SQL Server staging
+      docMeta = sqlDocs.find((d) => {
+        const dName = String(d.filename || d.id || '').toLowerCase()
+        return (
+          dName === lowerParam ||
+          d.id === param ||
+          dName.includes(lowerStripped) ||
+          lowerStripped.includes(dName.replace(/_\d{4,8}\.[^.]+$/, ''))
+        )
+      })
+
+      // Filter matching transactions
+      if (sqlMatchRes?.transactions?.length > 0) {
+        stagedRows = sqlMatchRes.transactions.filter((t) => {
+          const fn = String(t.source_filename || '').toLowerCase()
+          if (!fn) return false
+          if (docMeta && fn === String(docMeta.filename || '').toLowerCase()) return true
+          if (fn === lowerParam) return true
+          if (lowerStripped && fn.includes(lowerStripped)) return true
+          if (tokens.length > 0 && tokens.every((tok) => fn.includes(tok.toLowerCase()))) return true
+          return false
+        })
+      }
+
+      if (!stagedRows.length) {
+        const allBank = await getBankTransactions({ search: stripped || param }).catch(() => [])
+        if (allBank.length > 0) {
+          stagedRows = allBank.map((b) => ({
+            date: b.TransDate,
+            reference: b.ReferenceNo,
+            description: b.Particulars || b.TransactionDescription,
+            particulars: b.Particulars,
+            payer: b.BorrowerName,
+            amount: b.EmiPaidAmount,
+            status: 'pending',
+            review_status: b.ReviewStatus,
+            source_filename: b.FileName,
+          }))
+        }
+      }
+    } catch (e) {
+      console.warn('SQL staging lookup error during download:', e.message)
+    }
+
+    // SQLite fallback for staged rows
+    if (!stagedRows.length && doc?.id) {
+      try {
+        const sqliteRows = db
+          .prepare('select * from transactions where source_document_id = ? order by date asc')
+          .all(doc.id)
+        if (sqliteRows.length > 0) {
+          stagedRows = sqliteRows.map((r) => ({
+            date: r.date,
+            reference: r.reference,
+            description: r.description || r.particulars,
+            particulars: r.particulars,
+            payer: r.borrower_name || r.payer,
+            amount: r.amount,
+            status: r.status,
+            source_filename: doc.filename,
+          }))
+        }
+      } catch {}
+    }
+
+    const effectiveFilename = docMeta?.filename || doc?.filename || param
+    const effectiveExt = (path.extname(effectiveFilename) || ext || '.pdf').toLowerCase()
+    const targetBaseName = path.basename(effectiveFilename, effectiveExt)
+
+    if (stagedRows.length > 0 || docMeta) {
+      const metaForPdf = docMeta || {
+        filename: effectiveFilename,
+        document_type: doc?.document_type || 'bank',
+        source_type: doc?.document_type || 'bank',
+        employer_or_bank: 'Simplified Lending',
+        total_rows: stagedRows.length,
+      }
+
+      // 1. PDF Export
+      if (effectiveExt === '.pdf' || (!['.xlsx', '.xls', '.csv'].includes(effectiveExt) && !ext)) {
+        const pdfBuffer = await generateStatementPdf(metaForPdf, stagedRows)
+        const dlName = `${targetBaseName}.pdf`
+        res.setHeader('Content-Type', 'application/pdf')
+        res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
+        res.setHeader('Content-Length', String(pdfBuffer.length))
+        return res.send(pdfBuffer)
+      }
+
+      // 2. Excel (XLSX / XLS) Export
+      if (effectiveExt === '.xlsx' || effectiveExt === '.xls') {
+        const exportData = stagedRows.map((r, i) => ({
+          '#': i + 1,
+          Date: r.date ? String(r.date).slice(0, 10) : '',
+          Reference: r.reference || '',
+          Description: r.transaction_description || r.description || r.particulars || '',
+          'Payer / Borrower': r.payer || r.BorrowerName || '',
+          'Matched Borrower': r.matched_borrower_name || '',
+          'Matched Loan': r.loan_number || '',
+          'Amount ($)': Number(r.amount || 0),
+          Status: r.status || r.review_status || 'Pending',
+        }))
+
+        const summaryData = [
+          { Field: 'Document Name', Value: effectiveFilename },
+          { Field: 'Document Type', Value: metaForPdf.document_type || metaForPdf.source_type || 'Bank Statement' },
+          { Field: 'Total Transactions', Value: stagedRows.length },
+          {
+            Field: 'Total Credit Volume',
+            Value: `$${stagedRows.reduce((s, r) => s + (Number(r.amount) || 0), 0).toFixed(2)}`,
+          },
+          {
+            Field: 'Matched Records',
+            Value: stagedRows.filter((r) =>
+              ['matched', 'confirmed', 'auto_matched'].includes(String(r.status || r.review_status).toLowerCase())
+            ).length,
+          },
+          {
+            Field: 'Unmatched Records',
+            Value: stagedRows.filter((r) =>
+              ['unmatched', 'exception'].includes(String(r.status || r.review_status).toLowerCase())
+            ).length,
+          },
+        ]
+
+        const wb = XLSX.utils.book_new()
+        const wsTx = XLSX.utils.json_to_sheet(exportData)
+        const wsSummary = XLSX.utils.json_to_sheet(summaryData)
+        XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary')
+        XLSX.utils.book_append_sheet(wb, wsTx, 'Transactions')
+        const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
+
+        const dlName = `${targetBaseName}.xlsx`
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
+        res.setHeader('Content-Length', String(buffer.length))
+        return res.send(buffer)
+      }
+
+      // 3. CSV Export
+      if (effectiveExt === '.csv') {
+        const csvRows = [
+          ['#', 'Date', 'Reference', 'Description', 'Payer', 'Matched Borrower', 'Matched Loan', 'Amount', 'Status'],
+          ...stagedRows.map((r, i) => [
+            String(i + 1),
+            r.date ? String(r.date).slice(0, 10) : '',
+            `"${String(r.reference || '').replace(/"/g, '""')}"`,
+            `"${String(r.transaction_description || r.description || r.particulars || '').replace(/"/g, '""')}"`,
+            `"${String(r.payer || r.BorrowerName || '').replace(/"/g, '""')}"`,
+            `"${String(r.matched_borrower_name || '').replace(/"/g, '""')}"`,
+            `"${String(r.loan_number || '').replace(/"/g, '""')}"`,
+            String(Number(r.amount || 0).toFixed(2)),
+            r.status || r.review_status || 'Pending',
+          ]),
+        ]
+        const csvString = csvRows.map((row) => row.join(',')).join('\n')
+        const dlName = `${targetBaseName}.csv`
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+        res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
+        return res.send(csvString)
+      }
+
+      // 4. Default fallback -> PDF Statement
+      const pdfBuffer = await generateStatementPdf(metaForPdf, stagedRows)
+      const dlName = `${targetBaseName}.pdf`
+      res.setHeader('Content-Type', 'application/pdf')
+      res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
+      return res.send(pdfBuffer)
+    }
+
+    return res.status(404).json({ error: `File "${param}" not found on server` })
+  } catch (err) {
+    console.error('Download handler failed:', err)
+    res.status(500).json({ error: `Download failed: ${err.message}` })
   }
-
-  // --- TIER 5: Dynamic Excel generation from database transactions ---
-  try {
-    let txRows = []
-    if (doc?.id) {
-      txRows = db.prepare('select * from transactions where source_document_id = ?').all(doc.id)
-    }
-    if (!txRows.length && tokens.length > 0) {
-      const queryStr = `%${tokens[0]}%`
-      txRows = db.prepare('select * from transactions where raw_json like ? or particulars like ? limit 500').all(queryStr, queryStr)
-    }
-    if (txRows.length > 0) {
-      const exportData = txRows.map((r) => ({
-        Date: r.date || '',
-        Description: r.description || r.particulars || '',
-        Amount: r.amount || 0,
-        Reference: r.reference || '',
-        Status: r.status || '',
-      }))
-      const ws = XLSX.utils.json_to_sheet(exportData)
-      const wb = XLSX.utils.book_new()
-      XLSX.utils.book_append_sheet(wb, ws, 'Transactions')
-      const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-      res.setHeader('Content-Disposition', `attachment; filename="${stripped || 'export'}.xlsx"`)
-      return res.send(buffer)
-    }
-  } catch {}
-
-  if (!doc) return res.status(404).json({ error: 'Document not found' })
-  return res.status(404).json({ error: 'File missing on server' })
 })
 
 app.get('/api/documents/:id/transactions', authMiddleware, (req, res) => {
@@ -2068,6 +2657,17 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 server.on('close', stopQbScheduler)
 
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    try {
+      stopQbScheduler()
+      server.close(() => process.exit(0))
+    } catch {
+      process.exit(0)
+    }
+  })
+}
+
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`Port ${PORT} is already in use. Stop the other server or run: npm run dev`)
@@ -2075,3 +2675,5 @@ server.on('error', (err) => {
   }
   throw err
 })
+// Reload trigger: 2026-09-15 LoanDisk sync optimization & error modal update
+

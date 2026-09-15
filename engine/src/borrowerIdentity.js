@@ -58,6 +58,12 @@ export function createIdentityIndex(groups, history = []) {
       add(index.compact, tokens.join(''), group)
       // Rotation supports surname-first compound surnames without granting arbitrary subsets exact status.
       for (let i = 1; i < tokens.length; i++) add(index.compact, [...tokens.slice(i), ...tokens.slice(0, i)].join(''), group)
+      // When loan name contains middle name(s), also index first + last name directly
+      if (tokens.length > 2) {
+        const fl = [tokens[0], tokens[tokens.length - 1]]
+        add(index.compact, fl.join(''), group)
+        add(index.compact, [fl[1], fl[0]].join(''), group)
+      }
       for (const token of new Set(tokens)) {
         add(index, token, group)
         add(index.phonetic, doubleMetaphone(token).primary, group)
@@ -98,6 +104,8 @@ export function identityNameScore(input, target, floor = 0.7) {
   if ((ca === cb || rotateExact || [...a].sort().join(' ') === [...b].sort().join(' ')) && b.length >= 2 && b.every((t) => t.length > 1)) {
     return { score: 99, nameKind: 'exact_full', strongIdentity: true }
   }
+  // First + last may match independently while middle names do not.
+  // That is a review-tier identity, not a same-person auto-match.
   // Bank fields can truncate a compound surname. Three exact, ordered full
   // tokens from the beginning of the master name remain strong evidence.
   if (a.length >= 3 && a.length < b.length && a.every((t, i) => t.length > 1 && t === b[i])) {

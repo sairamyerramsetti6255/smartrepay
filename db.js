@@ -35,6 +35,31 @@ function migrateDb() {
   if (tableExists('loans') && !columnExists('loans', 'emi')) {
     db.exec('alter table loans add column emi real')
   }
+  if (tableExists('loans') && !columnExists('loans', 'synced_at')) {
+    db.exec('alter table loans add column synced_at text')
+  }
+  if (tableExists('loans') && !columnExists('loans', 'fingerprint')) {
+    db.exec('alter table loans add column fingerprint text')
+  }
+  if (!tableExists('loan_repayments')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS loan_repayments (
+        id TEXT PRIMARY KEY,
+        loan_number TEXT NOT NULL,
+        borrower_id TEXT REFERENCES borrowers(id),
+        repayment_id_ext TEXT,
+        date TEXT,
+        amount REAL,
+        reference TEXT,
+        source TEXT DEFAULT 'loandisk',
+        raw TEXT,
+        synced_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(loan_number, repayment_id_ext)
+      )
+    `)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_loan_repayments_loan ON loan_repayments(loan_number)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_loan_repayments_date ON loan_repayments(date)')
+  }
 }
 
 export function resetAppData() {

@@ -1,3 +1,4 @@
+import { extractPositionedBank } from './ingestion/bankPdf.js'
 import { PDFParse } from 'pdf-parse'
 import { extractNameFromParticulars, parsePipeParticulars } from './particularsParse.js'
 import { extractFromTextWithAI, extractFromImageWithAI } from './openrouter.js'
@@ -292,120 +293,19 @@ function toEmployerImportRows(rows) {
 
 // --- Bank statement parser ---
 
-function cleanBankText(text) {
-  return text
-    .replace(/Important Notice:[\s\S]*?(?=(?:-- \d+ of \d+ --|$))/gi, '\n')
-    .replace(/Conditions of Account Operation:[\s\S]*?(?=(?:-- \d+ of \d+ --|$))/gi, '\n')
-    .replace(/ONE JFK WEST[\s\S]*?(?:-- \d+ of \d+ --|\n(?=\d{1,2}\/\d{1,2}\/\d{2}))/gi, '\n')
-    .replace(/SIMPLIFIED LENDING LIMITED[\s\S]*?AC\.\s*STATUS:\s*NORM/gi, '\n')
-    .replace(/-- \d+ of \d+ --/gi, '\n')
-    .replace(/Page\.\s*\d+\s+of\s*\d+/gi, '\n')
-    .replace(/Date Posted\s+Value[\s\S]*?Balance\n/gi, '\n')
-    .replace(/Detailed Client Statement/gi, '\n')
-    .replace(/Balance Brought Forward[^\n]*/gi, '\n')
-    .replace(/Balance Carried Forward[^\n]*/gi, '\n')
-    .replace(/Statement Message Items Amount[\s\S]*?Total Value Added Taxes[^\n]*/gi, '\n')
-    .replace(/Dr\s*=\s*Overdrawn Balance/gi, ' ')
-    .replace(/(?:Shirley Street|Village Road|John F\. Kennedy|Head Office|Carmichael Road|Freeport|Bimini|Eleuthera|San Salvador|Inagua|Customer Care|Mangrove Cay|Kemp's Bay|Cat Island)[^\n]*\(\d{3}\)\d{3}-\d{4}/gi, '\n')
-}
-
-function groupBankBlocks(text) {
-  const lines = cleanBankText(text)
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-
-  const txStart = /^\d{1,2}\/\d{1,2}\/\d{2}\s+\d{1,2}\/\d{1,2}\/\d{2}\s+\S+/
-  const blocks = []
-  let current = null
-
-  for (const line of lines) {
-    if (txStart.test(line)) {
-      if (current) blocks.push(current)
-      current = line
-    } else if (current) {
-      current += ` ${line}`
-    }
-  }
-  if (current) blocks.push(current)
-  return blocks
-}
-
-function parseBankBlock(block) {
-  const head = block.match(/^(\d{1,2}\/\d{1,2}\/\d{2})\s+(\d{1,2}\/\d{1,2}\/\d{2})\s+(\S+)\s+(.*)$/)
-  if (!head) return null
-
-  const [, datePosted, valueDate, reference, rest] = head
-  const amounts = [...rest.matchAll(/([\d,]+\.\d{2})/g)].map((m) => m[1])
-  if (amounts.length < 2) return null
-
-  const txnAmount = parseAmount(amounts[amounts.length - 2])
-  const balance = parseAmount(amounts[amounts.length - 1])
-
-  let particulars = rest
-  for (let i = amounts.length - 1; i >= amounts.length - 2; i--) {
-    const idx = particulars.lastIndexOf(amounts[i])
-    if (idx >= 0) {
-      particulars = particulars.slice(0, idx) + particulars.slice(idx + amounts[i].length)
-    }
-  }
-
-  particulars = particulars
-    .replace(/Dr\s*=\s*Overdrawn Balance/gi, '')
-    .replace(/Important Notice:[\s\S]*$/gi, '')
-    .replace(/Conditions of Account[\s\S]*$/gi, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  if (!particulars.includes('|')) {
-    particulars = particulars.replace(/\s+[A-Za-z]{1,12}$/, '').trim()
-  }
-  if (!particulars || SKIP_PARTICULARS.test(particulars)) return null
-
-  return {
-    datePosted: normalizeBankDate(datePosted),
-    valueDate: normalizeBankDate(valueDate),
-    reference,
-    particulars,
-    creditAmount: txnAmount,
-    balance,
-    name: extractNameFromParticulars(particulars),
-  }
-}
-
-function filterBankCredits(rows) {
-  let prevBalance = null
-  const credits = []
-
-  for (const row of rows) {
-    if (prevBalance === null) {
-      prevBalance = row.balance
-      continue
-    }
-    const delta = row.balance - prevBalance
-    const isCredit = Math.abs(delta - row.creditAmount) < 0.02
-    if (isCredit) credits.push(row)
-    prevBalance = row.balance
-  }
-
-  if (credits.length) return credits
-
-  // Fallback: positive txn amounts when balance-delta classification fails
-  return rows.filter((r) => r.creditAmount > 0)
-}
-
 function toBankImportRows(creditRows) {
   return creditRows.map((r) => {
     const parsed = parsePipeParticulars(r.particulars)
     const borrowerName = r.name || parsed.borrowerName || ''
     return {
+      ...r,
       datePosted: r.datePosted,
       valueDate: r.valueDate,
       reference: r.reference,
       particulars: r.particulars,
       creditAmount: r.creditAmount,
       name: borrowerName,
-      date: r.valueDate,
+      date: r.datePosted,
       payer: borrowerName,
       transactionDescription: parsed.description,
       description: r.particulars,
@@ -444,18 +344,23 @@ export async function parsePdfBuffer(buffer, filename = 'statement.pdf', options
 
     // 2. Try deterministic bank statement parsing
     if ((forceBank || !forceEmployer) && rawText.length > 0) {
-      const parsed = groupBankBlocks(rawText).map(parseBankBlock).filter(Boolean)
-      const creditRows = filterBankCredits(parsed)
-      if (creditRows.length) {
+      const extracted = await extractPositionedBank(parser)
+      if (extracted.recognizedPages) {
+        const creditRows = extracted.rows.filter(r => r.direction === 'credit')
         return {
-          method: 'pdf',
-          source: 'bank',
-          documentType: 'bank',
-          creditRows,
-          rows: toBankImportRows(creditRows),
+          method: 'pdf', source: 'bank', documentType: 'bank',
+          creditRows, rows: toBankImportRows(creditRows),
+          extractedRows: extracted.rows, diagnostics: extracted.diagnostics,
         }
       }
+      // A bank layout without identifiable columns is not safe to import.
+      if (forceBank || BANK_MARKERS.test(rawText)) {
+        return { method: 'pdf', source: 'bank', documentType: 'bank', creditRows: [], rows: [],
+          diagnostics: { complete: false, warnings: ['Bank debit/credit columns could not be verified. Supply a searchable bank PDF or a bank CSV with explicit credit/debit columns.'] } }
+      }
     }
+
+    if (forceBank) return { method: 'pdf', source: 'bank', documentType: 'bank', creditRows: [], rows: [], diagnostics: { complete: false, warnings: ['Scanned bank statement requires verified credit/debit columns. Upload the bank CSV or searchable PDF.'] } }
 
     // 3. Fallback: try employer parsing on rawText if not yet tried
     if (rawText.length > 0) {
@@ -511,13 +416,15 @@ export async function parsePdfBuffer(buffer, filename = 'statement.pdf', options
     if (process.env.OPENROUTER_API_KEY) {
       try {
         const screenshotResult = await parser.getScreenshot({ imageBuffer: true, imageDataUrl: true })
-        const firstPage = screenshotResult.pages?.[0]
-        if (firstPage?.data && firstPage.data.length > 0) {
-          const imgBuffer = Buffer.from(firstPage.data)
-          const aiRows = await extractFromImageWithAI(imgBuffer, 'image/png', {
+        const aiRows = []
+        for (const page of screenshotResult.pages || []) {
+          if (!page.data?.length) throw new Error('PDF page image unavailable')
+          aiRows.push(...await extractFromImageWithAI(Buffer.from(page.data), 'image/png', {
             documentType: documentType || (detected === 'employer' ? 'employer' : 'bank'),
             fileParticulars,
-          })
+          }))
+        }
+        {
           if (aiRows.length) {
             const mappedRows = aiRows.map((r) => ({
               datePosted: r.date,

@@ -61,9 +61,16 @@ export const config = {
         .split(',')
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isFinite(n)),
-      // advanced_search_loans presigns S3 file URLs server-side and is slow for
-      // big branches, so it gets a much longer per-request timeout.
-      searchTimeoutMs: optionalNumber('LOANDISK_SEARCH_TIMEOUT_MS', 180_000),
+      // advanced_search_loans is slow on large branches. Prefer smaller pages + longer
+      // timeout: page size 100 typically completes in ~55s; 500 often exceeds 60s.
+      searchTimeoutMs: optionalNumber('LOANDISK_SEARCH_TIMEOUT_MS', 120_000),
+      // Larger pages = fewer round-trips. LoanDisk docs use count=500 for due_loans;
+      // advanced_search_loans on large branches often times out above ~100–200.
+      searchPageSize: Math.min(500, Math.max(50, optionalNumber('LOANDISK_SEARCH_PAGE_SIZE', 100))),
+      // Parallel pages within a branch (docs + repay.md). Keep modest to avoid rate limits.
+      pageConcurrency: Math.max(1, optionalNumber('LOANDISK_PAGE_CONCURRENCY', 3)),
+      // Default 1 — parallel branches multiply timeouts against LoanDisk.
+      branchConcurrency: Math.max(1, optionalNumber('LOANDISK_BRANCH_CONCURRENCY', 1)),
       // When true, closed / fully paid / settled loans are also synced and
       // matched (a bank credit can be the final payment that closed a loan).
       includeInactive: optionalBool('DUE_LOANS_INCLUDE_INACTIVE', true),
@@ -79,6 +86,11 @@ export const config = {
       encrypt: optionalBool('DB_ENCRYPT', false),
       trustServerCertificate: optionalBool('DB_TRUST_SERVER_CERT', true),
     },
+  },
+  borrowerRefresh: {
+    // Max borrower IDs per worker. Capped at 100 so each API worker stays bounded.
+    batchSize: Math.min(100, Math.max(1, optionalNumber('BORROWER_BATCH_SIZE', 100))),
+    concurrency: Math.max(1, optionalNumber('BORROWER_SYNC_CONCURRENCY', 5)),
   },
   performance: {
     borrowerConcurrency: Math.max(1, optionalNumber('BORROWER_CONCURRENCY', 20)),
