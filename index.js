@@ -805,11 +805,26 @@ const sqlMatchJob = {
   error: null,
 }
 
+function isSqlLoanSyncInProgress() {
+  const state = readLoanRefresh()
+  if (sqlSyncJob.status === 'running') return true
+  if (state.status !== 'running') return false
+  const started = Date.parse(state.startedAt || '')
+  // Abandoned file flag from a previous process should not block matching.
+  if (!started || Date.now() - started > 20 * 60 * 1000) {
+    writeLoanRefresh({
+      status: 'idle',
+      error: 'Previous loan sync was interrupted. Matching can run against existing SQL loans.',
+    })
+    return false
+  }
+  return true
+}
+
 app.post('/api/sql/match/run', authMiddleware, async (req, res) => {
-  try {
-    const freshness=await activeLoanFreshness()
-    if (readLoanRefresh().status==='running' || getActiveJobName()==='sync' || freshness.stale) return res.status(409).json({error:'Active loans must finish refreshing before running matching.'})
-  } catch {return res.status(503).json({error:'Cannot verify active loan freshness. Please retry the loan refresh.'})}
+  if (isSqlLoanSyncInProgress()) {
+    return res.status(409).json({ error: 'Active loans are still syncing from LoanDisk. Wait until the sync you started finishes, or cancel it.' })
+  }
   if (sqlMatchJob.status === 'running') {
     return res.json({ status: 'running', message: 'Matching already in progress', progress: sqlMatchJob.progress })
   }
@@ -1565,12 +1580,6 @@ app.get('/api/loandisk/status', authMiddleware, async (_req, res) => {
 })
 
 let loanFreshnessCache = null
-let loanDiskCountInFlight = null
-
-async function probeLoanDiskCounts() {
-  const { countActiveAndCurrentLoans } = await import('./engine/src/currentLoansClient.js')
-  return countActiveAndCurrentLoans()
-}
 
 async function activeLoanFreshness() {
   const state = readLoanRefresh()
@@ -1613,36 +1622,12 @@ async function activeLoanFreshness() {
       } catch {
         loanFreshnessCache = {
           checkedAt: Date.now(),
-          activeCount: 3374,
-          currentCount: 1382,
-          count: 4756,
+          activeCount: Number(state.activeCount) || 0,
+          currentCount: Number(state.currentCount) || 0,
+          count: Number(state.totalLoans) || 0,
           lastUpdated: state.lastSuccessfulAt || null,
         }
       }
-    }
-
-    // Refresh live Active+Current totals in the background (LoanDisk is slow).
-    if (!loanDiskCountInFlight) {
-      loanDiskCountInFlight = probeLoanDiskCounts()
-        .then((live) => {
-          loanFreshnessCache = {
-            checkedAt: Date.now(),
-            activeCount: live.active,
-            currentCount: live.current,
-            count: live.total,
-            lastUpdated: state.lastSuccessfulAt || loanFreshnessCache?.lastUpdated || null,
-            byBranch: live.byBranch,
-          }
-          writeLoanRefresh({
-            activeCount: live.active,
-            currentCount: live.current,
-            totalLoans: live.total,
-          })
-        })
-        .catch(() => {})
-        .finally(() => {
-          loanDiskCountInFlight = null
-        })
     }
   }
 
@@ -1676,46 +1661,28 @@ app.post('/api/loandisk/active-refresh', authMiddleware, async (req, res) => {
     req.query?.mode === 'full' ||
     req.query?.forceFull === 'true'
 
-  if (force || forceFull) {
-    if (sqlMatchJob.status === 'running') {
-      sqlMatchJob.status = 'error'
-      sqlMatchJob.error = 'Matching paused for active loan refresh'
-      sqlMatchJob.finishedAt = new Date().toISOString()
-    }
-    cancelHeavyJob('Paused for active loan refresh')
-    if (forceFull) {
-      // Full re-download: drop resume checkpoint so we start from branch 1.
-      writeLoanRefresh({ resume: null })
-      cancelSqlBorrowerLoanSync('Restarting full loan download')
-    } else if (force) {
-      cancelSqlBorrowerLoanSync('Restarting loan download')
-    }
-  } else {
-    // If sqlMatchJob is marked running but was started > 5 mins ago, reset stale state
-    if (sqlMatchJob.status === 'running') {
-      const started = Date.parse(sqlMatchJob.startedAt || '')
-      if (!started || Date.now() - started > 300000 || !isHeavyJobRunning()) {
-        sqlMatchJob.status = 'idle'
-        sqlMatchJob.error = null
-      } else {
-        return res.status(409).json({ error: 'Matching is currently running. You can cancel matching or retry with force refresh.' })
-      }
-    }
+  if (!force && !forceFull) {
+    return res.json(await activeLoanFreshness())
   }
 
-  const currentRefresh = readLoanRefresh()
-  if (currentRefresh.status === 'running' && !force && !forceFull) {
-    const started = Date.parse(currentRefresh.startedAt || '')
-    if (started && Date.now() - started < 210000) {
-      return res.json({ status: 'running' })
-    }
+  if (sqlMatchJob.status === 'running') {
+    sqlMatchJob.status = 'error'
+    sqlMatchJob.error = 'Matching paused for active loan refresh'
+    sqlMatchJob.finishedAt = new Date().toISOString()
+  }
+  cancelHeavyJob('Paused for active loan refresh')
+  if (forceFull) {
+    writeLoanRefresh({ resume: null })
+    cancelSqlBorrowerLoanSync('Restarting full loan download')
+  } else {
+    cancelSqlBorrowerLoanSync('Restarting loan download')
   }
 
   runSqlBorrowerLoanSync(() => {}, { forceFull })
     .then(() => { loanFreshnessCache = null })
     .catch((err) => { console.warn('[LoanRefresh] Background sync error:', err.message) })
 
-  res.json({ status: 'started', mode: forceFull ? 'full' : 'auto' })
+  res.json({ status: 'started', mode: forceFull ? 'full' : 'delta' })
 })
 
 app.post('/api/loandisk/active-refresh/cancel', authMiddleware, (_req, res) => {
@@ -2647,6 +2614,17 @@ app.use('/api/quickbooks-connector', createConnectorRouter(db))
 app.get('/api/quickbooks-excel/:filename', serveExcelLink)
 app.use('/api/quickbooks', authMiddleware, quickbooksRouter)
 const stopQbScheduler = startRpaScheduler(db)
+
+{
+  const leftover = readLoanRefresh()
+  if (leftover.status === 'running') {
+    writeLoanRefresh({
+      status: 'idle',
+      error: 'Server restarted — leftover LoanDisk sync was cleared. Click Sync to pull loans.',
+    })
+    console.log('[BOOT] Cleared leftover running LoanDisk sync so matching is not blocked')
+  }
+}
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`SmartRepay running on 0.0.0.0:${PORT}`)

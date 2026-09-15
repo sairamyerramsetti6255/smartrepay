@@ -4,13 +4,13 @@
  * Modes:
  *  - delta (default when lastSuccessfulAt exists): pull Active+Current, upsert only
  *    new/changed rows (fingerprint compare against local DB). Resume supported.
- *  - full (forceFull, stale >7d, or first sync): same pull, write all rows, clear resume.
+ *  - full (forceFull click, or first sync with almost no local loans): same pull, write all rows, also fetch repayments.
  *
  * LoanDisk does not support reliable "updated since" filters on advanced_search_loans,
  * so delta still pages the active book — speed comes from larger pages, branch/page
  * concurrency, resume, and skipping unchanged DB writes.
  */
-import { readLoanRefresh, writeLoanRefresh, loansAreStale } from './loanRefreshState.js'
+import { readLoanRefresh, writeLoanRefresh } from './loanRefreshState.js'
 import { config } from './engine/src/config.js'
 import { fetchAllLoansByStatus, loanFingerprint } from './engine/src/currentLoansClient.js'
 import { bulkInsertStagingRecords, bulkUpsertSilLoanRepayments, markStaleLoansInBranch } from './engine/src/dataAccess.js'
@@ -391,10 +391,8 @@ function fingerprintsTouch(id, loanNumber, fp) {
   if (loanNumber) _fpMaps.byNumber.set(loanNumber, fp)
 }
 
-function resolveMode({ forceFull, lastSuccessfulAt, localCount }) {
+function resolveMode({ forceFull, localCount }) {
   if (forceFull) return 'full'
-  if (!lastSuccessfulAt) return 'full'
-  if (loansAreStale(lastSuccessfulAt)) return 'full'
   if (!localCount || localCount < 50) return 'full'
   return 'delta'
 }
@@ -526,9 +524,9 @@ async function performLoanSync(onProgress, { mode, resume }) {
           percent: Math.min(90, Math.round((batchIndex / totalBatches) * 80) + 5),
         })
 
-        // Push repayment history into SILLoanRepayments (SQL Server).
-        // Staging_LoandiskDueRecords only holds loan master data — repayments live here.
-        if (batchRecords.length > 0) {
+        // Repayment history is slow on LoanDisk. Pull it only on a full click-sync
+        // so the default (delta) path stays loan-book only and finishes quickly.
+        if (mode === 'full' && batchRecords.length > 0) {
           onProgress({
             phase: 'repayments',
             branch: branch.name,
@@ -544,8 +542,7 @@ async function performLoanSync(onProgress, { mode, resume }) {
             batch: batchIndex,
             totalBatches,
             repaymentsSaved: repay.repayments,
-            totalRepayments,
-            percent: Math.min(96, Math.round((batchIndex / totalBatches) * 90) + 5),
+            percent: Math.min(96, Math.round((batchIndex / totalBatches) * 80) + 12),
           })
         }
       })
@@ -633,7 +630,6 @@ export async function runSqlBorrowerLoanSync(onProgress = () => {}, opts = {}) {
   const fingerprints = loadExistingLoanFingerprints()
   const mode = resolveMode({
     forceFull,
-    lastSuccessfulAt: current.lastSuccessfulAt,
     localCount: fingerprints.count,
   })
 
