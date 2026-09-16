@@ -6,7 +6,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node --experimental-sqlite index.js",
     "dev": "node scripts/free-port.mjs 3001 && node --watch-path=index.js --watch-path=stagingDb.js --watch-path=statementPdf.js --watch-path=crifClient.js --watch-path=routes --watch-path=engine --watch-path=qb --watch-path=ingestion index.js",
     "sync": "node engine/scripts/runSync.js",
     "match": "node engine/scripts/matchTransactions.js",
