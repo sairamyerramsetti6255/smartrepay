@@ -12,9 +12,8 @@ ENV PORT=3001
 
 EXPOSE 3001
 
-# Coolify / Traefik need a live process on 3001; fail closed if health stays down
-HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
-  CMD wget -qO- http://127.0.0.1:3001/api/health || exit 1
+# Do NOT use wget/curl HEALTHCHECK on alpine — those binaries are missing and
+# mark the container unhealthy, which makes Coolify stick on "Restarting" / 503.
+# Coolify's HTTP health check should hit /api/health on port 3001 instead.
 
 CMD ["node", "--experimental-sqlite", "index.js"]
-
