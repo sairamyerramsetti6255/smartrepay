@@ -277,6 +277,8 @@ app.get('/', (_req, res) => res.json(healthPayload()))
 app.get('/health', (_req, res) => res.json(healthPayload()))
 app.get('/ping', (_req, res) => res.send('pong'))
 app.get('/api/health', (_req, res) => res.json(healthPayload()))
+app.get('/api/status', (_req, res) => res.json(healthPayload()))
+app.get('/status', (_req, res) => res.json(healthPayload()))
 
 
 // --- Ingest helpers ---
