@@ -27,6 +27,12 @@ import { randomUUID, createHash } from 'crypto'
 import * as XLSX from 'xlsx'
 import db, { initDb, resetAppData, rowBorrower, parseJson } from './db.js'
 import { authMiddleware, signToken } from './auth.js'
+import {
+  listEmployerMappings,
+  upsertEmployerMapping,
+  saveRemittanceSchedule,
+  listRemittanceLines,
+} from './employerRemittance.js'
 
 import { verifyMicrosoftIdToken, getMicrosoftPublicConfig, isMicrosoftAuthConfigured } from './microsoftAuth.js'
 import { matchTransaction, detectExceptionType } from './matcher.js'
@@ -77,6 +83,8 @@ import {
   updateSqlTransactionRemarks,
   getDocuments,
   deleteDocument,
+  findLocalDocument,
+  resolveDocumentFilePath,
   flagDuplicateRows,
   getLoansByBorrowerId,
   saveManualReceipt,
@@ -223,17 +231,30 @@ function bulkInsertRows(rows, actor, documentId = null) {
   return inserted
 }
 
-function saveUploadedDocument({ buffer, filename, mimeType, documentType, uploadedBy, rowCount }) {
+function saveUploadedDocument({ buffer, filename, stagedFilename, mimeType, documentType, uploadedBy, rowCount }) {
+  if (!buffer?.length) {
+    throw new Error('Original file bytes are missing — re-upload the document before importing')
+  }
   const docId = randomUUID()
   const safeName = path.basename(filename || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload'
   const docDir = path.join(UPLOADS_DIR, docId)
   fs.mkdirSync(docDir, { recursive: true })
   const storagePath = path.join(docDir, safeName)
-  if (buffer?.length) fs.writeFileSync(storagePath, buffer)
+  fs.writeFileSync(storagePath, buffer)
   db.prepare(
-    `insert into documents (id, filename, mime_type, size_bytes, storage_path, uploaded_by, document_type, row_count)
-     values (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(docId, filename, mimeType || null, buffer?.length || 0, storagePath, uploadedBy, documentType || null, rowCount || 0)
+    `insert into documents (id, filename, mime_type, size_bytes, storage_path, uploaded_by, document_type, row_count, staged_filename)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    docId,
+    filename,
+    mimeType || null,
+    buffer.length,
+    storagePath,
+    uploadedBy,
+    documentType || null,
+    rowCount || 0,
+    stagedFilename || null
+  )
   return docId
 }
 
@@ -351,21 +372,31 @@ async function performParsedImport(parseId, user) {
   const toInsert = cached.rows.filter((r) => !r._duplicate)
   if (!toInsert.length) throw new Error('No new rows to import')
 
+  // Staged SQL FileName gets a time suffix; keep it on the documents row so Download
+  // can resolve the original bytes from the grid filename (which is the staged name).
+  const stagedFileName = cached.stagedFileName || uniqueFileName(cached.filename)
+  cached.stagedFileName = stagedFileName
+
   const documentId = cached.documentId || saveUploadedDocument({
     buffer: cached.buffer,
     filename: cached.filename,
+    stagedFilename: stagedFileName,
     mimeType: cached.mimeType,
     documentType: cached.documentType,
     uploadedBy: user.email,
     rowCount: toInsert.length,
   })
 
+  // Backfill staged_filename when re-importing an older document row
+  if (documentId && stagedFileName) {
+    db.prepare(
+      `update documents set staged_filename = coalesce(staged_filename, ?) where id = ?`
+    ).run(stagedFileName, documentId)
+  }
+
   cached.documentId = documentId
   parseCache.set(parseId, cached)
   const inserted = bulkInsertRows(toInsert, user.email, documentId)
-  const stagedFileName = cached.stagedFileName || uniqueFileName(cached.filename)
-  cached.stagedFileName = stagedFileName
-  parseCache.set(parseId, cached)
   let staged = 0
   let stagedDuplicates = 0
   let stagingError = null
@@ -770,6 +801,7 @@ app.patch('/api/sql/match-results/:bankTxId', authMiddleware, async (req, res) =
       confidence: req.body.confidence ?? null,
       emiPaidAmount: req.body.emiPaidAmount ?? null,
       expectedEmiAmount: req.body.expectedEmiAmount ?? null,
+      overrideReason: req.body.overrideReason ?? null,
     })
     res.json({ ok: true })
   } catch (e) {
@@ -786,6 +818,42 @@ app.patch('/api/sql/match-results/:bankTxId/remarks', authMiddleware, async (req
     res.json(result)
   } catch (e) {
     res.status(400).json({ error: e.message || 'Could not save remarks' })
+  }
+})
+
+// --- Employer remittance mapping / schedules (P1) ---------------------------
+app.get('/api/employer-remittance/mappings', authMiddleware, (req, res) => {
+  try {
+    res.json({ mappings: listEmployerMappings(req.query.employer || null) })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/api/employer-remittance/mappings', authMiddleware, (req, res) => {
+  try {
+    const mappings = upsertEmployerMapping(req.body || {})
+    res.json({ ok: true, mappings })
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/employer-remittance/schedule', authMiddleware, (req, res) => {
+  try {
+    if (!req.query.employer) return res.status(400).json({ error: 'employer query required' })
+    res.json({ lines: listRemittanceLines(req.query.employer) })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/api/employer-remittance/schedule', authMiddleware, (req, res) => {
+  try {
+    const result = saveRemittanceSchedule(req.body || {})
+    res.json(result)
+  } catch (e) {
+    res.status(400).json({ error: e.message })
   }
 })
 
@@ -1946,367 +2014,18 @@ app.get('/api/documents/:id/download', authMiddleware, async (req, res) => {
     const param = decodeURIComponent(req.params.id || '').trim()
     if (!param) return res.status(400).json({ error: 'Missing document ID or filename' })
 
-    const ext = path.extname(param).toLowerCase()
-    const base = path.basename(param, ext)
-    const stripped = base.replace(/_\d{4,8}$/, '')
-
-    const tokens = stripped
-      .split(/[^a-zA-Z0-9]+/)
-      .filter(
-        (t) =>
-          t.length >= 3 &&
-          !/^\d{4}$/.test(t) &&
-          !/^(part|statement|transactions|project|may|june|july|august|september|october|november|december)$/i.test(
-            t
-          )
-      )
-
-    const candidates = new Set([
-      param,
-      stripped + ext,
-      base,
-      stripped,
-      param.replace(/ /g, '_'),
-      (stripped + ext).replace(/ /g, '_'),
-      param.replace(/_/g, ' '),
-      (stripped + ext).replace(/_/g, ' '),
-    ])
-
-    const candidateDirs = [
-      UPLOADS_DIR,
-      path.join(path.dirname(UPLOADS_DIR), 'docs'),
-      path.join(process.cwd(), 'docs'),
-      path.join(process.cwd(), '..', 'docs'),
-      path.join(process.cwd(), 'data'),
-      path.join(process.cwd(), '..', 'data'),
-    ].filter((d, i, arr) => fs.existsSync(d) && arr.indexOf(d) === i)
-
-    // --- TIER 1: Exact doc in SQLite + storage_path or UPLOADS_DIR/doc.id ---
-    let doc = null
-    for (const cand of candidates) {
-      doc = db
-        .prepare('select * from documents where id = ? or filename = ? order by created_at desc limit 1')
-        .get(cand, cand)
-      if (doc) break
-    }
-    if (!doc && stripped) {
-      doc = db
-        .prepare('select * from documents where filename like ? order by created_at desc limit 1')
-        .get(`%${stripped}%`)
-    }
-
-    if (doc?.storage_path) {
-      const normalizedStoragePath = doc.storage_path.replace(/\\/g, '/')
-      const storageBasename = path.basename(normalizedStoragePath)
-      const altLocalPath = path.join(UPLOADS_DIR, doc.id || '', storageBasename)
-
-      if (fs.existsSync(doc.storage_path) && fs.statSync(doc.storage_path).isFile()) {
-        return res.download(doc.storage_path, doc.filename || param)
-      } else if (fs.existsSync(normalizedStoragePath) && fs.statSync(normalizedStoragePath).isFile()) {
-        return res.download(normalizedStoragePath, doc.filename || param)
-      } else if (fs.existsSync(altLocalPath) && fs.statSync(altLocalPath).isFile()) {
-        return res.download(altLocalPath, doc.filename || param)
-      }
-    }
-
-    if (doc?.id) {
-      const docDir = path.join(UPLOADS_DIR, doc.id)
-      if (fs.existsSync(docDir) && fs.statSync(docDir).isDirectory()) {
-        const files = fs.readdirSync(docDir).filter((f) => !f.startsWith('.'))
-        if (files.length > 0) {
-          const filePath = path.join(docDir, files[0])
-          if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-            return res.download(filePath, doc.filename || files[0])
-          }
-        }
-      }
-    }
-
-    // Search inside all subdirectories of UPLOADS_DIR
-    if (fs.existsSync(UPLOADS_DIR)) {
-      try {
-        const subDirs = fs.readdirSync(UPLOADS_DIR, { withFileTypes: true })
-        for (const sub of subDirs) {
-          if (sub.isDirectory()) {
-            const subDirPath = path.join(UPLOADS_DIR, sub.name)
-            const subFiles = fs.readdirSync(subDirPath).filter((f) => !f.startsWith('.'))
-            for (const sf of subFiles) {
-              const sfPath = path.join(subDirPath, sf)
-              if (
-                candidates.has(sf) ||
-                (ext &&
-                  sf.toLowerCase().endsWith(ext) &&
-                  (sf.includes(stripped) || stripped.includes(sf.replace(ext, ''))))
-              ) {
-                if (fs.existsSync(sfPath) && fs.statSync(sfPath).isFile()) {
-                  return res.download(sfPath, doc?.filename || sf)
-                }
-              }
-            }
-          }
-        }
-      } catch {}
-    }
-
-    // --- TIER 2: Same extension match across directories and subdirectories ---
-    if (ext) {
-      for (const dir of candidateDirs) {
-        const entries = fs.readdirSync(dir, { withFileTypes: true })
-        for (const entry of entries) {
-          if (entry.isFile()) {
-            const fExt = path.extname(entry.name).toLowerCase()
-            const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
-            if (fExt === ext) {
-              const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
-              if (
-                fNorm === strippedNorm ||
-                fNorm.includes(strippedNorm) ||
-                strippedNorm.includes(fNorm) ||
-                (tokens.length > 0 && tokens.some((t) => fNorm.includes(t.toLowerCase())))
-              ) {
-                return res.download(path.join(dir, entry.name), entry.name)
-              }
-            }
-          } else if (entry.isDirectory()) {
-            const subDir = path.join(dir, entry.name)
-            const subFiles = fs.readdirSync(subDir).filter((f) => !f.startsWith('.'))
-            for (const sf of subFiles) {
-              const sfExt = path.extname(sf).toLowerCase()
-              const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
-              if (sfExt === ext) {
-                const strippedNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
-                if (
-                  sfNorm === strippedNorm ||
-                  sfNorm.includes(strippedNorm) ||
-                  strippedNorm.includes(sfNorm) ||
-                  (tokens.length > 0 && tokens.some((t) => sfNorm.includes(t.toLowerCase())))
-                ) {
-                  return res.download(path.join(subDir, sf), sf)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // --- TIER 3: Candidates match directly or in subdirectories ---
-    const candList = Array.from(candidates)
-    for (const dir of candidateDirs) {
-      for (const cand of candList) {
-        const candPath = path.join(dir, cand)
-        if (fs.existsSync(candPath) && fs.statSync(candPath).isFile()) {
-          return res.download(candPath, doc?.filename || cand)
-        }
-      }
-    }
-
-    // --- TIER 4: Precise disk match in candidate directories ---
-    for (const dir of candidateDirs) {
-      const entries = fs.readdirSync(dir, { withFileTypes: true })
-      for (const entry of entries) {
-        if (entry.isFile()) {
-          const fNorm = entry.name.toLowerCase().replace(/[^a-z0-9]/g, '')
-          const sNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
-          if (sNorm && (fNorm === sNorm || fNorm.startsWith(sNorm))) {
-            return res.download(path.join(dir, entry.name), entry.name)
-          }
-        } else if (entry.isDirectory()) {
-          const subFiles = fs.readdirSync(path.join(dir, entry.name)).filter((f) => !f.startsWith('.'))
-          for (const sf of subFiles) {
-            const sfNorm = sf.toLowerCase().replace(/[^a-z0-9]/g, '')
-            const sNorm = stripped.toLowerCase().replace(/[^a-z0-9]/g, '')
-            if (sNorm && (sfNorm === sNorm || sfNorm.startsWith(sNorm))) {
-              return res.download(path.join(dir, entry.name, sf), sf)
-            }
-          }
-        }
-      }
-    }
-
-    // --- TIER 5: Dynamic Database Statement / Export Generation (SQL Server & SQLite) ---
-    let docMeta = null
-    let stagedRows = []
-
-    try {
-      const [sqlDocs, sqlMatchRes] = await Promise.all([
-        getDocuments().catch(() => []),
-        getSqlMatchResults().catch(() => ({ transactions: [] })),
-      ])
-
-      const lowerParam = param.toLowerCase()
-      const lowerStripped = stripped.toLowerCase()
-
-      // Find docMeta from SQL Server staging
-      docMeta = sqlDocs.find((d) => {
-        const dName = String(d.filename || d.id || '').toLowerCase()
-        return (
-          dName === lowerParam ||
-          d.id === param ||
-          dName.includes(lowerStripped) ||
-          lowerStripped.includes(dName.replace(/_\d{4,8}\.[^.]+$/, ''))
-        )
+    // Exact lookup only — never fuzzy LIKE / token search (those returned wrong files
+    // and regenerated PDFs that were not the originally uploaded document).
+    const doc = findLocalDocument(param)
+    const filePath = resolveDocumentFilePath(doc)
+    if (!doc || !filePath) {
+      return res.status(404).json({
+        error: `Original file "${param}" was not found on this server. Re-upload the document to restore download.`,
       })
-
-      // Filter matching transactions
-      if (sqlMatchRes?.transactions?.length > 0) {
-        stagedRows = sqlMatchRes.transactions.filter((t) => {
-          const fn = String(t.source_filename || '').toLowerCase()
-          if (!fn) return false
-          if (docMeta && fn === String(docMeta.filename || '').toLowerCase()) return true
-          if (fn === lowerParam) return true
-          if (lowerStripped && fn.includes(lowerStripped)) return true
-          if (tokens.length > 0 && tokens.every((tok) => fn.includes(tok.toLowerCase()))) return true
-          return false
-        })
-      }
-
-      if (!stagedRows.length) {
-        const allBank = await getBankTransactions({ search: stripped || param }).catch(() => [])
-        if (allBank.length > 0) {
-          stagedRows = allBank.map((b) => ({
-            date: b.TransDate,
-            reference: b.ReferenceNo,
-            description: b.Particulars || b.TransactionDescription,
-            particulars: b.Particulars,
-            payer: b.BorrowerName,
-            amount: b.EmiPaidAmount,
-            status: 'pending',
-            review_status: b.ReviewStatus,
-            source_filename: b.FileName,
-          }))
-        }
-      }
-    } catch (e) {
-      console.warn('SQL staging lookup error during download:', e.message)
     }
 
-    // SQLite fallback for staged rows
-    if (!stagedRows.length && doc?.id) {
-      try {
-        const sqliteRows = db
-          .prepare('select * from transactions where source_document_id = ? order by date asc')
-          .all(doc.id)
-        if (sqliteRows.length > 0) {
-          stagedRows = sqliteRows.map((r) => ({
-            date: r.date,
-            reference: r.reference,
-            description: r.description || r.particulars,
-            particulars: r.particulars,
-            payer: r.borrower_name || r.payer,
-            amount: r.amount,
-            status: r.status,
-            source_filename: doc.filename,
-          }))
-        }
-      } catch {}
-    }
-
-    const effectiveFilename = docMeta?.filename || doc?.filename || param
-    const effectiveExt = (path.extname(effectiveFilename) || ext || '.pdf').toLowerCase()
-    const targetBaseName = path.basename(effectiveFilename, effectiveExt)
-
-    if (stagedRows.length > 0 || docMeta) {
-      const metaForPdf = docMeta || {
-        filename: effectiveFilename,
-        document_type: doc?.document_type || 'bank',
-        source_type: doc?.document_type || 'bank',
-        employer_or_bank: 'Simplified Lending',
-        total_rows: stagedRows.length,
-      }
-
-      // 1. PDF Export
-      if (effectiveExt === '.pdf' || (!['.xlsx', '.xls', '.csv'].includes(effectiveExt) && !ext)) {
-        const pdfBuffer = await generateStatementPdf(metaForPdf, stagedRows)
-        const dlName = `${targetBaseName}.pdf`
-        res.setHeader('Content-Type', 'application/pdf')
-        res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
-        res.setHeader('Content-Length', String(pdfBuffer.length))
-        return res.send(pdfBuffer)
-      }
-
-      // 2. Excel (XLSX / XLS) Export
-      if (effectiveExt === '.xlsx' || effectiveExt === '.xls') {
-        const exportData = stagedRows.map((r, i) => ({
-          '#': i + 1,
-          Date: r.date ? String(r.date).slice(0, 10) : '',
-          Reference: r.reference || '',
-          Description: r.transaction_description || r.description || r.particulars || '',
-          'Payer / Borrower': r.payer || r.BorrowerName || '',
-          'Matched Borrower': r.matched_borrower_name || '',
-          'Matched Loan': r.loan_number || '',
-          'Amount ($)': Number(r.amount || 0),
-          Status: r.status || r.review_status || 'Pending',
-        }))
-
-        const summaryData = [
-          { Field: 'Document Name', Value: effectiveFilename },
-          { Field: 'Document Type', Value: metaForPdf.document_type || metaForPdf.source_type || 'Bank Statement' },
-          { Field: 'Total Transactions', Value: stagedRows.length },
-          {
-            Field: 'Total Credit Volume',
-            Value: `$${stagedRows.reduce((s, r) => s + (Number(r.amount) || 0), 0).toFixed(2)}`,
-          },
-          {
-            Field: 'Matched Records',
-            Value: stagedRows.filter((r) =>
-              ['matched', 'confirmed', 'auto_matched'].includes(String(r.status || r.review_status).toLowerCase())
-            ).length,
-          },
-          {
-            Field: 'Unmatched Records',
-            Value: stagedRows.filter((r) =>
-              ['unmatched', 'exception'].includes(String(r.status || r.review_status).toLowerCase())
-            ).length,
-          },
-        ]
-
-        const wb = XLSX.utils.book_new()
-        const wsTx = XLSX.utils.json_to_sheet(exportData)
-        const wsSummary = XLSX.utils.json_to_sheet(summaryData)
-        XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary')
-        XLSX.utils.book_append_sheet(wb, wsTx, 'Transactions')
-        const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
-
-        const dlName = `${targetBaseName}.xlsx`
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
-        res.setHeader('Content-Length', String(buffer.length))
-        return res.send(buffer)
-      }
-
-      // 3. CSV Export
-      if (effectiveExt === '.csv') {
-        const csvRows = [
-          ['#', 'Date', 'Reference', 'Description', 'Payer', 'Matched Borrower', 'Matched Loan', 'Amount', 'Status'],
-          ...stagedRows.map((r, i) => [
-            String(i + 1),
-            r.date ? String(r.date).slice(0, 10) : '',
-            `"${String(r.reference || '').replace(/"/g, '""')}"`,
-            `"${String(r.transaction_description || r.description || r.particulars || '').replace(/"/g, '""')}"`,
-            `"${String(r.payer || r.BorrowerName || '').replace(/"/g, '""')}"`,
-            `"${String(r.matched_borrower_name || '').replace(/"/g, '""')}"`,
-            `"${String(r.loan_number || '').replace(/"/g, '""')}"`,
-            String(Number(r.amount || 0).toFixed(2)),
-            r.status || r.review_status || 'Pending',
-          ]),
-        ]
-        const csvString = csvRows.map((row) => row.join(',')).join('\n')
-        const dlName = `${targetBaseName}.csv`
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8')
-        res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
-        return res.send(csvString)
-      }
-
-      // 4. Default fallback -> PDF Statement
-      const pdfBuffer = await generateStatementPdf(metaForPdf, stagedRows)
-      const dlName = `${targetBaseName}.pdf`
-      res.setHeader('Content-Type', 'application/pdf')
-      res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`)
-      return res.send(pdfBuffer)
-    }
-
-    return res.status(404).json({ error: `File "${param}" not found on server` })
+    const downloadName = doc.filename || path.basename(filePath) || param
+    return res.download(filePath, downloadName)
   } catch (err) {
     console.error('Download handler failed:', err)
     res.status(500).json({ error: `Download failed: ${err.message}` })

@@ -1,9 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildEngineConfig, previewMatchSample, extractIdsWithPatterns } from '../../matchingRules.js'
-import { groupLoansByBorrower, buildBorrowerIndex, classifyEvidence as classify, classify as classifyWithPolicy, matchStatusFor, reconcileAmount, applyAi, applyRepaymentHistoryMatch, getMatchingEngineConfig, setMatchingEngineConfig } from '../src/matchingEngine.js'
+import { groupLoansByBorrower, buildBorrowerIndex, classifyEvidence as classify, classify as classifyWithPolicy, matchStatusFor, reconcileAmount, applyAi, applyRepaymentHistoryMatch, getMatchingEngineConfig, setMatchingEngineConfig, confidenceBucket } from '../src/matchingEngine.js'
 import { extractLoanIds, identityNameScore } from '../src/borrowerIdentity.js'
 import { isCompanyName } from '../../particularsParse.js'
+import { isRematchProtected } from '../src/matchProtection.js'
 const loan = (id, name, emi, extra = {}) => ({ BorrowerId: id, LoanNumber: `LN${id}`, BorrowerFullName: name, ExpectedEMIAmount: emi, LoanStatus: 'active', ...extra })
 const tx = (name, amount = 350, extra = {}) => ({ Id: 1000, BorrowerName: name, Particulars: `Direct Credit BWAP - Salaries 260508|${name}`, EmiPaidAmount: amount, TransDate: '2026-05-08', ...extra })
 const resolve = (transaction, loans, history = [], config = buildEngineConfig()) => classify(transaction, buildBorrowerIndex(groupLoansByBorrower(loans), history), config).record
@@ -51,16 +52,21 @@ test('conflicting loan and full name, multiple references require review', () =>
   assert.equal(resolve(tx('Michael Bowe', 425, { ReferenceNo: 'Loan LN2' }), master).reviewStatus, 'needs_review')
   assert.equal(resolve(tx('', 350, { ReferenceNo: 'Loan LN1; Loan LN2' }), master).reviewStatus, 'needs_review')
 })
-test('company variants excluded; cash deposits find EMI candidates', () => {
+test('company variants excluded; cash deposits find EMI candidates; company ACH does not', () => {
   for (const value of ['SIMPLIFIED-LEND', 'Simplified Lean', 'SIMPLIFIED LENDING LTD', 'Simplified-Lending']) assert.equal(isCompanyName(value), true)
-  for (const particulars of ['Cash Deposit In Branch', 'Direct Credit AdvantageBusine - Loans 260508|Simplified-Lend']) {
-    const r = resolve(tx('', 350, { Particulars: particulars }), master)
-    assert.equal(r.reviewStatus, 'needs_review'); assert.equal(r.borrowerId, '1'); assert.equal(r.matchType, 'cash_amount')
-  }
+  const cash = resolve(tx('', 350, { Particulars: 'Cash Deposit In Branch' }), master)
+  assert.equal(cash.reviewStatus, 'needs_review'); assert.equal(cash.borrowerId, '1'); assert.equal(cash.matchType, 'cash_amount')
+  const company = resolve(tx('', 350, { Particulars: 'Direct Credit AdvantageBusine - Loans 260508|Simplified-Lend' }), master)
+  assert.equal(company.reviewStatus, 'unmatched'); assert.equal(company.borrowerId, null)
+  assert.equal(company.matchType, 'employer_remittance')
 })
-test('anonymous amount cannot distinguish one EMI from two smaller EMIs', () => {
-  const r = resolve(tx('', 700, { Particulars: 'Cash Deposit In Branch' }), [loan('1', 'Michael Bowe', 350), loan('2', 'John Smith', 700)])
-  assert.equal(r.reviewStatus, 'needs_review'); assert.equal(r.candidateCount, 2); assert.match(r.reasoning, /Ambiguous/)
+test('anonymous cash only suggests a unique exact single EMI, never a multi-EMI guess', () => {
+  const unique = resolve(tx('', 700, { Particulars: 'Cash Deposit In Branch' }), [loan('1', 'Michael Bowe', 350), loan('2', 'John Smith', 700)])
+  assert.equal(unique.reviewStatus, 'needs_review'); assert.equal(unique.borrowerId, '2'); assert.equal(unique.matchType, 'cash_amount')
+  const twoSmall = resolve(tx('', 700, { Particulars: 'Cash Deposit In Branch' }), [loan('1', 'Michael Bowe', 350), loan('2', 'John Smith', 350)])
+  assert.equal(twoSmall.reviewStatus, 'unmatched'); assert.equal(twoSmall.borrowerId, null)
+  const tied = resolve(tx('', 700, { Particulars: 'Cash Deposit In Branch' }), [loan('1', 'Michael Bowe', 700), loan('2', 'John Smith', 700)])
+  assert.equal(tied.reviewStatus, 'needs_review'); assert.equal(tied.candidateCount, 2); assert.match(tied.reasoning, /Ambiguous/)
 })
 test('multiple EMIs supported after borrower identity established', () => {
   for (const count of [2, 3, 12]) {
@@ -148,9 +154,9 @@ test('amount tolerance applies to the full payment in cents', () => {
   assert.equal(reconcileAmount(701.51, [{loanNumber: '1', expectedEMI: 350}], c).kind, 'mismatch')
 })
 test('current due context is optional; lifetime TotalDue is not used as arrears', () => {
-  const t = tx('', 700, {Particulars: 'Cash Deposit In Branch'})
-  const r = resolve(t, [loan('1', 'Michael Bowe', 350, {TotalAmountDue: 700, PendingEMICount: 2, NextDueDate: '2026-05-08'})])
-  assert.equal(r.reviewStatus, 'needs_review'); assert.match(r.reasoning, /Pending EMI count agrees/)
+  const t = tx('', 350, {Particulars: 'Cash Deposit In Branch'})
+  const r = resolve(t, [loan('1', 'Michael Bowe', 350, {TotalAmountDue: 350, PendingEMICount: 1, NextDueDate: '2026-05-08'})])
+  assert.equal(r.reviewStatus, 'needs_review'); assert.match(r.reasoning, /Current amount due agrees/)
   assert.doesNotMatch(resolve(t, [loan('1', 'Michael Bowe', 350, {TotalDue: 700})]).reasoning, /Current amount due agrees/)
 })
 
@@ -185,6 +191,24 @@ test('independent first + last + exact EMI is matched at 81%+', () => {
   assert.equal(posted.reviewStatus, 'auto_matched')
   assert.equal(posted.borrowerId, '1')
 })
+
+test('bank middle+last scores against borrower first+middle+last (MESHELL DEAN / Ranie Meshell Dean)', () => {
+  const score = identityNameScore('MESHELL DEAN', 'Ranie Meshell Dean')
+  assert.ok(score.score >= 84, `expected middle+last score, got ${score.score}`)
+  assert.equal(score.nameKind, 'middle+last')
+  assert.equal(score.nameBreakdown?.first?.skipped, true)
+  const r = resolve(
+    tx('MESHELL DEAN', 70.44, {
+      Particulars: 'Direct Credit ZNSBROADCASTING - DirPay Cr 260914|MESHELL DEAN',
+    }),
+    [loan('5275310', 'Ranie Meshell Dean', 70.44)]
+  )
+  assert.ok(r.nameScore >= 84, `nameScore ${r.nameScore}`)
+  assert.ok(r.confidenceScore >= 80, `confidence ${r.confidenceScore}`)
+  assert.equal(r.borrowerId, '5275310')
+  assert.notEqual(r.reviewStatus, 'unmatched')
+})
+
 test('first+last + EMI mismatch + matching history is a 100% match, not review', () => {
   const histLoan = loan('1', 'Chewuakii Mary T Symon', 413.72, { HistoricalPaymentCents: [10343] })
   const r = resolve(tx('Chewuakii Symon', 103.43), [histLoan])
@@ -252,11 +276,45 @@ test('requested matching cutoff is 81 percent and above', () => {
   assert.equal(matchStatusFor(70),'unmatched')
   assert.equal(matchStatusFor(0),'unmatched')
 })
-test('scores at 81%+ are matched even when posting still needs a unique identity', () => {
+test('100% score is Same Person, not the Need Review bucket', () => {
+  assert.equal(confidenceBucket(100), 'same_person')
+  assert.equal(confidenceBucket(98), 'same_person')
+  assert.equal(confidenceBucket(81), 'very_likely_match')
+  assert.equal(confidenceBucket(80), 'possible_review')
+})
+test('single-name 81% guesses stay in review; they are not matches', () => {
   const index=buildBorrowerIndex(groupLoansByBorrower([loan('1','Michael Bowe',350),loan('2','Michael Smith',350)]))
   const r=classifyWithPolicy(tx('Michael'),index).record
-  assert.ok(r.confidenceScore >= 81)
-  assert.equal(r.reviewStatus,'auto_matched')
-  assert.equal(r.matchType,'review_required')
-  assert.equal(r.emiCount,null)
+  assert.ok(r.confidenceScore >= 80)
+  assert.equal(r.reviewStatus,'needs_review')
+  assert.notEqual(r.reviewStatus,'auto_matched')
+})
+
+test('employer ACH with no person name is unmatched even when an EMI coincides', () => {
+  const loans = [loan('1', 'Sharmane Strachan', 280.18), loan('2', 'Michael Bowe', 200)]
+  const r = resolve(tx('', 200, { Particulars: 'Direct Credit STRACHANSORA - ACH TFR 260914|Simplified Lend' }), loans)
+  assert.equal(r.reviewStatus, 'unmatched')
+  assert.equal(r.borrowerId, null)
+  assert.equal(r.loanDiskBorrowerName, null)
+  assert.equal(r.confidenceScore, 0)
+  assert.equal(r.matchType, 'employer_remittance')
+  const easy = resolve(tx('', 6608.63, { Particulars: 'Direct Credit EASYTERMSLTD - Dom Pay 260914|Simplified Lending Ltd' }), loans)
+  assert.equal(easy.reviewStatus, 'unmatched')
+  assert.equal(easy.borrowerId, null)
+  assert.equal(easy.matchType, 'employer_remittance')
+})
+
+test('person name on a company destination ACH still matches', () => {
+  const r = resolve(tx('', 350, { Particulars: 'Direct Credit Michael Bowe - ACH TFR 260914|Simplified Lend' }), master)
+  assert.equal(r.reviewStatus, 'auto_matched')
+  assert.equal(r.borrowerId, '1')
+})
+
+test('amount-only confirms are rematched; named confirms stay protected', () => {
+  assert.equal(isRematchProtected({ ReviewStatus: 'rejected' }), true)
+  assert.equal(isRematchProtected({ ReviewStatus: 'confirmed', MatchType: 'cash_amount', NameScore: 0 }), false)
+  assert.equal(isRematchProtected({ ReviewStatus: 'confirmed', MatchType: 'name_and_amount', NameScore: 0 }), false)
+  assert.equal(isRematchProtected({ ReviewStatus: 'confirmed', MatchType: 'name_and_amount', NameScore: 99 }), true)
+  assert.equal(isRematchProtected({ ReviewStatus: 'confirmed', MatchType: 'loan_id', NameScore: 0 }), true)
+  assert.equal(isRematchProtected({ ReviewStatus: 'auto_matched', MatchMethod: 'manual', MatchType: 'cash_amount', NameScore: 0 }), false)
 })

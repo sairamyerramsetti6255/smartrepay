@@ -41,6 +41,10 @@ function migrateDb() {
   if (tableExists('loans') && !columnExists('loans', 'fingerprint')) {
     db.exec('alter table loans add column fingerprint text')
   }
+  if (tableExists('documents') && !columnExists('documents', 'staged_filename')) {
+    db.exec('alter table documents add column staged_filename text')
+    db.exec('create index if not exists idx_documents_staged_filename on documents(staged_filename)')
+  }
   if (!tableExists('loan_repayments')) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS loan_repayments (
@@ -59,6 +63,38 @@ function migrateDb() {
     `)
     db.exec('CREATE INDEX IF NOT EXISTS idx_loan_repayments_loan ON loan_repayments(loan_number)')
     db.exec('CREATE INDEX IF NOT EXISTS idx_loan_repayments_date ON loan_repayments(date)')
+  }
+  if (!tableExists('employer_employee_map')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS employer_employee_map (
+        id TEXT PRIMARY KEY,
+        employer_key TEXT NOT NULL,
+        employer_label TEXT,
+        borrower_id TEXT,
+        borrower_name TEXT NOT NULL,
+        loan_number TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(employer_key, borrower_name, loan_number)
+      )
+    `)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_employer_map_key ON employer_employee_map(employer_key)')
+  }
+  if (!tableExists('employer_remittance_lines')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS employer_remittance_lines (
+        id TEXT PRIMARY KEY,
+        employer_key TEXT NOT NULL,
+        file_name TEXT,
+        employee_name TEXT NOT NULL,
+        amount REAL NOT NULL,
+        loan_number TEXT,
+        borrower_id TEXT,
+        bank_transaction_id INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `)
   }
 }
 

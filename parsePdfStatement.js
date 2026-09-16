@@ -1,6 +1,6 @@
 import { extractPositionedBank } from './ingestion/bankPdf.js'
 import { PDFParse } from 'pdf-parse'
-import { extractNameFromParticulars, parsePipeParticulars } from './particularsParse.js'
+import { extractNameFromParticulars, parsePipeParticulars, looksLikePersonName } from './particularsParse.js'
 import { extractFromTextWithAI, extractFromImageWithAI } from './openrouter.js'
 
 const SKIP_PARTICULARS = /balance (brought|carried) forward/i
@@ -263,10 +263,11 @@ function parseEmployerStatement(text, filename, fileParticulars = '') {
 
 function toEmployerCreditRows(rows) {
   return rows.map((r) => ({
-    datePosted: r.statementDate,
-    valueDate: r.date,
-    reference: r.reference || '',
+    datePosted: r.date || r.statementDate,
+    valueDate: r.date || r.statementDate,
+    reference: r.reference && String(r.reference).toLowerCase() !== 'customer' ? r.reference : '',
     particulars: r.remarks,
+    rawParticulars: r.remarks,
     creditAmount: r.amount,
     name: r.name,
     employer: r.employer,
@@ -276,15 +277,16 @@ function toEmployerCreditRows(rows) {
 
 function toEmployerImportRows(rows) {
   return rows.map((r) => ({
-    datePosted: r.statementDate,
-    valueDate: r.date,
-    reference: r.reference || '',
+    datePosted: r.date || r.statementDate,
+    valueDate: r.date || r.statementDate,
+    reference: r.reference && String(r.reference).toLowerCase() !== 'customer' ? r.reference : '',
     particulars: r.remarks,
+    rawParticulars: r.remarks,
     creditAmount: r.amount,
     name: r.name,
     employer: r.employer,
     remarks: r.remarks,
-    date: r.date,
+    date: r.date || r.statementDate,
     payer: r.name,
     description: r.remarks,
     amount: r.amount,
@@ -297,18 +299,22 @@ function toBankImportRows(creditRows) {
   return creditRows.map((r) => {
     const parsed = parsePipeParticulars(r.particulars)
     const borrowerName = r.name || parsed.borrowerName || ''
+    const personName = looksLikePersonName(borrowerName) ? borrowerName : ''
+    const raw = String(r.particulars || '').trim()
+    const ref = r.reference && String(r.reference).toLowerCase() !== 'customer' ? r.reference : ''
     return {
       ...r,
       datePosted: r.datePosted,
       valueDate: r.valueDate,
-      reference: r.reference,
-      particulars: r.particulars,
+      reference: ref,
+      particulars: raw,
+      rawParticulars: raw,
       creditAmount: r.creditAmount,
-      name: borrowerName,
+      name: personName,
       date: r.datePosted,
-      payer: borrowerName,
+      payer: personName,
       transactionDescription: parsed.description,
-      description: r.particulars,
+      description: raw,
       amount: r.creditAmount,
       employerOrBank: parsed.companyAccount || 'Bank of The Bahamas',
     }

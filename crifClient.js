@@ -101,24 +101,24 @@ export async function crif(json, condition, type = '', options = {}) {
   const execPromise = (async () => {
     try {
       const token = await getLoanDiskToken()
-      const res = await fetch(`${API_BASE}/SP/CRIF_Operations`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ Json: payload, Condition: condition, Type: type }),
-        signal: AbortSignal.timeout(CRIF_TIMEOUT_MS),
-      })
+  const res = await fetch(`${API_BASE}/SP/CRIF_Operations`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ Json: payload, Condition: condition, Type: type }),
+    signal: AbortSignal.timeout(CRIF_TIMEOUT_MS),
+  })
 
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.message || data.title || `CRIF ${condition} HTTP ${res.status}`)
-      if (!isSuccess(data.code)) throw new Error(data.message || `CRIF ${condition} failed`)
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.message || data.title || `CRIF ${condition} HTTP ${res.status}`)
+  if (!isSuccess(data.code)) throw new Error(data.message || `CRIF ${condition} failed`)
 
-      let table = []
-      try {
-        const doc = typeof data.document === 'string' ? JSON.parse(data.document) : data.document
-        table = doc?.Table ?? []
-      } catch {
-        table = []
-      }
+  let table = []
+  try {
+    const doc = typeof data.document === 'string' ? JSON.parse(data.document) : data.document
+    table = doc?.Table ?? []
+  } catch {
+    table = []
+  }
       const rows = Array.isArray(table) ? table : []
 
       if (isRead && ttl > 0) {

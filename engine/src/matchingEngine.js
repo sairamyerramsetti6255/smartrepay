@@ -218,7 +218,7 @@ function contextFor(cand, recon, tx, identity, historyId) {
 }
 
 function emptyRecord(tx, reason) {
-  return { bankTransactionId: tx.Id, fileName: tx.FileName, bankBorrowerName: transactionIdentity(tx).borrowerName || tx.BorrowerName,
+  return { bankTransactionId: tx.Id, fileName: tx.FileName, bankBorrowerName: transactionIdentity(tx).borrowerName || null,
     loanDiskBorrowerName: null, borrowerId: null, loanNumber: null, matchedLoanNumbers: [], loanCount: 0,
     emiPaidAmount: tx.EmiPaidAmount ?? null, expectedEmiAmount: null, summedExpectedEmi: null, amountDiff: null,
     matchType: 'unmatched', amountMatchKind: 'none', nameScore: 0, confidenceScore: 0, confidenceBucket: 'different_person',
@@ -245,6 +245,19 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
   const conflictingReference = hints.length > 1
   const nameConflict = hints.length === 1 && candidates.some((v) => v.score >= 92 && v.group.key !== hints[0].group.key)
   if (hints.length) candidates = hints
+  const companyCredit = !!identity.companyCredit && !inputName && !descName && !hints.length
+  if (companyCredit) {
+    return {
+      record: {
+        ...base,
+        matchType: 'employer_remittance',
+        reviewStatus: 'unmatched',
+        reasoning: '[different_person] Employer/org credit has no borrower name — route to employer remittance queue; amount alone is not a match.',
+      },
+      needsAi: false,
+      candidates: [],
+    }
+  }
   const anonymousCash = identity.cash && !inputName && !descName && !hints.length
   if (anonymousCash) candidates = [...index.groups.values()].filter((g) => g.loans.some(activeLoan)).map((group) => ({ group, score: 0, nameKind: 'cash_amount', partialIdentity: true }))
   const historyId = confirmedHistory(tx, identity, index)
@@ -257,10 +270,9 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     let confidence
     if (cand.hintedLoanNumber) confidence = 100
     else if (anonymousCash) {
-      // Cash deposits (no payer name) can only be matched on amount alone.
-      // Only surface for review when the amount is an EXACT single-loan match —
-      // partial fractions, multi-EMI guesses, and mismatches are pure coincidence.
-      const exactCash = recon.kind === 'exact_single' || recon.kind === 'emi_multiple'
+      // Cash deposits (no payer name) can only be suggested on an exact single EMI.
+      // Multi-EMI guesses and company ACH credits are coincidences, not matches.
+      const exactCash = recon.kind === 'exact_single'
       confidence = exactCash ? 80 + (context.due ? 5 : 0) + (context.nearDue ? 3 : 0) + (context.pendingCount ? 3 : 0) : 0
     }
     else if (cand.partialIdentity) confidence = cand.score + (reconciled(recon) ? 10 : 0) + (context.employer ? 5 : 0) + (context.history ? 10 : 0)
@@ -279,7 +291,7 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     // Independent first + last is not a full identity; cap below exact/same-person.
     if (isIndependentFirstLast(cand) && reconciled(recon) && !historyAuto) confidence = Math.min(confidence, 91)
     return { cand, recon, context, confidence: round2(confidence), historyAuto }
-  }).filter((s) => anonymousCash ? reconciled(s.recon) : s.cand.score >= c.NAME_MIN)
+  }).filter((s) => anonymousCash ? s.recon.kind === 'exact_single' : s.cand.score >= c.NAME_MIN)
     .sort((a, b) => b.confidence - a.confidence || b.cand.score - a.cand.score || a.cand.group.key.localeCompare(b.cand.group.key))
   if (!scored.length) return { record: { ...base, reasoning: '[different_person] No qualifying borrower candidate; cash credits require an active loan and a reconcilable EMI amount.' }, needsAi: false, candidates: [] }
   const best = scored[0], second = scored[1]
@@ -294,7 +306,7 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
   const blocked = identityBlocked || allocationBlocked
   const confidence = identityBlocked ? Math.min(best.confidence, 91) : best.confidence
   const autoFloor = Math.max(AUTO_CONFIDENCE, Number(c.AUTO_CONFIDENCE) || AUTO_CONFIDENCE)
-  const identityOk = cand.strongIdentity || cand.score >= autoFloor || historyAuto || isIndependentFirstLast(cand) || hasFirstLastIdentity(cand)
+  const identityOk = cand.strongIdentity || historyAuto || isIndependentFirstLast(cand) || hasFirstLastIdentity(cand) || cand.nameKind === 'exact_loan_id' || cand.nameKind === 'exact_borrower_id'
   const status = !blocked && confidence >= autoFloor && identityOk
     ? 'auto_matched' : confidence >= 80 || ambiguous ? 'needs_review' : 'unmatched'
   const bucket = confidenceBucket(confidence)
@@ -340,10 +352,10 @@ export function classify(tx, index, c = runtimeConfig) {
   const original = result.record
   const anonymous = result.candidates[0]?.nameKind === 'cash_amount'
   const score = Number(original.confidenceScore)
-  const historyPerfect = original.historyMatched && score >= 100
+  const historyPerfect = original.historyMatched && score >= 100 && (original.firstLastIdentity || original.independentFirstLast)
   const status = anonymous
     ? 'needs_review'
-    : historyPerfect || score >= AUTO_CONFIDENCE
+    : historyPerfect
       ? 'auto_matched'
       : original.reviewStatus
   const ready = original.reviewStatus === 'auto_matched' || historyPerfect
@@ -358,9 +370,7 @@ export function classify(tx, index, c = runtimeConfig) {
     matchedLoanNumbers: anonymous ? [] : original.matchedLoanNumbers,
     matchType: historyPerfect || ready ? original.matchType : status !== 'unmatched' ? 'review_required' : original.matchType,
     emiCount: ready ? original.emiCount : null,
-    reasoning: status === 'auto_matched' && !ready
-      ? original.reasoning.replace(/^(\[[^\]]+\] )/, '$1Matched by ≥81% rule; review required before posting. ').slice(0, 1000)
-      : original.reasoning,
+    reasoning: original.reasoning,
   }
   return result
 }

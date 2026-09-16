@@ -67,10 +67,10 @@ export const RULE_CATALOG = {
     ],
   },
   confidenceBuckets: [
-    { key: 'same_person', min: 98, label: 'Same person', hint: 'Exact / same person — full name strong and amount usually reconciles.' },
-    { key: 'very_likely_match', min: 81, max: 97, label: 'Very likely', hint: 'Matched band; 81–97%.' },
-    { key: 'possible_review', min: 71, max: 80, label: 'Review', hint: 'Evidence suggests a candidate; manual review required.' },
-    { key: 'different_person', max: 70, label: 'Unmatched', hint: 'Insufficient evidence to assign a borrower.' },
+    { key: 'verified_match', label: 'Verified Match %', hint: 'Staff confirmed or ready to post — not a raw engine score.' },
+    { key: 'evidence_backed_match', min: 81, max: 100, label: 'Evidence-backed Match %', hint: 'Suggested with strong multi-signal evidence (≥81%), awaiting staff verification.' },
+    { key: 'needs_review', label: 'Staff Decision %', hint: 'Pending staff decision, mid-band suggestions, or employer remittance. Distinct from Summary “Needs Review” status.' },
+    { key: 'wrong_match', label: 'Wrong Match %', hint: 'No borrower identity, or a pick with name score under 70%.' },
   ],
 }
 

@@ -2,6 +2,7 @@ import sql from 'mssql'
 import { config } from './config.js'
 import { chunk } from './concurrency.js'
 import { crif } from '../../crifClient.js'
+import { isRematchProtected, isIdentityGuess } from './matchProtection.js'
 
 /**
  * Data access layer — port of dataaccess.cs.
@@ -388,6 +389,17 @@ export async function getMatchHistory() {
   return execCrif('{}', 'Get_TransactionMatches')
 }
 
+/** Drop confirmed amount-only guesses so Save_TransactionMatches can overwrite them. */
+export async function releaseIdentityGuesses(history = []) {
+  const rows = (history || []).filter((r) =>
+    ['confirmed', 'auto_matched'].includes(String(r.ReviewStatus || '')) && isIdentityGuess(r)
+  )
+  for (const r of rows) {
+    await execCrif({ BankTransactionId: Number(r.Id), ReviewStatus: 'unmatched' }, 'Update_MatchReview')
+  }
+  return rows.length
+}
+
 /**
  * Recurring repayment amounts per loan (cents), from the synced LoanDisk ledger.
  * An amount that appears at least twice is treated as the observed EMI.
@@ -429,7 +441,7 @@ export async function getLoanDiskDueRecords() {
  */
 export async function saveTransactionMatches(matches) {
   if (!matches.length) return 0
-  const protectedIds = new Set((await getMatchHistory()).filter((r) => (['confirmed', 'rejected'].includes(r.ReviewStatus) || (r.ReviewStatus === 'auto_matched' && r.MatchMethod === 'manual'))).map((r) => String(r.Id)))
+  const protectedIds = new Set((await getMatchHistory()).filter((r) => isRematchProtected(r)).map((r) => String(r.Id)))
   matches = matches.filter((m) => !protectedIds.has(String(m.bankTransactionId)))
   let saved = 0
 

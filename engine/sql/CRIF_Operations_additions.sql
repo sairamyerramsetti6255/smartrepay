@@ -18,7 +18,8 @@
 	BEGIN
 		SELECT 'True' AS Result, 'Details found' AS Message,
 			Id, FileName, FileType, SourceType, EmployerOrBank, TransDate, ReferenceNo,
-			Particulars, BorrowerName, NormalizedName, EmiPaidAmount, Remarks, UploadedDate, ImportedAt
+			Particulars, RawParticulars, BorrowerName, NormalizedName, EmiPaidAmount,
+			PostedDate, ValueDate, Remarks, OverrideReason, UploadedDate, ImportedAt
 		FROM Staging_BankTransactions
 		ORDER BY ImportedAt DESC, Id DESC;
 	END
@@ -27,8 +28,10 @@
 	ELSE IF (@Condition = 'Get_TransactionMatches')
 	BEGIN
 		SELECT 'True' AS Result, 'Details found' AS Message,
-			bt.Id, bt.TransDate, bt.BorrowerName, bt.EmiPaidAmount, bt.ReferenceNo,
-			bt.Particulars, bt.FileName, bt.SourceType, bt.EmployerOrBank, bt.Remarks,
+			bt.Id, COALESCE(bt.PostedDate, bt.TransDate) AS TransDate, bt.PostedDate, bt.ValueDate,
+			bt.BorrowerName, bt.EmiPaidAmount,
+			CASE WHEN LOWER(LTRIM(RTRIM(ISNULL(bt.ReferenceNo, '')))) IN ('', 'customer') THEN NULL ELSE bt.ReferenceNo END AS ReferenceNo,
+			bt.Particulars, bt.RawParticulars, bt.FileName, bt.SourceType, bt.EmployerOrBank, bt.Remarks, bt.OverrideReason,
 			m.LoanDiskBorrowerName, m.BorrowerId, m.LoanNumber, m.MatchedLoanNumbers,
 			m.LoanCount, m.SummedExpectedEMI, m.AmountDiff, m.MatchType, m.AmountMatchKind,
 			m.NameScore, m.ConfidenceScore, m.MatchMethod, m.ReviewStatus, m.Reasoning,
@@ -88,16 +91,16 @@
 	ELSE IF (@Condition = 'Save_BankTransactions')
 	BEGIN
 		INSERT INTO Staging_BankTransactions
-			(FileName, FileType, SourceType, EmployerOrBank, TransDate, ReferenceNo,
-			 Particulars, BorrowerName, NormalizedName, EmiPaidAmount, UploadedDate)
+			(FileName, FileType, SourceType, EmployerOrBank, TransDate, PostedDate, ValueDate, ReferenceNo,
+			 Particulars, RawParticulars, BorrowerName, NormalizedName, EmiPaidAmount, UploadedDate)
 		SELECT
-			j.FileName, j.FileType, j.SourceType, j.EmployerOrBank, j.TransDate, j.ReferenceNo,
-			j.Particulars, j.BorrowerName, j.NormalizedName, j.EmiPaidAmount,
+			j.FileName, j.FileType, j.SourceType, j.EmployerOrBank, j.TransDate, j.PostedDate, j.ValueDate, j.ReferenceNo,
+			j.Particulars, j.RawParticulars, j.BorrowerName, j.NormalizedName, j.EmiPaidAmount,
 			ISNULL(j.UploadedDate, GETUTCDATE())
 		FROM OPENJSON(@Json) WITH (
 			FileName NVARCHAR(260), FileType VARCHAR(20), SourceType VARCHAR(20),
-			EmployerOrBank NVARCHAR(255), TransDate DATE, ReferenceNo VARCHAR(100),
-			Particulars NVARCHAR(500), BorrowerName NVARCHAR(255), NormalizedName VARCHAR(255),
+			EmployerOrBank NVARCHAR(255), TransDate DATE, PostedDate DATE, ValueDate DATE, ReferenceNo VARCHAR(100),
+			Particulars NVARCHAR(2000), RawParticulars NVARCHAR(2000), BorrowerName NVARCHAR(255), NormalizedName VARCHAR(255),
 			EmiPaidAmount DECIMAL(18,2), UploadedDate DATETIME
 		) j;
 
@@ -118,7 +121,8 @@
 				MatchMethod VARCHAR(20), ReviewStatus VARCHAR(20), Reasoning NVARCHAR(1000)
 			)
 		) AS S ON T.BankTransactionId = S.BankTransactionId
-		WHEN MATCHED AND ISNULL(T.ReviewStatus, '') NOT IN ('confirmed','rejected') AND NOT (T.ReviewStatus = 'auto_matched' AND T.MatchMethod = 'manual') THEN UPDATE SET
+		WHEN MATCHED AND ISNULL(T.ReviewStatus, '') <> 'rejected'
+			AND NOT (T.ReviewStatus = 'confirmed' AND (ISNULL(T.MatchType, '') = 'loan_id' OR ISNULL(T.NameScore, 0) >= 70)) THEN UPDATE SET
 			T.FileName = S.FileName, T.BankBorrowerName = S.BankBorrowerName,
 			T.LoanDiskBorrowerName = S.LoanDiskBorrowerName, T.BorrowerId = S.BorrowerId,
 			T.LoanNumber = S.LoanNumber, T.MatchedLoanNumbers = S.MatchedLoanNumbers,
@@ -188,11 +192,19 @@
 		DECLARE @rv_conf DECIMAL(5,2) = TRY_CAST(JSON_VALUE(@Json,'$.Confidence') AS DECIMAL(5,2));
 		DECLARE @rv_amt DECIMAL(18,2) = TRY_CAST(JSON_VALUE(@Json,'$.EmiPaidAmount') AS DECIMAL(18,2));
 		DECLARE @rv_expected DECIMAL(18,2) = TRY_CAST(JSON_VALUE(@Json,'$.ExpectedEMIAmount') AS DECIMAL(18,2));
+		DECLARE @rv_override NVARCHAR(500) = JSON_VALUE(@Json,'$.OverrideReason');
 
 		IF @rv_amt IS NOT NULL AND @rv_amt > 0
 		BEGIN
 			UPDATE dbo.Staging_BankTransactions
 			SET EmiPaidAmount = @rv_amt
+			WHERE Id = @rv_btid;
+		END
+
+		IF @rv_override IS NOT NULL
+		BEGIN
+			UPDATE dbo.Staging_BankTransactions
+			SET OverrideReason = LEFT(@rv_override, 500)
 			WHERE Id = @rv_btid;
 		END
 

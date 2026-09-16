@@ -1,9 +1,12 @@
 import { orderStoredStatements } from './statementOrder.js'
 import path from 'path'
+import fs from 'fs'
 import { crif } from './crifClient.js'
 import { resolveParticularsFields } from './particularsParse.js'
-import { parseBucketFromReasoning, confidenceBucket } from './engine/src/matchingEngine.js'
+import { confidenceBucket } from './engine/src/matchingEngine.js'
+import { reviewStatusToUi } from '../shared/matchStatus.js'
 import db from './db.js'
+import { UPLOADS_DIR } from './paths.js'
 
 /**
  * Call the dynamic dispatcher stored procedure dbo.CRIF_Operations over HTTP
@@ -144,9 +147,9 @@ export async function insertBankTransactions(records, { fileName, uploadedDate }
 
   // Build prepared rows (proc JSON shape) + their dedup signatures.
   const prepared = rows.map((r) => {
-    const particulars = (r.particulars || r.description || '') || null
+    const rawParticulars = String(r.rawParticulars || r.particulars || r.description || '').trim() || null
     const parsed = resolveParticularsFields({
-      particulars,
+      particulars: rawParticulars,
       borrowerName: r.borrowerName || r.name || r.payer,
     })
     const borrowerName = parsed.borrowerName || null
@@ -154,8 +157,12 @@ export async function insertBankTransactions(records, { fileName, uploadedDate }
     const employerOrBank =
       r.employerOrBank || r.employer || (sourceType === 'bank' ? r.bank || null : null)
     const transDate = isoDate(r.datePosted || r.transDate || r.date || r.valueDate)
-    const referenceNo =
-      r.referenceNo || r.reference ? String(r.referenceNo || r.reference).slice(0, 100) : null
+    const postedDate = isoDate(r.datePosted || r.postedDate || r.transDate || r.date) || transDate
+    const valueDate = isoDate(r.valueDate || r.ValueDate) || null
+    let referenceNo =
+      r.referenceNo || r.reference ? String(r.referenceNo || r.reference).trim() : null
+    if (referenceNo && referenceNo.toLowerCase() === 'customer') referenceNo = null
+    if (referenceNo) referenceNo = referenceNo.slice(0, 100)
     const normalizedName = normalizeNameKey(borrowerName).slice(0, 255) || null
     const amount = toAmountOrNull(r.emiPaidAmount ?? r.amount ?? r.creditAmount)
 
@@ -165,9 +172,12 @@ export async function insertBankTransactions(records, { fileName, uploadedDate }
         FileType: fileType,
         SourceType: sourceType ? String(sourceType).slice(0, 20) : null,
         EmployerOrBank: employerOrBank ? String(employerOrBank).slice(0, 255) : null,
-        TransDate: transDate,
+        TransDate: postedDate || transDate,
+        PostedDate: postedDate,
+        ValueDate: valueDate,
         ReferenceNo: referenceNo,
-        Particulars: particulars ? String(particulars).slice(0, 500) : null,
+        Particulars: rawParticulars ? String(rawParticulars).slice(0, 2000) : null,
+        RawParticulars: rawParticulars ? String(rawParticulars).slice(0, 2000) : null,
         BorrowerName: borrowerName ? String(borrowerName).slice(0, 255) : null,
         NormalizedName: normalizedName,
         EmiPaidAmount: amount,
@@ -236,7 +246,7 @@ export async function getBankTransactions({ search = '' } = {}) {
     return {
       ...r,
       TransactionDescription: parsed.description || null,
-      BorrowerName: parsed.borrowerName || r.BorrowerName || null,
+      BorrowerName: parsed.borrowerName || null,
     }
   })
   const q = String(search || '').trim().toLowerCase()
@@ -247,42 +257,41 @@ export async function getBankTransactions({ search = '' } = {}) {
   )
 }
 
-/** Map the SQL ReviewStatus to the UI status vocabulary. */
-function reviewStatusToUi(rs) {
-  if (rs === 'auto_matched' || rs === 'confirmed') return 'matched'
-  if (rs === 'unmatched') return 'exception' // processed by a run, no match found
-  if (rs === 'needs_review') return 'pending'
-  return 'pending' // null / no match row yet => not matched yet (PENDING, not unmatched)
-}
-
 function shapeMatchRow(r) {
   const parsed = resolveParticularsFields({
-    particulars: r.Particulars,
+    particulars: r.Particulars || r.RawParticulars,
     borrowerName: r.BorrowerName,
   })
-  const reasoning = r.Reasoning || null
   const confidence_score = r.ConfidenceScore != null ? Number(r.ConfidenceScore) : null
-  const confidence_bucket = parseBucketFromReasoning(reasoning) || confidenceBucket(confidence_score ?? 0)
-
-  const fullParticulars = r.Particulars || parsed.full || null
+  const confidence_bucket = confidenceBucket(confidence_score ?? 0)
+  const rawParticulars = r.RawParticulars || r.Particulars || parsed.full || null
+  const fullParticulars = r.Particulars || parsed.full || rawParticulars
+  const postedDate = r.PostedDate || r.TransDate
+  const valueDate = r.ValueDate || null
+  const reference = r.ReferenceNo && String(r.ReferenceNo).trim().toLowerCase() !== 'customer'
+    ? r.ReferenceNo
+    : null
 
   return {
     id: String(r.Id),
     bank_transaction_id: r.Id,
     source_serial: r.SourceSerial,
     order_source: r.OrderSource,
-    date: r.TransDate,
-    payer: parsed.borrowerName || r.BorrowerName || null,
+    date: postedDate,
+    posted_date: postedDate || null,
+    value_date: valueDate,
+    payer: parsed.borrowerName || null,
     transaction_description: fullParticulars || parsed.description || null,
     amount: r.EmiPaidAmount != null ? Number(r.EmiPaidAmount) : null,
-    reference: r.ReferenceNo,
+    reference,
     description: fullParticulars,
     particulars: fullParticulars,
-    raw_description: fullParticulars,
+    raw_particulars: rawParticulars,
+    raw_description: rawParticulars,
     source_filename: r.FileName,
     source_type: r.SourceType,
     employer_or_bank: r.EmployerOrBank,
-    status: reviewStatusToUi(r.ReviewStatus),
+    status: reviewStatusToUi(r.ReviewStatus, r.MatchType, r.NameScore, { sourceType: r.SourceType }),
     review_status: r.ReviewStatus || null,
     posting_review_required: r.MatchType === 'review_required' && r.ReviewStatus !== 'confirmed',
     confidence_score,
@@ -304,6 +313,7 @@ function shapeMatchRow(r) {
     match_method: r.MatchMethod || null,
     reasoning: r.Reasoning || null,
     remarks: r.Remarks != null ? String(r.Remarks) : '',
+    override_reason: r.OverrideReason != null ? String(r.OverrideReason) : null,
   }
 }
 
@@ -348,6 +358,7 @@ export async function updateSqlMatchReview({
   confidence = null,
   emiPaidAmount = null,
   expectedEmiAmount = null,
+  overrideReason = null,
 }) {
   const payload = {
     BankTransactionId: Number(bankTransactionId),
@@ -362,6 +373,9 @@ export async function updateSqlMatchReview({
   }
   if (expectedEmiAmount != null && !Number.isNaN(Number(expectedEmiAmount))) {
     payload.ExpectedEMIAmount = Number(expectedEmiAmount)
+  }
+  if (overrideReason != null && String(overrideReason).trim()) {
+    payload.OverrideReason = String(overrideReason).trim().slice(0, 500)
   }
   await execCrif(payload, 'Update_MatchReview')
   return true
@@ -779,22 +793,110 @@ export async function getDashboardStats() {
   }
 }
 
-/** Uploaded-document list derived purely from staged credits in SQL Server. */
+/** Uploaded-document list from SQL staging, linked to locally saved originals. */
 export async function getDocuments() {
   const rows = await execCrif('{}', 'Get_Documents')
-  return rows.map((r) => ({
-    id: r.id,
-    filename: r.filename,
-    document_type: r.document_type || null,
-    source_type: r.source_type || null,
-    employer_or_bank: r.employer_or_bank || null,
-    date_from: r.date_from || null,
-    date_to: r.date_to || null,
-    total_rows: r.total_rows ?? 0,
-    matched_count: r.matched_count ?? 0,
-    unmatched_count: r.unmatched_count ?? 0,
-    created_at: r.created_at || null,
-  }))
+  return rows.map((r) => {
+    const gridName = String(r.filename || r.id || '').trim()
+    const local = findLocalDocument(gridName)
+    const storagePath = local?.storage_path || null
+    let hasFile = false
+    if (storagePath) {
+      try {
+        hasFile = fs.existsSync(storagePath) && fs.statSync(storagePath).isFile()
+      } catch {
+        hasFile = false
+      }
+    }
+    if (!hasFile && local?.id) {
+      try {
+        const dir = path.join(UPLOADS_DIR, local.id)
+        if (fs.existsSync(dir)) {
+          const files = fs.readdirSync(dir).filter((f) => !f.startsWith('.'))
+          hasFile = files.some((f) => fs.statSync(path.join(dir, f)).isFile())
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    return {
+      id: gridName,
+      document_id: local?.id || null,
+      filename: gridName,
+      original_filename: local?.filename || null,
+      has_file: hasFile,
+      document_type: r.document_type || null,
+      source_type: r.source_type || null,
+      employer_or_bank: r.employer_or_bank || null,
+      date_from: r.date_from || null,
+      date_to: r.date_to || null,
+      total_rows: r.total_rows ?? 0,
+      matched_count: r.matched_count ?? 0,
+      unmatched_count: r.unmatched_count ?? 0,
+      created_at: r.created_at || local?.created_at || null,
+      size_bytes: local?.size_bytes ?? null,
+    }
+  })
+}
+
+/**
+ * Resolve the SQLite documents row for a grid filename / document UUID.
+ * Exact matches only — never fuzzy LIKE (that returned wrong files).
+ */
+export function findLocalDocument(param) {
+  const key = String(param || '').trim()
+  if (!key) return null
+
+  let doc = db
+    .prepare(
+      `select * from documents
+       where id = ? or staged_filename = ? or filename = ?
+       order by created_at desc limit 1`
+    )
+    .get(key, key, key)
+  if (doc) return doc
+
+  // Legacy imports: grid uses base_HHMM.ext while documents.filename is original base.ext
+  const ext = path.extname(key)
+  const base = path.basename(key, ext)
+  const withoutStamp = base.replace(/_\d{4}$/, '')
+  if (withoutStamp && withoutStamp !== base) {
+    const guess = `${withoutStamp}${ext}`
+    doc = db
+      .prepare(
+        `select * from documents
+         where filename = ? or staged_filename = ?
+         order by created_at desc limit 1`
+      )
+      .get(guess, key)
+    if (doc) return doc
+  }
+  return null
+}
+
+/** Absolute path to the saved original bytes for a documents row. */
+export function resolveDocumentFilePath(doc) {
+  if (!doc) return null
+  const candidates = []
+  if (doc.storage_path) {
+    candidates.push(doc.storage_path)
+    candidates.push(String(doc.storage_path).replace(/\\/g, '/'))
+  }
+  if (doc.id) {
+    const dir = path.join(UPLOADS_DIR, doc.id)
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      const files = fs.readdirSync(dir).filter((f) => !f.startsWith('.'))
+      for (const f of files) candidates.push(path.join(dir, f))
+    }
+  }
+  for (const p of candidates) {
+    try {
+      if (p && fs.existsSync(p) && fs.statSync(p).isFile()) return p
+    } catch {
+      /* try next */
+    }
+  }
+  return null
 }
 
 /** Cascade-delete a file's staged credits (and their matches) from SQL Server. */

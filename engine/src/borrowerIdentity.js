@@ -1,33 +1,33 @@
 import { stripPaymentNote } from './bankName.js'
-import { nameTokens, scoreNameMatch, doubleMetaphone, normalizeNameKey } from './nameMatch.js'
-import { resolveParticularsFields, isCompanyName } from '../../particularsParse.js'
+import { nameTokens, scoreNameMatch, doubleMetaphone, normalizeNameKey, tokenConfidence } from './nameMatch.js'
+import { resolveParticularsFields, isCompanyName, isFusedEmployerName, extractPayerFromNarration, looksLikeBankNarration, looksLikePersonName } from '../../particularsParse.js'
 
 export const compactName = (text) => nameTokens(text).join('')
 export const normalizeLoanId = (text) => String(text ?? '').toUpperCase().trim().replace(/^LN[\s:#-]*(?=\d)/, '').replace(/[\s:#-]/g, '')
 const clean = (text) => String(text ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[’']/g, '')
 export const personTokens = (text) => nameTokens(clean(text))
 export const activeLoan = (loan) => /^(active|current|open|arrears|overdue|past due|delinquent)$/i.test(String(loan.status || '').trim())
-const generic = /^(cash deposit(?: in branch)?|deposit|transfer|salary|salaries|direct credit|loan payment|repayment)$/i
+const generic = /^(cash deposit(?: in branch)?|cheque deposit(?:\s*-\s*local)?|check deposit|deposit|transfer|salary|salaries|direct credit|loan payment|repayment)$/i
 
 export function transactionIdentity(tx) {
   const parsed = resolveParticularsFields({ particulars: tx.Particulars, borrowerName: tx.BorrowerName })
   let name = parsed.borrowerName
   // A staged payer occasionally contains the entire narrative. Prefer its pipe name.
-  if (name?.includes('|')) name = resolveParticularsFields({ particulars: name }).borrowerName
+  if (name?.includes('|') || looksLikeBankNarration(name) || !looksLikePersonName(name)) {
+    name = resolveParticularsFields({ particulars: name || parsed.full, borrowerName: '' }).borrowerName
+  }
   name = stripPaymentNote(name)
-  if (isCompanyName(name) || generic.test(name)) name = ''
+  if (!looksLikePersonName(name) || isCompanyName(name) || generic.test(name) || isFusedEmployerName(name)) name = ''
   let descriptionName = ''
-  if (!name && !parsed.full.includes('|')) {
-    descriptionName = parsed.description
-      .replace(/\b(?:loan(?:\s*id)?|top[\s-]*up|account|ln)[\s:#-]*[a-z]*\d[\w-]*/gi, ' ')
-      .replace(/\b(?:direct credit|cash deposit in branch|ebank|internal|same cust|transfer|salary|salaries|payment|repayment|from|to)\b/gi, ' ')
-      .replace(/\d+/g, ' ').replace(/\s+/g, ' ').trim()
-    descriptionName = stripPaymentNote(descriptionName)
-    if (isCompanyName(descriptionName) || generic.test(descriptionName)) descriptionName = ''
+  if (!name) {
+    const fromCredit = extractPayerFromNarration(parsed.description || parsed.full)
+    if (fromCredit && looksLikePersonName(fromCredit)) descriptionName = fromCredit
+    // Do not invent a person from leftover narration tokens (e.g. Cheque Deposit - Local).
   }
   const employer = String(tx.EmployerName || '').trim() || parsed.description.match(/direct\s+credit\s+(.+?)\s*-\s*(?:salar(?:y|ies)|loans?)\b/i)?.[1] || ''
-  return { ...parsed, borrowerName: name, descriptionName, employer,
-    cash: /cash\s+deposit(?:\s+in\s+branch)?/i.test(parsed.full) || !!parsed.companyAccount || isCompanyName(tx.BorrowerName) }
+  const cash = /(?:cash|cheque|check)\s+deposit(?:\s+in\s+branch)?/i.test(parsed.full)
+  const companyCredit = !!parsed.companyAccount || isCompanyName(tx.BorrowerName)
+  return { ...parsed, borrowerName: name, descriptionName, employer, cash, companyCredit }
 }
 
 export function extractLoanIds(text) {
@@ -63,6 +63,11 @@ export function createIdentityIndex(groups, history = []) {
         const fl = [tokens[0], tokens[tokens.length - 1]]
         add(index.compact, fl.join(''), group)
         add(index.compact, [fl[1], fl[0]].join(''), group)
+        // Bank often omits given name: index middle(+…) + last (e.g. Meshell Dean)
+        for (let i = 1; i < tokens.length - 1; i++) {
+          add(index.compact, tokens.slice(i).join(''), group)
+        }
+        add(index.compact, tokens.slice(-2).join(''), group)
       }
       for (const token of new Set(tokens)) {
         add(index, token, group)
@@ -110,6 +115,41 @@ export function identityNameScore(input, target, floor = 0.7) {
   // tokens from the beginning of the master name remain strong evidence.
   if (a.length >= 3 && a.length < b.length && a.every((t, i) => t.length > 1 && t === b[i])) {
     return { score: 94, nameKind: 'truncated_full_name', strongIdentity: true }
+  }
+  // Bank omits first/given name: "MESHELL DEAN" vs "Ranie Meshell Dean".
+  // Do not score the missing first name; score middle(+…) + last when they align.
+  if (a.length >= 2 && b.length > a.length && a.every((t) => t.length > 1)) {
+    let best = null
+    for (let i = 1; i <= b.length - a.length; i++) {
+      const window = b.slice(i, i + a.length)
+      const pairs = a.map((t, j) => tokenConfidence(t, window[j]))
+      if (!pairs.every((p) => p.blended >= floor)) continue
+      const quality = pairs.reduce((s, p) => s + p.blended, 0) / pairs.length
+      const trailing = i + a.length === b.length
+      if (!best || quality > best.quality || (quality === best.quality && trailing && !best.trailing)) {
+        best = { quality, trailing, pairs, start: i }
+      }
+    }
+    if (best) {
+      const exact = best.pairs.every((p) => p.blended >= 0.999)
+      // High confidence for trailing middle+last; never auto-treat as full same-person.
+      const score = exact && best.trailing
+        ? Math.min(91, Math.round(84 + best.quality * 7))
+        : Math.min(86, Math.round(76 + best.quality * 10))
+      return {
+        score,
+        nameKind: best.trailing ? 'middle+last' : 'name_window',
+        partialIdentity: true,
+        strongIdentity: false,
+        nameBreakdown: {
+          first: { skipped: true, match: false },
+          last: best.pairs[best.pairs.length - 1],
+          middleLast: true,
+          windowStart: best.start,
+          windowQuality: best.quality,
+        },
+      }
+    }
   }
   if (a.length === 1) {
     if (a[0].length < 3) return empty

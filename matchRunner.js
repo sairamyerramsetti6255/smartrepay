@@ -1,7 +1,8 @@
 import { loadPaymentHistory } from './paymentHistory.js'
 import { assessPayment } from './engine/src/paymentAssessment.js'
 import { groupLoansByBorrower, buildBorrowerIndex, classify, applyRepaymentHistoryMatch, typicalCentsFromRepaymentRows } from './engine/src/matchingEngine.js'
-import { getBankTransactions, getLoanDiskDueRecords, getMatchHistory, getTypicalRepaymentAmounts, saveTransactionMatches } from './engine/src/dataAccess.js'
+import { getBankTransactions, getLoanDiskDueRecords, getMatchHistory, getTypicalRepaymentAmounts, saveTransactionMatches, releaseIdentityGuesses } from './engine/src/dataAccess.js'
+import { isRematchProtected } from './engine/src/matchProtection.js'
 import db from './db.js'
 import { buildEngineConfig } from './matchingRules.js'
 import { yieldEventLoop } from './asyncUtil.js'
@@ -27,7 +28,9 @@ export async function runMatch({ fileNames = null, onProgress } = {}) {
     getTypicalRepaymentAmounts(),
   ])
   const scope = Array.isArray(fileNames) && fileNames.length ? new Set(fileNames.map(String)) : null
-  const protectedIds = new Set(history.filter((r) => (['confirmed', 'rejected'].includes(r.ReviewStatus) || (r.ReviewStatus === 'auto_matched' && r.MatchMethod === 'manual'))).map((r) => String(r.Id)))
+  const scopedHistory = history.filter((t) => !scope || scope.has(String(t.FileName)))
+  await releaseIdentityGuesses(scopedHistory)
+  const protectedIds = new Set(history.filter((r) => isRematchProtected(r)).map((r) => String(r.Id)))
   const scoped = allBankTx.filter((t) => !scope || scope.has(String(t.FileName)))
   const bankTx = scoped.filter((t) => !protectedIds.has(String(t.Id)))
   const master = new Map(db.prepare('select loandisk_id, aliases, employer from borrowers where loandisk_id is not null').all().map((b) => [String(b.loandisk_id), b]))
@@ -72,7 +75,8 @@ export async function runMatch({ fileNames = null, onProgress } = {}) {
     let record = applyRepaymentHistoryMatch(draft, group?.loans || [], typical, engineCfg)
     const loan = group?.loans.find(l=>l.loanNumber===record.loanNumber)
     const historyPerfect = record.historyMatched && Number(record.confidenceScore) >= 100
-    if (loan && !historyPerfect) {
+    const alreadyMatched = record.reviewStatus === 'auto_matched' || historyPerfect
+    if (loan && !alreadyMatched) {
       const assessment = assessPayment(tx, loan, ledgers.get(record.loanNumber))
       record.paymentAssessment = assessment
       if (assessment.requiresReview) {
@@ -80,8 +84,8 @@ export async function runMatch({ fileNames = null, onProgress } = {}) {
         record.emiCount = null
       }
       record.reasoning = record.reasoning.replace(/^(\[[^\]]+\] )/, `$1${assessment.explanation} `).slice(0, 1000)
-    } else if (historyPerfect) {
-      record.matchType = 'name_and_amount'
+    } else if (alreadyMatched) {
+      record.matchType = record.matchType === 'unmatched' ? 'name_and_amount' : record.matchType
       record.emiCount = record.emiCount || 1
     }
     matches.push(record)
