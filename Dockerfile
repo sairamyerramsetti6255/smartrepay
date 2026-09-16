@@ -7,13 +7,14 @@ RUN npm ci --omit=dev
 
 COPY . .
 
+RUN chmod +x /app/start.sh
+
 ENV NODE_ENV=production
 ENV PORT=3001
 
 EXPOSE 3001
 
-# Do NOT use wget/curl HEALTHCHECK on alpine — those binaries are missing and
-# mark the container unhealthy, which makes Coolify stick on "Restarting" / 503.
-# Coolify's HTTP health check should hit /api/health on port 3001 instead.
+# Coolify HTTP healthcheck should use: GET /api/health on port 3001
+# Do not add a Docker HEALTHCHECK that depends on wget/curl (missing on alpine).
 
-CMD ["node", "--experimental-sqlite", "index.js"]
+CMD ["/app/start.sh"]
