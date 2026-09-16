@@ -265,7 +265,7 @@ const healthPayload = () => ({
   status: 'healthy',
   backend: 'node-sqlite',
   ai: !!process.env.OPENROUTER_API_KEY,
-  build: '1.8.0',
+  build: '1.8.1-coolify',
   heavyJob: getActiveJobName(),
   features: {
     documents: true,
