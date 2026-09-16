@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildEngineConfig, previewMatchSample, extractIdsWithPatterns } from '../../matchingRules.js'
-import { groupLoansByBorrower, buildBorrowerIndex, classifyEvidence as classify, classify as classifyWithPolicy, matchStatusFor, reconcileAmount, applyAi, getMatchingEngineConfig, setMatchingEngineConfig } from '../src/matchingEngine.js'
+import { groupLoansByBorrower, buildBorrowerIndex, classifyEvidence as classify, classify as classifyWithPolicy, matchStatusFor, reconcileAmount, applyAi, applyRepaymentHistoryMatch, getMatchingEngineConfig, setMatchingEngineConfig } from '../src/matchingEngine.js'
 import { extractLoanIds, identityNameScore } from '../src/borrowerIdentity.js'
 import { isCompanyName } from '../../particularsParse.js'
 const loan = (id, name, emi, extra = {}) => ({ BorrowerId: id, LoanNumber: `LN${id}`, BorrowerFullName: name, ExpectedEMIAmount: emi, LoanStatus: 'active', ...extra })
@@ -185,19 +185,37 @@ test('independent first + last + exact EMI is matched at 81%+', () => {
   assert.equal(posted.reviewStatus, 'auto_matched')
   assert.equal(posted.borrowerId, '1')
 })
-test('first+last + credit matching historical repayments is a 100% match', () => {
+test('first+last + EMI mismatch + matching history is a 100% match, not review', () => {
   const histLoan = loan('1', 'Chewuakii Mary T Symon', 413.72, { HistoricalPaymentCents: [10343] })
   const r = resolve(tx('Chewuakii Symon', 103.43), [histLoan])
   assert.equal(r.reviewStatus, 'auto_matched')
   assert.equal(r.confidenceScore, 100)
   assert.equal(r.confidenceBucket, 'same_person')
-  assert.equal(r.loanNumber, 'LN1')
+  assert.equal(r.matchType, 'name_and_amount')
+  assert.equal(r.amountMatchKind, 'history_installment')
   assert.equal(r.historyMatched, true)
-  assert.match(r.reasoning, /historical repayment EMI/)
   const posted = classifyWithPolicy(tx('Chewuakii Symon', 103.43), buildBorrowerIndex(groupLoansByBorrower([histLoan]))).record
   assert.equal(posted.reviewStatus, 'auto_matched')
-  assert.equal(posted.confidenceScore, 100)
   assert.equal(posted.matchType, 'name_and_amount')
+  assert.notEqual(posted.matchType, 'review_required')
+})
+test('full name + EMI mismatch + matching history is a 100% match', () => {
+  const histLoan = loan('1', 'Martha Jane Smith', 611.17, { HistoricalPaymentCents: [15280] })
+  const r = resolve(tx('Martha Jane Smith', 152.80), [histLoan])
+  assert.equal(r.reviewStatus, 'auto_matched')
+  assert.equal(r.confidenceScore, 100)
+  assert.equal(r.historyMatched, true)
+  assert.equal(r.amountMatchKind, 'history_installment')
+})
+test('live repayment history upgrades a first+last EMI miss to 100%', () => {
+  const histLoan = loan('1', 'Chewuakii Mary T Symon', 413.72)
+  const draft = resolve(tx('Chewuakii Symon', 103.43), [histLoan])
+  assert.notEqual(draft.confidenceScore, 100)
+  const promoted = applyRepaymentHistoryMatch(draft, groupLoansByBorrower([histLoan]).get('id:1').loans, new Map([['LN1', [10343]]]))
+  assert.equal(promoted.reviewStatus, 'auto_matched')
+  assert.equal(promoted.confidenceScore, 100)
+  assert.equal(promoted.matchType, 'name_and_amount')
+  assert.equal(promoted.historyMatched, true)
 })
 test('first+last + contractual EMI + matching history is a 100% match', () => {
   const r = resolve(tx('Chewuakii Symon', 350), [loan('1', 'Chewuakii Mary T Symon', 350, { HistoricalPaymentCents: [35000] })])
@@ -223,7 +241,7 @@ test('legacy human confirmations can supply history; automatic guesses cannot', 
   assert.doesNotMatch(resolve(tx('M Bowe'),master,[{...h,MatchMethod:'deterministic'}]).reasoning,/Previously confirmed/)
 })
 test('different installment ratios on different loans still require review', () => {
-  const r=resolve(tx('Martha Jane Smith',193.70),[loan('1','Martha Jane Smith',96.72),loan('1','Martha Jane Smith',387.39,{LoanNumber:'LN99'})])
+  const r=resolve(tx('Martha Jane Smith',350),[loan('1','Martha Jane Smith',175),loan('1','Martha Jane Smith',350,{LoanNumber:'LN99'})])
   assert.equal(r.reviewStatus,'needs_review');assert.equal(r.loanNumber,null)
 })
 

@@ -1,6 +1,6 @@
 import { loadPaymentHistory } from './paymentHistory.js'
 import { assessPayment } from './engine/src/paymentAssessment.js'
-import { groupLoansByBorrower, buildBorrowerIndex, classify } from './engine/src/matchingEngine.js'
+import { groupLoansByBorrower, buildBorrowerIndex, classify, applyRepaymentHistoryMatch, typicalCentsFromRepaymentRows } from './engine/src/matchingEngine.js'
 import { getBankTransactions, getLoanDiskDueRecords, getMatchHistory, getTypicalRepaymentAmounts, saveTransactionMatches } from './engine/src/dataAccess.js'
 import db from './db.js'
 import { buildEngineConfig } from './matchingRules.js'
@@ -40,36 +40,54 @@ export async function runMatch({ fileNames = null, onProgress } = {}) {
   emit({ phase: 'loaded', bankTx: bankTx.length, loans: loans.length, scopedFiles: scope?.size || 0 })
   // Fetch once per selected loan, with bounded concurrency. No LoanDisk writes.
   const drafts = bankTx.map(tx => ({ tx, record: classify(tx, index, engineCfg).record }))
-  const loanIds = [...new Set(drafts.map(d=>d.record.loanNumber).filter(Boolean))]
+  const loanIds = new Set()
+  for (const { record } of drafts) {
+    if (record.loanNumber) loanIds.add(record.loanNumber)
+    const group = groups.get(`id:${record.borrowerId}`)
+    if (group && (record.firstLastIdentity || record.independentFirstLast) && !record.historyMatched) {
+      for (const loan of group.loans) if (loan.loanNumber) loanIds.add(loan.loanNumber)
+    }
+  }
   const ledgers = new Map()
+  const loanIdList = [...loanIds]
   let next = 0, loaded = 0
-  await Promise.all(Array.from({length: Math.min(4, loanIds.length)}, async () => {
-    while (next < loanIds.length) {
-      const loanId = loanIds[next++]
+  await Promise.all(Array.from({length: Math.min(4, loanIdList.length)}, async () => {
+    while (next < loanIdList.length) {
+      const loanId = loanIdList[next++]
       const loan = [...groups.values()].flatMap(g=>g.loans).find(l=>l.loanNumber===loanId)
-      ledgers.set(loanId, await loadPaymentHistory(loan))
-      emit({ phase: 'payment-history', done: ++loaded, total: loanIds.length })
+      ledgers.set(loanId, loan ? await loadPaymentHistory(loan) : { rows: [], complete: false })
+      emit({ phase: 'payment-history', done: ++loaded, total: loanIdList.length })
     }
   }))
   const matches = []
   const counts = { matched: 0, unmatched: 0, needsReview: 0 }
-  for (const { tx, record } of drafts) {
-    const group = groups.get(`id:${record.borrowerId}`)
+  for (const { tx, record: draft } of drafts) {
+    const group = groups.get(`id:${draft.borrowerId}`)
+    const typical = new Map()
+    for (const loan of group?.loans || []) {
+      const fromSql = loan.historicalPaymentCents || []
+      const fromLedger = typicalCentsFromRepaymentRows(ledgers.get(loan.loanNumber)?.rows || []).get(String(loan.loanNumber)) || []
+      typical.set(String(loan.loanNumber), [...new Set([...fromSql, ...fromLedger])])
+    }
+    let record = applyRepaymentHistoryMatch(draft, group?.loans || [], typical, engineCfg)
     const loan = group?.loans.find(l=>l.loanNumber===record.loanNumber)
-    if (loan) {
+    const historyPerfect = record.historyMatched && Number(record.confidenceScore) >= 100
+    if (loan && !historyPerfect) {
       const assessment = assessPayment(tx, loan, ledgers.get(record.loanNumber))
       record.paymentAssessment = assessment
-      if (assessment.requiresReview && !(record.historyMatched && record.confidenceScore >= 100)) {
+      if (assessment.requiresReview) {
         record.matchType = 'review_required'
         record.emiCount = null
       }
-      // SQL stores a bounded reasoning field. Put payment evidence first so it survives.
       record.reasoning = record.reasoning.replace(/^(\[[^\]]+\] )/, `$1${assessment.explanation} `).slice(0, 1000)
+    } else if (historyPerfect) {
+      record.matchType = 'name_and_amount'
+      record.emiCount = record.emiCount || 1
     }
     matches.push(record)
     if (record.reviewStatus === 'auto_matched') counts.matched++
     else if (record.reviewStatus === 'unmatched') counts.unmatched++
-    if (record.reviewStatus === 'needs_review' || record.matchType === 'review_required') counts.needsReview++
+    if (record.reviewStatus === 'needs_review') counts.needsReview++
     if (matches.length % 50 === 0) {
       emit({ phase: 'classifying', done: matches.length, total: bankTx.length, ...counts })
       await yieldEventLoop()

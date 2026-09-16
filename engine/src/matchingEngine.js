@@ -104,6 +104,61 @@ function uniqueHistoryAllocation(cents, loans, c) {
   }
 }
 
+function emiSubsets(emiList, c) {
+  const subsets = emiList.map((l) => [l])
+  const truncated = c.useSubsetSum && emiList.length > 12
+  if (c.useSubsetSum && emiList.length <= 12) {
+    for (let mask = 1; mask < (1 << emiList.length); mask++) {
+      if ((mask & (mask - 1)) === 0) continue
+      subsets.push(emiList.filter((_, i) => mask & (1 << i)))
+    }
+  }
+  return { subsets, truncated }
+}
+
+/** Contractual EMI = full installment, integer multiples, subsets, charges. Fractions run after history. */
+function collectEmiPossibilities(subsets, emiList, cents, amt, c, { fractions }) {
+  const possibilities = []
+  for (const subset of subsets) {
+    const base = subset.reduce((sum, l) => sum + Math.round(l.expectedEMI * 100), 0)
+    const scales = []
+    if (fractions) {
+      scales.push(...(c.installmentScales || []).filter((s) => s.scale > 0 && s.scale < 1))
+    } else {
+      scales.push({ scale: 1, freq: 'base installment' })
+      const pct = c.AMOUNT_TOL_PCT
+      const floorTolerance = c.AMOUNT_TOL_MIN * 100
+      const low = Math.max(2, Math.ceil(Math.min((cents - floorTolerance) / base, cents / (base * (1 + pct)))))
+      const high = Math.min(c.MAX_EMI_MULTIPLE || 60, Math.floor(Math.max((cents + floorTolerance) / base, cents / (base * (1 - pct)))))
+      for (let count = low; count <= high; count++) scales.push({ scale: count, freq: `${count} EMIs` })
+    }
+    for (const { scale, freq } of scales) {
+      const expected = Math.round(base * scale)
+      const diff = cents - expected
+      if (Math.abs(diff) > Math.round(tolerance(expected / 100, c) * 100)) continue
+      possibilities.push({
+        kind: scale > 1 ? 'emi_multiple' : subset.length === 1 ? 'exact_single' : subset.length === emiList.length ? 'sum_all' : 'subset',
+        loanNumbers: subset.map((l) => l.loanNumber), summedExpected: base / 100, diff: diff / 100, frequency: freq, emiCount: scale,
+      })
+    }
+    if (!fractions && subset.length === 1 && Number.isFinite(subset[0].charges) && subset[0].charges > 0) {
+      const charges = Math.round(subset[0].charges * 100)
+      const k = Math.round((cents - charges) / base)
+      if (k >= 1 && k <= (c.MAX_EMI_MULTIPLE || 60) && Math.abs(cents - base * k - charges) <= Math.round(tolerance(amt, c) * 100)) {
+        possibilities.push({ kind: 'emi_with_charges', loanNumbers: [subset[0].loanNumber], summedExpected: base / 100,
+          diff: (cents - base * k - charges) / 100, frequency: `${k} EMIs + charges`, emiCount: k })
+      }
+    }
+  }
+  possibilities.sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff) || a.loanNumbers.length - b.loanNumbers.length || a.emiCount - b.emiCount)
+  return possibilities
+}
+
+function pickEmiBest(possibilities, truncated) {
+  if (!possibilities.length) return null
+  return { ...possibilities[0], ambiguous: truncated || possibilities.length > 1, alternatives: possibilities.slice(0, 5) }
+}
+
 /** Allocate only inside one borrower. Integer cents and all plausible allocations prevent first-hit bias. */
 export function reconcileAmount(paid, loans, c = runtimeConfig) {
   const amt = number(paid)
@@ -114,50 +169,19 @@ export function reconcileAmount(paid, loans, c = runtimeConfig) {
   const hist = uniqueHistoryAllocation(cents, list, c)
   const emiList = list.filter((l) => Number.isFinite(l.expectedEMI) && l.expectedEMI > 0)
   if (!emiList.length) return hist || none
-  const subsets = emiList.map((l) => [l])
-  // Bounded search. If the book is too large, do not claim a unique allocation.
-  const truncated = c.useSubsetSum && emiList.length > 12
-  if (c.useSubsetSum && emiList.length <= 12) {
-    for (let mask = 1; mask < (1 << emiList.length); mask++) {
-      if ((mask & (mask - 1)) === 0) continue
-      subsets.push(emiList.filter((_, i) => mask & (1 << i)))
-    }
-  }
-  const possibilities = []
-  for (const subset of subsets) {
-    const base = subset.reduce((sum, l) => sum + Math.round(l.expectedEMI * 100), 0)
-    const scales = [{ scale: 1, freq: 'base installment' }, ...(c.installmentScales || []).filter((s) => s.scale > 0 && s.scale < 1)]
-    // Include every count within the tolerance window, not just the rounded ratio.
-    const pct = c.AMOUNT_TOL_PCT
-    const floorTolerance = c.AMOUNT_TOL_MIN * 100
-    const low = Math.max(2, Math.ceil(Math.min((cents - floorTolerance) / base, cents / (base * (1 + pct)))))
-    const high = Math.min(c.MAX_EMI_MULTIPLE || 60, Math.floor(Math.max((cents + floorTolerance) / base, cents / (base * (1 - pct)))))
-    for (let count = low; count <= high; count++) scales.push({ scale: count, freq: `${count} EMIs` })
-    for (const { scale, freq } of scales) {
-      const expected = Math.round(base * scale)
-      const diff = cents - expected
-      if (Math.abs(diff) > Math.round(tolerance(expected / 100, c) * 100)) continue
-      possibilities.push({ kind: scale > 1 ? 'emi_multiple' : subset.length === 1 ? 'exact_single' : subset.length === emiList.length ? 'sum_all' : 'subset',
-        loanNumbers: subset.map((l) => l.loanNumber), summedExpected: base / 100, diff: diff / 100, frequency: freq, emiCount: scale })
-    }
-    if (subset.length === 1 && Number.isFinite(subset[0].charges) && subset[0].charges > 0) {
-      const charges = Math.round(subset[0].charges * 100)
-      const k = Math.round((cents - charges) / base)
-      if (k >= 1 && k <= (c.MAX_EMI_MULTIPLE || 60) && Math.abs(cents - base * k - charges) <= Math.round(tolerance(amt, c) * 100)) {
-        possibilities.push({ kind: 'emi_with_charges', loanNumbers: [subset[0].loanNumber], summedExpected: base / 100,
-          diff: (cents - base * k - charges) / 100, frequency: `${k} EMIs + charges`, emiCount: k })
-      }
-    }
-  }
-  possibilities.sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff) || a.loanNumbers.length - b.loanNumbers.length || a.emiCount - b.emiCount)
-  if (possibilities.length) {
-    const best = { ...possibilities[0], ambiguous: truncated || possibilities.length > 1, alternatives: possibilities.slice(0, 5) }
-    if (hist && hist.loanNumbers[0] === best.loanNumbers[0]) best.historyMatched = true
-    return best
+  const { subsets, truncated } = emiSubsets(emiList, c)
+
+  // 1) Contractual EMI. 2) If EMI does not uniquely match, repayment history. 3) Half/quarter EMI last.
+  const contractual = pickEmiBest(collectEmiPossibilities(subsets, emiList, cents, amt, c, { fractions: false }), truncated)
+  if (contractual && !contractual.ambiguous) {
+    if (hist && hist.loanNumbers[0] === contractual.loanNumbers[0]) contractual.historyMatched = true
+    return contractual
   }
   if (hist) return hist
+  if (contractual) return contractual
+  const fractional = pickEmiBest(collectEmiPossibilities(subsets, emiList, cents, amt, c, { fractions: true }), truncated)
+  if (fractional) return fractional
   const closest = emiList.map((l) => ({ l, diff: round2(amt - l.expectedEMI) })).sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff))[0]
-  // A residual is evidence for review; never invent late fees or infer a schedule.
   return { kind: amt < closest.l.expectedEMI ? 'partial' : 'mismatch', loanNumbers: [closest.l.loanNumber], summedExpected: closest.l.expectedEMI,
     diff: closest.diff, ambiguous: emiList.length > 1, frequency: null, emiCount: null }
 }
@@ -172,6 +196,13 @@ function isIndependentFirstLast(cand) {
   // Initials (M Smith) are not a first+last identity even when the surname matches.
   if (cand?.nameBreakdown?.first?.initial || cand?.nameBreakdown?.last?.initial) return false
   return true
+}
+
+/** First and last names both match — full identity or independent first+last. Initials do not count. */
+function hasFirstLastIdentity(cand) {
+  if (cand?.nameBreakdown?.first?.initial || cand?.nameBreakdown?.last?.initial) return false
+  if (cand?.strongIdentity || cand?.nameKind === 'exact_full' || String(cand?.nameKind || '').includes('+full')) return true
+  return isIndependentFirstLast(cand)
 }
 
 function contextFor(cand, recon, tx, identity, historyId) {
@@ -241,7 +272,7 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
       if (cand.nameKind === 'exact_full') confidence = Math.max(confidence, 98)
       confidence += (context.employer ? 3 : 0) + (context.history ? 5 : 0)
     }
-    const historyAuto = isIndependentFirstLast(cand) && recon.historyMatched && reconciled(recon)
+    const historyAuto = hasFirstLastIdentity(cand) && recon.historyMatched && reconciled(recon)
     if (historyAuto) confidence = 100
     else if (!cand.hintedLoanNumber) confidence = Math.min(confidence, 99)
     if ((cand.partialIdentity || anonymousCash) && !historyAuto) confidence = Math.min(confidence, 91)
@@ -263,7 +294,7 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
   const blocked = identityBlocked || allocationBlocked
   const confidence = identityBlocked ? Math.min(best.confidence, 91) : best.confidence
   const autoFloor = Math.max(AUTO_CONFIDENCE, Number(c.AUTO_CONFIDENCE) || AUTO_CONFIDENCE)
-  const identityOk = cand.strongIdentity || cand.score >= autoFloor || historyAuto || isIndependentFirstLast(cand)
+  const identityOk = cand.strongIdentity || cand.score >= autoFloor || historyAuto || isIndependentFirstLast(cand) || hasFirstLastIdentity(cand)
   const status = !blocked && confidence >= autoFloor && identityOk
     ? 'auto_matched' : confidence >= 80 || ambiguous ? 'needs_review' : 'unmatched'
   const bucket = confidenceBucket(confidence)
@@ -291,6 +322,7 @@ export function classifyEvidence(tx, index, c = runtimeConfig) {
     amountMatchKind: recon.kind, nameScore: cand.score, confidenceScore: confidence, confidenceBucket: bucket, reviewStatus: status,
     nameKind: cand.nameKind || null,
     independentFirstLast: isIndependentFirstLast(cand),
+    firstLastIdentity: hasFirstLastIdentity(cand),
     historyMatched: !!recon.historyMatched,
     reasoning: formatReasoningWithBucket(bucket, reasons).slice(0, 1000),
     emiCount: status === 'auto_matched' ? recon.emiCount : null, candidateCount: scored.length,
@@ -308,12 +340,13 @@ export function classify(tx, index, c = runtimeConfig) {
   const original = result.record
   const anonymous = result.candidates[0]?.nameKind === 'cash_amount'
   const score = Number(original.confidenceScore)
+  const historyPerfect = original.historyMatched && score >= 100
   const status = anonymous
     ? 'needs_review'
-    : score >= AUTO_CONFIDENCE
+    : historyPerfect || score >= AUTO_CONFIDENCE
       ? 'auto_matched'
       : original.reviewStatus
-  const ready = original.reviewStatus === 'auto_matched'
+  const ready = original.reviewStatus === 'auto_matched' || historyPerfect
   const candidate = result.candidates[0]
   const keepSuggestion = status !== 'unmatched'
   result.record = {
@@ -323,13 +356,69 @@ export function classify(tx, index, c = runtimeConfig) {
     loanDiskBorrowerName: keepSuggestion ? original.loanDiskBorrowerName || candidate?.group.borrowerName || null : null,
     loanNumber: anonymous ? null : original.loanNumber,
     matchedLoanNumbers: anonymous ? [] : original.matchedLoanNumbers,
-    matchType: !ready && status !== 'unmatched' ? 'review_required' : original.matchType,
+    matchType: historyPerfect || ready ? original.matchType : status !== 'unmatched' ? 'review_required' : original.matchType,
     emiCount: ready ? original.emiCount : null,
     reasoning: status === 'auto_matched' && !ready
       ? original.reasoning.replace(/^(\[[^\]]+\] )/, '$1Matched by ≥81% rule; review required before posting. ').slice(0, 1000)
       : original.reasoning,
   }
   return result
+}
+
+/** Recurring ledger amounts in cents, keyed by loan number. */
+export function typicalCentsFromRepaymentRows(rows = []) {
+  const byLoan = new Map()
+  for (const row of rows) {
+    const loan = String(row?.loanNumber || '').trim()
+    const cents = Math.round(Number(row?.amount) * 100)
+    if (!loan || !Number.isFinite(cents) || cents <= 0) continue
+    if (!byLoan.has(loan)) byLoan.set(loan, new Map())
+    const counts = byLoan.get(loan)
+    counts.set(cents, (counts.get(cents) || 0) + 1)
+  }
+  const typical = new Map()
+  for (const [loan, counts] of byLoan) {
+    const recurring = [...counts.entries()].filter(([, n]) => n >= 2).map(([cents]) => cents)
+    if (recurring.length) typical.set(loan, recurring)
+    else if (counts.size === 1) typical.set(loan, [...counts.keys()])
+  }
+  return typical
+}
+
+/**
+ * After first+last identity is established and EMI did not uniquely match,
+ * promote a unique historical repayment amount to a 100% match.
+ */
+export function applyRepaymentHistoryMatch(record, loans = [], typicalCentsByLoan = new Map(), c = runtimeConfig) {
+  if (!record?.firstLastIdentity && !record?.independentFirstLast) return record
+  if (record.historyMatched && Number(record.confidenceScore) >= 100) return record
+  if (!record.borrowerId) return record
+  const list = (loans || []).map((l) => ({
+    ...l,
+    historicalPaymentCents: typicalCentsByLoan.get(String(l.loanNumber)) || l.historicalPaymentCents || [],
+  }))
+  const hist = uniqueHistoryAllocation(Math.round(Number(record.emiPaidAmount) * 100), list, c)
+  if (!hist) return record
+  const bucket = confidenceBucket(100)
+  return {
+    ...record,
+    historyMatched: true,
+    confidenceScore: 100,
+    confidenceBucket: bucket,
+    reviewStatus: 'auto_matched',
+    matchType: 'name_and_amount',
+    amountMatchKind: 'history_installment',
+    loanNumber: hist.loanNumbers[0],
+    matchedLoanNumbers: hist.loanNumbers,
+    loanCount: hist.loanNumbers.length,
+    expectedEmiAmount: hist.summedExpected,
+    summedExpectedEmi: hist.summedExpected,
+    amountDiff: hist.diff,
+    emiCount: 1,
+    reasoning: formatReasoningWithBucket(bucket,
+      `First and last name match; EMI did not match contractual installment; credit equals historical repayment EMI — 100% match. ${String(record.reasoning || '').replace(/^\[[^\]]+\]\s*/, '')}`
+    ).slice(0, 1000),
+  }
 }
 
 // Compatibility for optional AI callers: model text can never select a financial identity or invent loans.
