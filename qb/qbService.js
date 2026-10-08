@@ -189,6 +189,20 @@ export function getTransaction(db, id) {
  * @param {number} limit - Max records to import (default 1000)
  * @returns {{ batch_id, total, valid, skipped, invalid }}
  */
+const IMPORTABLE_REVIEW = new Set(['auto_matched', 'confirmed', 'ready_to_post', 'posted'])
+
+/** Matched SmartRepay rows that can become EMI receipts. Needs-review rows stay out. */
+export function selectSmartRepayImportRows(transactions = []) {
+  return transactions.filter((t) => {
+    if (['needs_review', 'unmatched', 'rejected'].includes(t.review_status)) return false
+    const reviewOk = IMPORTABLE_REVIEW.has(t.review_status)
+    const statusOk = t.status === 'matched' || t.status === 'posted' || t.status === 'ready'
+    return (reviewOk || statusOk)
+      && (t.matched_borrower_id || t.borrower_id)
+      && Number(t.amount) > 0
+  })
+}
+
 export async function seedFromSmartRepay(db, actor, limit = 1000) {
   let srTransactions = []
 
@@ -196,9 +210,7 @@ export async function seedFromSmartRepay(db, actor, limit = 1000) {
   try {
     const sqlResult = await getSqlMatchResults()
     if (sqlResult?.transactions?.length) {
-      const matched = sqlResult.transactions.filter((t) =>
-        t.status === 'matched' || t.status === 'posted' || t.review_status === 'auto_matched'
-      )
+      const matched = selectSmartRepayImportRows(sqlResult.transactions)
       if (matched.length > 0) {
         srTransactions = matched.slice(0, limit).map((t) => ({
           id: t.bank_transaction_id || t.id,
